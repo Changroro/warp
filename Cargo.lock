@@ -15266,6 +15266,7 @@ dependencies = [
  "winreg",
  "x11rb",
  "zbus",
+ "zeroize",
 ]
 
 [[package]]
