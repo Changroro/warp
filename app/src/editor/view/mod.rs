@@ -3234,6 +3234,15 @@ impl EditorView {
         ctx.notify();
     }
 
+    pub fn set_is_password(&mut self, is_password: bool, ctx: &mut ViewContext<Self>) {
+        self.is_password = is_password;
+        ctx.notify();
+    }
+
+    pub fn is_password(&self) -> bool {
+        self.is_password
+    }
+
     pub fn update_image_context_options(
         &mut self,
         options: ImageContextOptions,

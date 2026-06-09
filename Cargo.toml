@@ -379,6 +379,7 @@ wgpu = { version = "30.0.0", default-features = false, features = [
   "wgsl",
 ] }
 zbus = "5.9.0"
+zeroize = "1.8"
 memchr = "2"
 memo-map = "0.3.1"
 async-recursion = "1.0.0"

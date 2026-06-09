@@ -470,6 +470,41 @@ fn ssh_bootstraps_if_blocklist_empty_and_reconciles_parent_return() {
 }
 
 #[test]
+fn temporary_bootstrap_suppression_ignores_remote_ssh_hooks_until_command_finishes() {
+    let (event_tx, event_rx) = async_channel::unbounded();
+    let event_proxy = ChannelEventListener::builder_for_test()
+        .with_terminal_events_tx(event_tx)
+        .build();
+    let mut terminal = TerminalModel::mock(None, Some(event_proxy));
+    while event_rx.try_recv().is_ok() {}
+
+    terminal.ignore_bootstrapping_messages_until_command_finished();
+    terminal.init_ssh(InitSshValue {
+        shell: "bash".to_string(),
+        uname: Some("Linux".to_string()),
+    });
+    terminal.init_subshell(InitSubshellValue {
+        shell: "bash".to_string(),
+        uname: Some("Linux".to_string()),
+    });
+
+    assert!(event_rx.is_empty());
+
+    terminal.command_finished(Default::default());
+    while event_rx.try_recv().is_ok() {}
+
+    terminal.init_ssh(InitSshValue {
+        shell: "bash".to_string(),
+        uname: Some("Linux".to_string()),
+    });
+
+    match event_rx.try_recv() {
+        Ok(Event::InitSsh(event)) => assert_eq!(event.shell_type, ShellType::Bash),
+        other => panic!("Expected Event::InitSsh after command finished, got: {other:?}"),
+    }
+}
+
+#[test]
 // An empty block that is restored should have a nonzero height and it should not get deleted.
 pub fn test_restored_empty_command_block() {
     let restored_blocks = [create_default_serialized_block().into()];
