@@ -283,7 +283,7 @@ fn ssh_bootstraps_if_blocklist_empty() {
 }
 
 #[test]
-fn temporary_bootstrap_suppression_ignores_remote_ssh_hooks_until_command_finishes() {
+fn temporary_bootstrap_suppression_ignores_hooks_until_command_finishes() {
     let (event_tx, event_rx) = async_channel::unbounded();
     let event_proxy = ChannelEventListener::builder_for_test()
         .with_terminal_events_tx(event_tx)
@@ -292,13 +292,10 @@ fn temporary_bootstrap_suppression_ignores_remote_ssh_hooks_until_command_finish
     while event_rx.try_recv().is_ok() {}
 
     terminal.ignore_bootstrapping_messages_until_command_finished();
-    terminal.init_ssh(InitSshValue {
-        shell: "bash".to_string(),
-        uname: Some("Linux".to_string()),
-    });
     terminal.init_subshell(InitSubshellValue {
         shell: "bash".to_string(),
         uname: Some("Linux".to_string()),
+        session_id: Default::default(),
     });
 
     assert!(event_rx.is_empty());
@@ -306,14 +303,15 @@ fn temporary_bootstrap_suppression_ignores_remote_ssh_hooks_until_command_finish
     terminal.command_finished(Default::default());
     while event_rx.try_recv().is_ok() {}
 
-    terminal.init_ssh(InitSshValue {
+    terminal.init_subshell(InitSubshellValue {
         shell: "bash".to_string(),
         uname: Some("Linux".to_string()),
+        session_id: Default::default(),
     });
 
     match event_rx.try_recv() {
-        Ok(Event::InitSsh(event)) => assert_eq!(event.shell_type, ShellType::Bash),
-        other => panic!("Expected Event::InitSsh after command finished, got: {other:?}"),
+        Ok(Event::InitSubshell(event)) => assert_eq!(event.shell_type, ShellType::Bash),
+        other => panic!("Expected Event::InitSubshell after command finished, got: {other:?}"),
     }
 }
 

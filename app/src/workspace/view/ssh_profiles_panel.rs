@@ -25,6 +25,7 @@ use crate::appearance::Appearance;
 use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
 use crate::modal::{Modal, ModalEvent, ModalViewState};
 use crate::settings::SshSettings;
+use crate::terminal::ssh::config_file;
 use crate::terminal::ssh::util::{
     default_ssh_port, normalize_ssh_host_profiles, ssh_profile_password_key, SshHostProfile,
     SshJumpHost,
@@ -75,7 +76,7 @@ pub struct SshProfilesPanelView {
 
 impl SshProfilesPanelView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
-        normalize_saved_profiles(ctx);
+        sync_profiles_with_ssh_config(ctx);
 
         let modal_body = ctx.add_typed_action_view(SshProfileModalView::new);
         ctx.subscribe_to_view(&modal_body, |me, _, event, ctx| {
@@ -221,34 +222,20 @@ impl SshProfilesPanelView {
         password: PasswordIntent,
         ctx: &mut ViewContext<Self>,
     ) {
-        let mut profiles = SshSettings::as_ref(ctx)
-            .saved_ssh_host_profiles
-            .value()
-            .clone();
-        let profile_index = match mode {
-            SshProfileModalMode::Add => {
-                profiles.push(profile);
-                profiles.len() - 1
-            }
-            SshProfileModalMode::Edit(id) => {
-                let Some(index) = profiles.iter().position(|existing| existing.id == id) else {
-                    log::warn!("Failed to save SSH profile: profile_id={id} not found");
-                    return;
-                };
-                profiles[index] = profile;
-                index
-            }
-        };
+        let mut profile = profile;
+        if let SshProfileModalMode::Edit(id) = mode {
+            profile.id = id;
+        }
 
-        let before_normalize = profiles.clone();
-        normalize_ssh_host_profiles(&mut profiles);
-        warn_normalized_profile_id_changes(&before_normalize, &profiles);
-        let profile_id = profiles[profile_index].id;
-        SshSettings::handle(ctx).update(ctx, |settings, ctx| {
-            if let Err(err) = settings.saved_ssh_host_profiles.set_value(profiles, ctx) {
-                log::error!("Failed to save SSH profiles: {err:#}");
-            }
-        });
+        // If the config can't be written we must not touch the password either, or the two would
+        // disagree about which profile exists.
+        if let Err(err) = config_file::upsert_profile(&profile) {
+            log::error!("Failed to save SSH profile to ~/.ssh/config: {err:#}");
+            return;
+        }
+
+        let profile_id = profile.id;
+        sync_profiles_with_ssh_config(ctx);
 
         match password {
             PasswordIntent::Keep => {}
@@ -286,25 +273,41 @@ impl SshProfilesPanelView {
     }
 
     fn remove_profile(&mut self, profile_id: Uuid, ctx: &mut ViewContext<Self>) {
-        SshSettings::handle(ctx).update(ctx, |settings, ctx| {
-            let mut profiles = settings.saved_ssh_host_profiles.value().clone();
-            let removed_jump_host = profiles
-                .iter()
-                .find(|profile| profile.id == profile_id)
-                .map(SshProfileModalView::jump_host_from_profile);
-            profiles.retain(|profile| profile.id != profile_id);
-            if let Some(removed_jump_host) = removed_jump_host {
-                let removed_target = removed_jump_host.target();
-                for profile in &mut profiles {
-                    profile
-                        .jump_hosts
-                        .retain(|jump_host| jump_host.target() != removed_target);
+        let profiles = Self::profiles(ctx);
+        let removed_jump_host = profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .map(SshProfileModalView::jump_host_from_profile);
+
+        if let Err(err) = config_file::remove_profile(profile_id) {
+            log::error!("Failed to remove SSH profile from ~/.ssh/config: {err:#}");
+            return;
+        }
+
+        // Any profile that jumped through the removed host would otherwise keep a dangling hop.
+        if let Some(removed_jump_host) = removed_jump_host {
+            let removed_target = removed_jump_host.target();
+            for mut profile in profiles
+                .into_iter()
+                .filter(|profile| profile.id != profile_id)
+            {
+                if !profile
+                    .jump_hosts
+                    .iter()
+                    .any(|jump_host| jump_host.target() == removed_target)
+                {
+                    continue;
+                }
+                profile
+                    .jump_hosts
+                    .retain(|jump_host| jump_host.target() != removed_target);
+                if let Err(err) = config_file::upsert_profile(&profile) {
+                    log::error!("Failed to drop jump host from ~/.ssh/config: {err:#}");
                 }
             }
-            if let Err(err) = settings.saved_ssh_host_profiles.set_value(profiles, ctx) {
-                log::error!("Failed to remove SSH profile: {err:#}");
-            }
-        });
+        }
+
+        sync_profiles_with_ssh_config(ctx);
 
         if let Err(err) = ctx
             .secure_storage()
@@ -1337,18 +1340,59 @@ impl View for SshProfileModalView {
     }
 }
 
-fn normalize_saved_profiles(ctx: &mut ViewContext<SshProfilesPanelView>) {
-    let mut profiles = SshSettings::as_ref(ctx)
+/// `~/.ssh/config` owns the profiles; the settings entry is only the cache the UI renders from.
+///
+/// Profiles that predate this (they lived only in Warp's settings) are written into the config once,
+/// so the user gets them in every terminal, not just Warp.
+fn sync_profiles_with_ssh_config(ctx: &mut ViewContext<SshProfilesPanelView>) {
+    let cached = SshSettings::as_ref(ctx)
         .saved_ssh_host_profiles
         .value()
         .clone();
+
+    let mut profiles = match config_file::load_profiles() {
+        Ok(profiles) => profiles,
+        Err(err) => {
+            log::error!("Failed to read SSH profiles from ~/.ssh/config: {err:#}");
+            return;
+        }
+    };
+
+    let migrated = cached
+        .iter()
+        .filter(|profile| {
+            !profiles
+                .iter()
+                .any(|existing| existing.id == profile.id || existing.name == profile.name)
+        })
+        .fold(false, |migrated, profile| {
+            match config_file::upsert_profile(profile) {
+                Ok(()) => true,
+                Err(err) => {
+                    log::error!("Failed to migrate SSH profile to ~/.ssh/config: {err:#}");
+                    migrated
+                }
+            }
+        });
+
+    if migrated {
+        profiles = match config_file::load_profiles() {
+            Ok(profiles) => profiles,
+            Err(err) => {
+                log::error!("Failed to re-read SSH profiles from ~/.ssh/config: {err:#}");
+                return;
+            }
+        };
+    }
+
     let before = profiles.clone();
     normalize_ssh_host_profiles(&mut profiles);
-    if profiles != before {
-        warn_normalized_profile_id_changes(&before, &profiles);
+    warn_normalized_profile_id_changes(&before, &profiles);
+
+    if profiles != cached {
         SshSettings::handle(ctx).update(ctx, |settings, ctx| {
             if let Err(err) = settings.saved_ssh_host_profiles.set_value(profiles, ctx) {
-                log::error!("Failed to normalize SSH profiles: {err:#}");
+                log::error!("Failed to cache SSH profiles: {err:#}");
             }
         });
     }
