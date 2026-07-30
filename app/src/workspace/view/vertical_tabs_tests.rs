@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use chrono::NaiveDate;
+
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
 use warpui::EntityId;
@@ -9,13 +11,14 @@ use super::{
     AgentTabTextPreference, SummaryPaneKind, SummaryPaneKindIcons, TerminalAgentText,
     TerminalPrimaryLineData, TerminalPrimaryLineFont, VerticalTabsDetailTarget,
     VerticalTabsDetailTargetKind, VerticalTabsSummaryBranchEntry, VerticalTabsSummaryData,
-    VerticalTabsSummaryPrimaryLabel, branch_label_display, coalesce_summary_branch_entries,
-    code_detail_kind_label, compact_branch_subtitle_display, detail_sidecar_width_and_bounds,
-    detail_target_for_hovered_row, non_terminal_search_text_fragments,
-    pane_ids_for_display_granularity, pane_search_text_fragments, preferred_agent_tab_titles,
-    push_normalized_unique_summary_label, search_fragments_contain_query,
-    select_summary_pane_kind_icons, should_keep_detail_sidecar_visible_for_mouse_position,
-    should_show_tab_group_header, sort_summary_primary_labels_status_first, summary_overflow_count,
+    VerticalTabsSummaryPrimaryLabel, archived_session_matches_query, branch_label_display,
+    coalesce_summary_branch_entries, code_detail_kind_label, compact_branch_subtitle_display,
+    detail_sidecar_width_and_bounds, detail_target_for_hovered_row, format_last_used,
+    non_terminal_search_text_fragments, pane_ids_for_display_granularity,
+    pane_search_text_fragments, preferred_agent_tab_titles, push_normalized_unique_summary_label,
+    search_fragments_contain_query, select_summary_pane_kind_icons,
+    should_keep_detail_sidecar_visible_for_mouse_position, should_show_tab_group_header,
+    sort_summary_primary_labels_status_first, summary_overflow_count,
     summary_search_text_fragments, terminal_kind_badge_label, terminal_primary_line_data,
     terminal_pull_request_badge_label, terminal_search_text_fragments,
     terminal_title_fallback_font, uses_outer_group_container, visible_pane_ids_for_detail_target,
@@ -25,6 +28,7 @@ use crate::ai::agent::conversation::ConversationStatus;
 use crate::context_chips::display_chip::GitLineChanges;
 use crate::pane_group::pane::IPaneType;
 use crate::pane_group::{PaneId, TerminalPaneId};
+use crate::persistence::model::ArchivedSession;
 use crate::safe_triangle::SafeTriangle;
 use crate::terminal::CLIAgent;
 use crate::workspace::tab_settings::VerticalTabsDisplayGranularity;
@@ -1206,4 +1210,62 @@ fn summary_search_fragments_include_hidden_overflow_values() {
     assert!(search_fragments_contain_query(&fragments, "#789"));
     assert!(search_fragments_contain_query(&fragments, "+2"));
     assert!(search_fragments_contain_query(&fragments, "-3"));
+}
+
+fn archived_session(title: &str, cwd: Option<&str>) -> ArchivedSession {
+    let timestamp = NaiveDate::from_ymd_opt(2026, 7, 30)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap();
+    ArchivedSession {
+        id: "id".to_string(),
+        title: title.to_string(),
+        cwd: cwd.map(str::to_string),
+        cli_agent: None,
+        branch: None,
+        last_used_at: timestamp,
+        archived_at: timestamp,
+    }
+}
+
+#[test]
+fn an_empty_query_keeps_every_archived_session() {
+    let session = archived_session("warp", Some("/home/me/warp"));
+    assert!(archived_session_matches_query(&session, ""));
+}
+
+#[test]
+fn an_archived_session_matches_its_title_or_directory_case_insensitively() {
+    let session = archived_session("Warp OSS", Some("/home/me/Project/warp"));
+
+    assert!(archived_session_matches_query(&session, "warp oss"));
+    assert!(archived_session_matches_query(&session, "project"));
+    assert!(!archived_session_matches_query(&session, "kakao"));
+}
+
+#[test]
+fn an_archived_session_without_a_directory_only_matches_its_title() {
+    let session = archived_session("scratch", None);
+
+    assert!(archived_session_matches_query(&session, "scratch"));
+    assert!(!archived_session_matches_query(&session, "home"));
+}
+
+#[test]
+fn last_used_labels_step_from_minutes_to_a_date() {
+    let now = chrono::Utc::now().naive_utc();
+
+    assert_eq!(format_last_used(now), "just now");
+    assert_eq!(
+        format_last_used(now - chrono::Duration::minutes(5)),
+        "5m ago"
+    );
+    assert_eq!(format_last_used(now - chrono::Duration::hours(3)), "3h ago");
+    assert_eq!(format_last_used(now - chrono::Duration::days(2)), "2d ago");
+
+    let long_ago = now - chrono::Duration::days(45);
+    assert_eq!(
+        format_last_used(long_ago),
+        long_ago.format("%Y-%m-%d").to_string()
+    );
 }

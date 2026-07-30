@@ -10,9 +10,9 @@ use warp_multi_agent_api::{self as api};
 
 use super::schema::{
     active_mcp_servers, agent_conversations, agent_tasks, ai_document_panes, ai_memory_panes,
-    ambient_agent_panes, app, blocks, cloud_objects_refreshes, code_pane_tabs, code_panes,
-    code_review_panes, commands, current_user_information, env_var_collection_panes, folders,
-    generic_string_objects, ignored_suggestions, mcp_environment_variables,
+    ambient_agent_panes, app, archived_sessions, blocks, cloud_objects_refreshes, code_pane_tabs,
+    code_panes, code_review_panes, commands, current_user_information, env_var_collection_panes,
+    folders, generic_string_objects, ignored_suggestions, mcp_environment_variables,
     mcp_server_installations, mcp_server_panes, notebook_panes, notebooks, object_actions,
     object_metadata, object_permissions, pane_branches, pane_leaves, pane_nodes, panels,
     project_rules, projects, server_experiments, settings_panes, tab_groups, tabs, team_members,
@@ -361,6 +361,18 @@ pub struct NewTab {
     pub color: Option<String>,
     pub tab_group_id: Option<i32>,
     pub pinned: bool,
+}
+
+#[derive(Identifiable, Queryable, Insertable, AsChangeset, Clone, Debug)]
+#[diesel(table_name = archived_sessions)]
+pub struct ArchivedSession {
+    pub id: String,
+    pub title: String,
+    pub cwd: Option<String>,
+    pub cli_agent: Option<String>,
+    pub branch: Option<String>,
+    pub last_used_at: NaiveDateTime,
+    pub archived_at: NaiveDateTime,
 }
 
 /// Persisted form of a tab group. `name` is optional — untitled groups omit

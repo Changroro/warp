@@ -54,7 +54,10 @@ use crate::pane_group::pane::IPaneType;
 use crate::pane_group::{
     CodePane, NotebookPane, PaneGroup, PaneId, TabBarHoverIndex, TerminalPane, WorkflowPane,
 };
+use crate::persistence::model::ArchivedSession;
 use crate::safe_triangle::SafeTriangle;
+use crate::session_archive::{SessionArchiveModel, deserialize_cli_agent};
+use crate::settings::SessionArchiveSettings;
 use crate::tab::{SelectedTabColor, TabData, tab_position_id};
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::session_settings::SessionSettings;
@@ -103,6 +106,7 @@ const GROUP_ACTION_BUTTON_GAP: f32 = 2.;
 const ROW_CORNER_RADIUS: f32 = 4.;
 const TAB_GROUP_MEMBER_INDENT: f32 = 12.;
 const TAB_GROUP_ICON_SIZE: f32 = 16.;
+const ARCHIVE_REMOVE_ICON_SIZE: f32 = 12.;
 const TAB_GROUP_CONTENT_INSET: f32 = 4.;
 const BADGE_ICON_SIZE: f32 = 12.;
 const DETAIL_SIDECAR_DEFAULT_WIDTH: f32 = 320.;
@@ -725,6 +729,9 @@ pub(super) struct VerticalTabsPanelState {
     show_details_on_hover_mouse_state: MouseStateHandle,
     panel_right_click_mouse_state: MouseStateHandle,
     pub(super) show_settings_popup: bool,
+    session_archive_header_mouse_state: MouseStateHandle,
+    session_archive_row_mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
+    session_archive_remove_mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
 }
 
 impl Default for VerticalTabsPanelState {
@@ -763,6 +770,9 @@ impl Default for VerticalTabsPanelState {
             show_details_on_hover_mouse_state: Default::default(),
             panel_right_click_mouse_state: Default::default(),
             show_settings_popup: false,
+            session_archive_header_mouse_state: Default::default(),
+            session_archive_row_mouse_states: RefCell::default(),
+            session_archive_remove_mouse_states: RefCell::default(),
         }
     }
 }
@@ -1153,6 +1163,22 @@ fn resolve_summary_pane_kind_icons(
 }
 
 impl VerticalTabsPanelState {
+    fn session_archive_row_mouse_state(&self, session_id: &str) -> MouseStateHandle {
+        self.session_archive_row_mouse_states
+            .borrow_mut()
+            .entry(session_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    fn session_archive_remove_mouse_state(&self, session_id: &str) -> MouseStateHandle {
+        self.session_archive_remove_mouse_states
+            .borrow_mut()
+            .entry(session_id.to_string())
+            .or_default()
+            .clone()
+    }
+
     pub(super) fn scroll_to_tab(&self, tab_index: usize) {
         self.scroll_state.scroll_to_position(ScrollTarget {
             position_id: tab_position_id(tab_index),
@@ -1754,13 +1780,21 @@ fn render_groups(
     let theme = appearance.theme();
 
     if workspace.tabs.is_empty() {
-        return Container::new(
+        let empty_state = Container::new(
             Text::new_inline("No tabs open", appearance.ui_font_family(), 12.)
                 .with_color(theme.sub_text_color(theme.background()).into())
                 .finish(),
         )
         .with_padding(Padding::uniform(12.))
         .finish();
+        let mut column = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(empty_state);
+        if let Some(archive) = render_session_archive_section(state, app) {
+            column.add_child(archive);
+        }
+        return column.finish();
     }
 
     let resolved_mode = resolve_vertical_tabs_mode(app);
@@ -2011,6 +2045,10 @@ fn render_groups(
         .detail_pane_badge_mouse_states
         .borrow_mut()
         .retain(|id, _| all_pane_ids.contains(id));
+
+    if let Some(archive) = render_session_archive_section(state, app) {
+        groups.add_child(archive);
+    }
 
     let groups = groups.finish();
     if uses_outer_group_container {
@@ -7351,6 +7389,254 @@ impl Workspace {
         app: &AppContext,
     ) -> Box<dyn Element> {
         render_vertical_tabs_panel(&self.vertical_tabs_panel, self, side, app)
+    }
+}
+
+/// The archive section at the end of the tab list: sessions the user closed on
+/// purpose, kept only as a record of where they were working.
+fn render_session_archive_section(
+    state: &VerticalTabsPanelState,
+    app: &AppContext,
+) -> Option<Box<dyn Element>> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let archive = SessionArchiveModel::as_ref(app);
+
+    let query = state.search_query.to_lowercase();
+    let sessions: Vec<&ArchivedSession> = archive
+        .sessions()
+        .iter()
+        .filter(|session| archived_session_matches_query(session, &query))
+        .collect();
+    if sessions.is_empty() {
+        return None;
+    }
+
+    let is_collapsed = *SessionArchiveSettings::as_ref(app)
+        .archive_section_collapsed
+        .value();
+    let main_text_color = theme.main_text_color(theme.background());
+    let sub_text_color = theme.sub_text_color(theme.background());
+    let count_label = sessions.len().to_string();
+
+    let header = Hoverable::new(
+        state.session_archive_header_mouse_state.clone(),
+        move |header_state| {
+            let chevron = if is_collapsed {
+                WarpIcon::ChevronRight
+            } else {
+                WarpIcon::ChevronDown
+            };
+            let row = Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(4.)
+                .with_child(
+                    ConstrainedBox::new(chevron.to_warpui_icon(main_text_color).finish())
+                        .with_width(TAB_GROUP_ICON_SIZE)
+                        .with_height(TAB_GROUP_ICON_SIZE)
+                        .finish(),
+                )
+                .with_child(
+                    Shrinkable::new(
+                        1.,
+                        Text::new_inline("Archive", appearance.ui_font_family(), 12.)
+                            .with_clip(ClipConfig::ellipsis())
+                            .with_color(main_text_color.into())
+                            .finish(),
+                    )
+                    .finish(),
+                )
+                .with_child(
+                    Text::new_inline(count_label.clone(), appearance.ui_font_family(), 11.)
+                        .with_color(sub_text_color.into())
+                        .finish(),
+                )
+                .finish();
+
+            let mut container = Container::new(row)
+                .with_padding(Padding::uniform(6.))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)));
+            if header_state.is_hovered() {
+                container = container.with_background(internal_colors::fg_overlay_1(theme));
+            }
+            container.finish()
+        },
+    )
+    .with_cursor(Cursor::PointingHand)
+    .on_click(|ctx, _, _| {
+        ctx.dispatch_typed_action(WorkspaceAction::ToggleSessionArchiveCollapsed);
+    })
+    .finish();
+
+    let mut section = Flex::column()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        .with_spacing(TABS_MODE_ITEM_SPACING)
+        .with_child(header);
+
+    if !is_collapsed {
+        for session in sessions {
+            section.add_child(render_archived_session_row(state, session, app));
+        }
+    }
+
+    Some(
+        Container::new(section.finish())
+            .with_padding_top(TABS_MODE_ITEM_SPACING)
+            .finish(),
+    )
+}
+
+fn archived_session_matches_query(session: &ArchivedSession, query_lower: &str) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    session.title.to_lowercase().contains(query_lower)
+        || session
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd.to_lowercase().contains(query_lower))
+}
+
+fn render_archived_session_row(
+    state: &VerticalTabsPanelState,
+    session: &ArchivedSession,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let main_text_color = theme.main_text_color(theme.background());
+    let sub_text_color = theme.sub_text_color(theme.background());
+
+    let agent = session.cli_agent.as_deref().and_then(deserialize_cli_agent);
+    let home_dir = dirs::home_dir();
+    let home_str = home_dir.as_ref().and_then(|path| path.to_str());
+    let subtitle = session
+        .cwd
+        .as_deref()
+        .map(|cwd| warp_util::path::user_friendly_path(cwd, home_str).to_string())
+        .unwrap_or_default();
+    let mut meta_parts = Vec::new();
+    if let Some(agent) = agent {
+        meta_parts.push(agent.display_name().to_string());
+    }
+    if let Some(branch) = session.branch.as_deref() {
+        meta_parts.push(branch.to_string());
+    }
+    meta_parts.push(format_last_used(session.last_used_at));
+    let meta = meta_parts.join(" · ");
+
+    let title = session.title.clone();
+    let session_id = session.id.clone();
+    let remove_id = session.id.clone();
+    let mouse_state = state.session_archive_row_mouse_state(&session.id);
+    let remove_mouse_state = state.session_archive_remove_mouse_state(&session.id);
+    let remove_is_hovered = remove_mouse_state
+        .lock()
+        .map(|state| state.is_mouse_over_element())
+        .unwrap_or(false);
+
+    Hoverable::new(mouse_state, move |row_state| {
+        let icon = agent
+            .and_then(|agent| agent.icon())
+            .map(|icon| icon.to_warpui_icon(sub_text_color).finish())
+            .unwrap_or_else(|| WarpIcon::Terminal.to_warpui_icon(sub_text_color).finish());
+
+        let mut text_column = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_spacing(1.)
+            .with_child(
+                Text::new_inline(title.clone(), appearance.ui_font_family(), 12.)
+                    .with_clip(ClipConfig::ellipsis())
+                    .with_color(main_text_color.into())
+                    .finish(),
+            );
+        if !subtitle.is_empty() {
+            text_column = text_column.with_child(
+                Text::new_inline(subtitle.clone(), appearance.ui_font_family(), 11.)
+                    .with_clip(ClipConfig::ellipsis())
+                    .with_color(sub_text_color.into())
+                    .finish(),
+            );
+        }
+        text_column = text_column.with_child(
+            Text::new_inline(meta.clone(), appearance.ui_font_family(), 10.)
+                .with_clip(ClipConfig::ellipsis())
+                .with_color(theme.disabled_ui_text_color().into())
+                .finish(),
+        );
+
+        let mut row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.)
+            .with_child(
+                ConstrainedBox::new(icon)
+                    .with_width(TAB_GROUP_ICON_SIZE)
+                    .with_height(TAB_GROUP_ICON_SIZE)
+                    .finish(),
+            )
+            .with_child(Shrinkable::new(1., text_column.finish()).finish());
+
+        if row_state.is_hovered() || remove_is_hovered {
+            let forget_id = remove_id.clone();
+            row = row.with_child(
+                Hoverable::new(remove_mouse_state.clone(), move |button_state| {
+                    let mut button = Container::new(
+                        ConstrainedBox::new(WarpIcon::X.to_warpui_icon(sub_text_color).finish())
+                            .with_width(ARCHIVE_REMOVE_ICON_SIZE)
+                            .with_height(ARCHIVE_REMOVE_ICON_SIZE)
+                            .finish(),
+                    )
+                    .with_padding(Padding::uniform(2.))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
+                    if button_state.is_hovered() {
+                        button = button.with_background(internal_colors::fg_overlay_3(theme));
+                    }
+                    button.finish()
+                })
+                .with_cursor(Cursor::PointingHand)
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(WorkspaceAction::RemoveArchivedSession(
+                        forget_id.clone(),
+                    ));
+                })
+                .finish(),
+            );
+        }
+
+        let row = row.finish();
+
+        let mut container = Container::new(row)
+            .with_padding(Padding::uniform(6.))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)));
+        if row_state.is_hovered() {
+            container = container.with_background(internal_colors::fg_overlay_1(theme));
+        }
+        container.finish()
+    })
+    .with_cursor(Cursor::PointingHand)
+    .with_defer_events_to_children()
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(WorkspaceAction::RestoreArchivedSession(session_id.clone()));
+    })
+    .finish()
+}
+
+fn format_last_used(last_used_at: chrono::NaiveDateTime) -> String {
+    let elapsed = chrono::Utc::now().naive_utc() - last_used_at;
+    if elapsed.num_minutes() < 1 {
+        "just now".to_string()
+    } else if elapsed.num_hours() < 1 {
+        format!("{}m ago", elapsed.num_minutes())
+    } else if elapsed.num_days() < 1 {
+        format!("{}h ago", elapsed.num_hours())
+    } else if elapsed.num_days() < 30 {
+        format!("{}d ago", elapsed.num_days())
+    } else {
+        last_used_at.format("%Y-%m-%d").to_string()
     }
 }
 

@@ -175,6 +175,14 @@ pub enum WorkspaceAction {
     ToggleTabBarOverflowMenu,
     ToggleWelcomeTips,
     CloseTab(usize),
+    /// Close the given tab but keep a record of it in the session archive.
+    ArchiveTab(usize),
+    /// Open a new tab in an archived session's directory and drop the record.
+    RestoreArchivedSession(String),
+    /// Forget an archived session without opening it.
+    RemoveArchivedSession(String),
+    /// Toggle collapsed state for the archive section in the vertical tabs panel.
+    ToggleSessionArchiveCollapsed,
     CloseActiveTab,
     CloseOtherTabs(usize),
     CloseNonActiveTabs,
@@ -940,6 +948,8 @@ impl WorkspaceAction {
             | SetActiveTabName(_)
             | SetActiveTabColor(_)
             | CloseTab(_)
+            | ArchiveTab(_)
+            | RestoreArchivedSession(_)
             | CloseActiveTab
             | CloseOtherTabs(_)
             | CloseNonActiveTabs
@@ -1196,7 +1206,9 @@ impl WorkspaceAction {
             | ShowHandoffEnvironmentCreationModal
             | ShowCloudModeV2EnvironmentCreationModal
             | OpenCreateAuthSecretModal { .. }
-            | OpenNetworkLogPane => false,
+            | OpenNetworkLogPane
+            | RemoveArchivedSession(_)
+            | ToggleSessionArchiveCollapsed => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,
             #[cfg(target_family = "wasm")]

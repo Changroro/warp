@@ -591,6 +591,11 @@ impl TabData {
                     .with_on_select_action(WorkspaceAction::CloseTab(index))
                     .into_item(),
             );
+            menu_items.push(
+                MenuItemFields::new("Move tab to archive")
+                    .with_on_select_action(WorkspaceAction::ArchiveTab(index))
+                    .into_item(),
+            );
         }
         if tabs_len > 1 {
             menu_items.push(

@@ -43,7 +43,7 @@ use warp_graphql::scalars::time::ServerTimestamp;
 use warp_multi_agent_api as api;
 use warpui::{AppContext, Entity, SingletonEntity};
 
-use self::model::{AgentConversation, AgentConversationData, Project};
+use self::model::{AgentConversation, AgentConversationData, ArchivedSession, Project};
 use crate::ai::blocklist::PersistedAIInput;
 use crate::ai::mcp::TemplatableMCPServerInstallation;
 use crate::ai::persisted_workspace::EnablementState;
@@ -296,6 +296,7 @@ pub struct PersistedData {
     pub workspace_language_servers: HashMap<PathBuf, HashMap<LSPServerType, EnablementState>>,
     pub multi_agent_conversations: Vec<AgentConversation>,
     pub projects: Vec<Project>,
+    pub archived_sessions: Vec<ArchivedSession>,
     pub project_rules: Vec<ProjectRulePath>,
     pub ignored_suggestions: Vec<(String, SuggestionType)>,
     pub mcp_server_installations: HashMap<Uuid, TemplatableMCPServerInstallation>,
@@ -449,6 +450,12 @@ pub enum ModelEvent {
     },
     DeleteProject {
         path: String,
+    },
+    UpsertArchivedSession {
+        session: ArchivedSession,
+    },
+    DeleteArchivedSession {
+        id: String,
     },
     UpsertMCPServerEnvironmentVariables {
         mcp_server_uuid: Vec<u8>,
