@@ -752,6 +752,14 @@ pub fn init(app: &mut AppContext) {
         .with_context_predicate(id!("Workspace"))
         .with_custom_action(CustomAction::ToggleWarpDrive),
         EditableBinding::new(
+            "workspace:toggle_ssh_profiles_panel",
+            BindingDescription::new("Toggle SSH profiles panel")
+                .with_custom_description(bindings::MAC_MENUS_CONTEXT, "Toggle SSH Profiles Panel"),
+            WorkspaceAction::ToggleSshProfilesPanel,
+        )
+        .with_group(bindings::BindingGroup::Navigation.as_str())
+        .with_context_predicate(id!("Workspace")),
+        EditableBinding::new(
             TOGGLE_RIGHT_PANEL_BINDING_NAME,
             BindingDescription::new("Toggle code review")
                 .with_custom_description(bindings::MAC_MENUS_CONTEXT, "Toggle Code Review"),

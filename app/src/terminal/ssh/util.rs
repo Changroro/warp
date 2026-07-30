@@ -5,28 +5,25 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+const SSH_COMMAND_LAUNCHER: [&str; 2] = ["command", "ssh"];
+
 fn new_profile_id() -> Uuid {
     Uuid::new_v4()
 }
 
-#[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    schemars::JsonSchema,
-    settings_value::SettingsValue,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[schemars(description = "A saved SSH jump host configuration.")]
 pub struct SshJumpHost {
+    #[serde(default)]
+    pub source_profile_id: Option<Uuid>,
     pub host: String,
     pub user: Option<String>,
     #[serde(default = "default_ssh_port")]
     pub port: u16,
     pub identity_file: Option<String>,
 }
+
+impl settings_value::SettingsValue for SshJumpHost {}
 
 impl SshJumpHost {
     pub fn target(&self) -> String {
@@ -38,17 +35,17 @@ impl SshJumpHost {
     }
 
     fn host_port(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        host_with_port(&self.host, self.port)
     }
 
-    fn push_ssh_options(&self, argv: &mut Vec<String>) {
+    fn push_proxy_command_options(&self, argv: &mut Vec<String>) {
         if let Some(identity_file) = self
             .identity_file
             .as_deref()
             .filter(|value| !value.is_empty())
         {
             argv.push("-i".to_string());
-            argv.push(identity_file.to_string());
+            argv.push(escape_openssh_percent(identity_file));
         }
 
         if self.port != default_ssh_port() {
@@ -96,15 +93,7 @@ impl SshHostProfile {
     }
 
     pub fn to_ssh_command(&self) -> String {
-        self.to_ssh_command_with_launcher(&["command", "ssh"])
-    }
-
-    pub fn to_ssh_command_bypassing_warpify(&self) -> String {
-        self.to_ssh_command_with_launcher(&["env", "ssh"])
-    }
-
-    fn to_ssh_command_with_launcher(&self, launcher: &[&str]) -> String {
-        let mut argv = launcher
+        let mut argv = SSH_COMMAND_LAUNCHER
             .iter()
             .map(|arg| (*arg).to_string())
             .collect::<Vec<_>>();
@@ -133,7 +122,10 @@ impl SshHostProfile {
                 argv.push("-o".to_string());
                 argv.push(format!(
                     "ProxyCommand={}",
-                    proxy_command_for_jump_hosts(&self.jump_hosts, "%h:%p")
+                    proxy_command_for_jump_hosts(
+                        &self.jump_hosts,
+                        &host_with_port(&self.host, self.port)
+                    )
                 ));
             } else {
                 argv.push("-J".to_string());
@@ -157,7 +149,7 @@ impl SshHostProfile {
 }
 
 fn proxy_command_for_jump_hosts(jump_hosts: &[SshJumpHost], destination: &str) -> String {
-    let mut proxy_command = None;
+    let mut proxy_command: Option<String> = None;
     for (index, jump_host) in jump_hosts.iter().enumerate() {
         let next_destination = jump_hosts
             .get(index + 1)
@@ -167,13 +159,16 @@ fn proxy_command_for_jump_hosts(jump_hosts: &[SshJumpHost], destination: &str) -
         let mut argv = vec!["ssh".to_string()];
         if let Some(previous_proxy_command) = proxy_command.take() {
             argv.push("-o".to_string());
-            argv.push(format!("ProxyCommand={previous_proxy_command}"));
+            argv.push(format!(
+                "ProxyCommand={}",
+                escape_openssh_percent(&previous_proxy_command)
+            ));
         }
-        jump_host.push_ssh_options(&mut argv);
+        jump_host.push_proxy_command_options(&mut argv);
         argv.push("-W".to_string());
-        argv.push(next_destination);
+        argv.push(escape_openssh_percent(&next_destination));
         argv.push("--".to_string());
-        argv.push(jump_host.destination());
+        argv.push(escape_openssh_percent(&jump_host.destination()));
 
         proxy_command = Some(
             argv.into_iter()
@@ -190,12 +185,31 @@ pub fn default_ssh_port() -> u16 {
     22
 }
 
-pub fn normalize_ssh_host_profiles(profiles: &mut [SshHostProfile]) {
+/// A profile id replaced by [`normalize_ssh_host_profiles`]; secrets stored under `previous_id` no
+/// longer resolve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SshProfileIdReassignment {
+    pub previous_id: Uuid,
+    pub new_id: Uuid,
+}
+
+/// Replaces nil and duplicate profile ids with fresh ones and normalizes zero ports, returning
+/// every id reassignment so callers can migrate or discard secrets keyed by the previous id.
+#[must_use]
+pub fn normalize_ssh_host_profiles(
+    profiles: &mut [SshHostProfile],
+) -> Vec<SshProfileIdReassignment> {
     let mut seen = std::collections::HashSet::new();
+    let mut reassignments = Vec::new();
     for profile in profiles {
         if profile.id.is_nil() || !seen.insert(profile.id) {
+            let previous_id = profile.id;
             profile.id = Uuid::new_v4();
             seen.insert(profile.id);
+            reassignments.push(SshProfileIdReassignment {
+                previous_id,
+                new_id: profile.id,
+            });
         }
         if profile.port == 0 {
             profile.port = default_ssh_port();
@@ -206,6 +220,7 @@ pub fn normalize_ssh_host_profiles(profiles: &mut [SshHostProfile]) {
             }
         }
     }
+    reassignments
 }
 
 pub fn ssh_profile_password_key(id: Uuid) -> String {
@@ -216,13 +231,37 @@ pub fn shell_quote_arg(arg: &str) -> String {
     shell_words::quote(arg).into_owned()
 }
 
+/// Renders a `host[:port]` destination in the bracketed form OpenSSH requires for IPv6 literals.
+fn host_with_port(host: &str, port: u16) -> String {
+    if is_ipv6_literal(host) {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn is_ipv6_literal(host: &str) -> bool {
+    host.contains(':') && !host.starts_with('[')
+}
+
+/// Escapes one level of OpenSSH `%` token expansion so the value reaches the next `ssh` literally.
+fn escape_openssh_percent(value: &str) -> String {
+    value.replace('%', "%%")
+}
+
 fn ssh_target(user: &Option<String>, host: &str, port: u16, include_port: bool) -> String {
     let mut target = String::new();
     if let Some(user) = user.as_deref().filter(|value| !value.is_empty()) {
         target.push_str(user);
         target.push('@');
     }
-    target.push_str(host);
+    if include_port && is_ipv6_literal(host) {
+        target.push('[');
+        target.push_str(host);
+        target.push(']');
+    } else {
+        target.push_str(host);
+    }
     if include_port && port != default_ssh_port() {
         target.push(':');
         target.push_str(&port.to_string());
@@ -230,12 +269,31 @@ fn ssh_target(user: &Option<String>, host: &str, port: u16, include_port: bool) 
     target
 }
 
-pub fn is_ssh_password_prompt_strict(output: &str) -> bool {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshPromptPrincipal {
+    pub user: Option<String>,
+    pub host: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SshLoginPromptKind {
+    HostPassword {
+        principal: Option<SshPromptPrincipal>,
+    },
+    KeyPassphrase {
+        identity_file: String,
+    },
+}
+
+pub fn parse_ssh_login_prompt(output: &str) -> Option<SshLoginPromptKind> {
     lazy_static! {
-        static ref PASSWORD_PROMPT: Regex =
-            Regex::new(r"^.*'s password:\s*$").expect("password prompt regex invalid");
+        static ref PASSWORD_PROMPT: Regex = Regex::new(r"^(?P<principal>.*)'s password:\s*$")
+            .expect("password prompt regex invalid");
+        static ref PAM_PASSWORD_PROMPT: Regex =
+            Regex::new(r"^(?:\((?P<principal>[^()]*)\)\s*)?Password:\s*$")
+                .expect("PAM password prompt regex invalid");
         static ref PASSPHRASE_PROMPT: Regex =
-            Regex::new(r#"(?i)^enter passphrase for key ['"].*['"]:\s*$"#)
+            Regex::new(r#"(?i)^enter passphrase for key ['"](?P<identity_file>.*)['"]:\s*$"#)
                 .expect("passphrase prompt regex invalid");
     }
 
@@ -246,7 +304,53 @@ pub fn is_ssh_password_prompt_strict(output: &str) -> bool {
         .find(|line| !line.is_empty())
         .unwrap_or_default()
         .trim_end_matches('\r');
-    PASSWORD_PROMPT.is_match(last_line) || PASSPHRASE_PROMPT.is_match(last_line)
+
+    if let Some(captures) = PASSWORD_PROMPT.captures(last_line) {
+        let principal = captures
+            .name("principal")
+            .and_then(|principal| principal.as_str().split_whitespace().next_back())
+            .and_then(parse_ssh_prompt_principal);
+        return Some(SshLoginPromptKind::HostPassword { principal });
+    }
+
+    if let Some(captures) = PAM_PASSWORD_PROMPT.captures(last_line) {
+        let principal = captures
+            .name("principal")
+            .map(|principal| principal.as_str().trim())
+            .and_then(parse_pam_prompt_principal);
+        return Some(SshLoginPromptKind::HostPassword { principal });
+    }
+
+    PASSPHRASE_PROMPT
+        .captures(last_line)
+        .map(|captures| SshLoginPromptKind::KeyPassphrase {
+            identity_file: captures["identity_file"].to_string(),
+        })
+}
+
+/// OpenSSH writes `user@host` inside a PAM prompt's parentheses; without `@` no host is named.
+fn parse_pam_prompt_principal(value: &str) -> Option<SshPromptPrincipal> {
+    let (user, host) = value.rsplit_once('@')?;
+    (!user.is_empty() && !host.is_empty()).then(|| SshPromptPrincipal {
+        user: Some(user.to_string()),
+        host: host.to_string(),
+    })
+}
+
+fn parse_ssh_prompt_principal(value: &str) -> Option<SshPromptPrincipal> {
+    let (user, host) = split_ssh_destination(value);
+    (!host.is_empty()).then(|| SshPromptPrincipal {
+        user: user.map(ToString::to_string),
+        host: host.to_string(),
+    })
+}
+
+pub fn split_ssh_destination(destination: &str) -> (Option<&str>, &str) {
+    match destination.rsplit_once('@') {
+        Some((user, host)) if !user.is_empty() => (Some(user), host),
+        Some((_, host)) => (None, host),
+        None => (None, destination),
+    }
 }
 
 /// Converts a multiline bash or zsh script to one line by turning newlines into semicolons or
@@ -332,6 +436,7 @@ pub fn check_ssh_login_state(block_output: &str) -> SshLoginState {
 pub struct InteractiveSshCommand {
     pub host: Option<String>,
     pub port: Option<String>,
+    pub user: Option<String>,
 }
 
 impl InteractiveSshCommand {
@@ -346,6 +451,7 @@ impl InteractiveSshCommand {
         let tokens = parse_ssh_command_tokens(command)?;
         let mut host: Option<String> = None;
         let mut port: Option<String> = None;
+        let mut login_name: Option<String> = None;
 
         let mut i = 1;
         while i < tokens.len() {
@@ -362,9 +468,18 @@ impl InteractiveSshCommand {
                     }
                 }
 
+                "-l" => {
+                    i += 1;
+                    if i < tokens.len() {
+                        login_name = Some(tokens[i].clone());
+                    } else {
+                        return None;
+                    }
+                }
+
                 // SSH option that doesn't change interactivity and require an argument: Skip the next item.
                 "-B" | "-b" | "-c" | "-D" | "-E" | "-e" | "-F" | "-I" | "-i" | "-J" | "-L"
-                | "-l" | "-m" | "-O" | "-o" | "-P" | "-Q" | "-R" | "-S" | "-w" => {
+                | "-m" | "-O" | "-o" | "-P" | "-Q" | "-R" | "-S" | "-w" => {
                     i += 1;
                 }
 
@@ -383,7 +498,12 @@ impl InteractiveSshCommand {
             i += 1;
         }
 
-        Some(InteractiveSshCommand { host, port })
+        let user = host
+            .as_deref()
+            .and_then(|destination| split_ssh_destination(destination).0)
+            .map(ToString::to_string)
+            .or(login_name);
+        Some(InteractiveSshCommand { host, port, user })
     }
 }
 

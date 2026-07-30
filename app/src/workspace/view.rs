@@ -9233,6 +9233,10 @@ impl Workspace {
 
     fn toggle_ssh_profiles_panel(&mut self, ctx: &mut ViewContext<Self>) {
         self.ssh_profiles_panel_open = !self.ssh_profiles_panel_open;
+        if !self.ssh_profiles_panel_open {
+            self.ssh_profiles_panel_view
+                .update(ctx, |panel, ctx| panel.on_panel_hidden(ctx));
+        }
         ctx.notify();
     }
 
@@ -9244,22 +9248,20 @@ impl Workspace {
             .find(|profile| profile.id == profile_id)
             .cloned()
         else {
+            log::warn!(
+                "Failed to start SSH profile session: no saved profile for profile_id={profile_id}"
+            );
             return;
         };
 
-        let warpify_settings = WarpifySettings::as_ref(ctx);
-        let enable_ssh_warpification = *warpify_settings.enable_ssh_warpification.value();
-        let use_ssh_tmux_wrapper = *warpify_settings.use_ssh_tmux_wrapper.value();
-        let command = if enable_ssh_warpification {
-            profile.to_ssh_command()
-        } else {
-            profile.to_ssh_command_bypassing_warpify()
-        };
-        // Auto-inject targets the final destination's prompt. With jump hosts, the prompt could
-        // belong to a bastion, so disable it to avoid sending the saved final password there.
+        let enable_ssh_warpification = *WarpifySettings::as_ref(ctx)
+            .enable_ssh_warpification
+            .value();
+        let command = profile.to_ssh_command();
+        // A jump host's prompt can arrive first, so auto-inject would send the final password to it.
         let enable_password_auto_inject = profile.jump_hosts.is_empty();
         log::info!(
-            "Connecting SSH profile: profile_id={profile_id}, enable_ssh_warpification={enable_ssh_warpification}, use_ssh_tmux_wrapper={use_ssh_tmux_wrapper}"
+            "Connecting SSH profile: profile_id={profile_id}, enable_ssh_warpification={enable_ssh_warpification}"
         );
         let window_id = ctx.window_id();
         self.add_new_session_tab_internal_with_default_session_mode_behavior(
@@ -20386,7 +20388,7 @@ impl Workspace {
     fn render_ssh_profiles_button(
         &self,
         appearance: &Appearance,
-        _ctx: &AppContext,
+        ctx: &AppContext,
     ) -> Box<dyn Element> {
         SavePosition::new(
             Container::new(
@@ -20397,7 +20399,10 @@ impl Workspace {
                         &self.mouse_states.ssh_profiles_icon,
                         WorkspaceAction::ToggleSshProfilesPanel,
                         "SSH profiles".to_string(),
-                        None,
+                        keybinding_name_to_display_string(
+                            "workspace:toggle_ssh_profiles_panel",
+                            ctx,
+                        ),
                         self.ssh_profiles_panel_open,
                         false,
                     )
@@ -22753,11 +22758,7 @@ impl Workspace {
                 if !self.ssh_profiles_panel_open || warpui::platform::is_mobile_device() {
                     return None;
                 }
-                Some(
-                    ConstrainedBox::new(ChildView::new(&self.ssh_profiles_panel_view).finish())
-                        .with_width(280.)
-                        .finish(),
-                )
+                Some(ChildView::new(&self.ssh_profiles_panel_view).finish())
             }
             HeaderToolbarItemKind::CodeReview => {
                 if !pane_group.right_panel_open {
@@ -27137,11 +27138,13 @@ impl View for Workspace {
             stack.add_child(ChildView::new(&self.header_toolbar_editor_modal).finish());
         }
 
-        if let Some(modal) = self
-            .ssh_profiles_panel_view
-            .read(app, |panel, _| panel.render_modal())
-        {
-            stack.add_child(modal);
+        if self.ssh_profiles_panel_open {
+            if let Some(modal) = self
+                .ssh_profiles_panel_view
+                .read(app, |panel, _| panel.render_modal())
+            {
+                stack.add_child(modal);
+            }
         }
 
         if self

@@ -436,9 +436,7 @@ pub struct TerminalModel {
     /// cleared at the next precmd, because it is only relevant for the block where it was set.
     ignore_bootstrapping_messages: bool,
 
-    /// If true, ignore bootstrapping messages until the current user command finishes. SSH
-    /// profile connections use this when SSH Warpification is disabled so remote shell hooks do
-    /// not bootstrap the session behind the setting.
+    /// Cleared in `command_finished`.
     ignore_bootstrapping_messages_until_command_finished: bool,
 
     // This session's startup directory path. If None, the startup directory is treated as default
@@ -1485,9 +1483,6 @@ impl TerminalModel {
     }
 
     /// Suppresses bootstrapping hooks until the next `command_finished`.
-    ///
-    /// SSH profile connections use this when SSH Warpification is disabled so remote shell hooks
-    /// do not re-bootstrap the session behind the setting.
     pub fn ignore_bootstrapping_messages_until_command_finished(&mut self) {
         self.ignore_bootstrapping_messages_until_command_finished = true;
     }
@@ -2952,6 +2947,8 @@ impl ansi::Handler for TerminalModel {
     }
 
     fn command_finished(&mut self, data: CommandFinishedValue) {
+        self.ignore_bootstrapping_messages_until_command_finished = false;
+
         let disposition = self
             .block_list
             .classify_next_block_id(&data.completion_metadata.next_block_id);
@@ -3122,6 +3119,8 @@ impl ansi::Handler for TerminalModel {
             self.pending_ssh_wrapper_session = Some(value);
             self.event_proxy
                 .send_terminal_event(Event::SSH(remote_shell));
+        } else {
+            log::info!("Ignoring SSH hook while bootstrapping messages are suppressed");
         }
     }
 
@@ -3136,7 +3135,7 @@ impl ansi::Handler for TerminalModel {
     }
 
     fn init_shell(&mut self, data: InitShellValue) {
-        if !self.ignore_bootstrapping_messages {
+        if !self.should_ignore_bootstrapping_messages() {
             let hook_session_id = Some(data.session_id.as_u64());
             let transition = self.plan_lifecycle_transition(
                 LifecycleInput::InitShell,
@@ -3203,6 +3202,7 @@ impl ansi::Handler for TerminalModel {
 
     fn init_subshell(&mut self, data: InitSubshellValue) {
         if self.should_ignore_bootstrapping_messages() {
+            log::info!("Ignoring InitSubshell hook while bootstrapping messages are suppressed");
             return;
         }
 
@@ -3223,6 +3223,7 @@ impl ansi::Handler for TerminalModel {
 
     fn sourced_rc_file(&mut self, data: SourcedRcFileForWarpValue) {
         if self.should_ignore_bootstrapping_messages() {
+            log::info!("Ignoring SourcedRcFile hook while bootstrapping messages are suppressed");
             return;
         }
 

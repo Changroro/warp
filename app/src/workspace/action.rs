@@ -397,7 +397,6 @@ pub enum WorkspaceAction {
     /// Toggles the vertical tabs panel. This happens as an explicit action from the user.
     ToggleVerticalTabsPanel,
     OpenVerticalTabsPanel,
-    /// Toggles the SSH profiles panel. This happens as an explicit action from the user.
     ToggleSshProfilesPanel,
     /// Opens a new terminal tab and runs the saved SSH profile command.
     ConnectSshProfile(Uuid),

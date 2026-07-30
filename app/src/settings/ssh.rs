@@ -23,6 +23,7 @@ define_settings_group!(SshSettings,
             // SSH profile metadata can reveal private infrastructure. Keep it private and out of
             // cloud sync; passwords are stored separately in secure storage.
             sync_to_cloud: SyncToCloud::Never,
+            surface: settings::SettingSurfaces::GUI,
             private: true,
             storage_key: "SavedSSHHostProfiles",
             toml_path: "ssh.saved_profiles",

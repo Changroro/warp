@@ -503,6 +503,97 @@ fn temporary_bootstrap_suppression_ignores_hooks_until_command_finishes() {
 }
 
 #[test]
+fn ssh_profile_bootstrap_suppression_ignores_the_remote_ssh_hook() {
+    let (event_tx, event_rx) = async_channel::unbounded();
+    let event_proxy = ChannelEventListener::builder_for_test()
+        .with_terminal_events_tx(event_tx)
+        .build();
+    let mut terminal = TerminalModel::mock(None, Some(event_proxy));
+    while event_rx.try_recv().is_ok() {}
+
+    terminal.ignore_bootstrapping_messages_until_command_finished();
+    terminal.ssh(ssh_hook_value());
+
+    assert!(
+        event_rx.is_empty(),
+        "SSH hook must not bootstrap the session while suppression is armed"
+    );
+
+    terminal.command_finished(Default::default());
+    while event_rx.try_recv().is_ok() {}
+    terminal.ssh(ssh_hook_value());
+
+    assert!(
+        event_rx
+            .try_recv()
+            .is_ok_and(|event| matches!(event, Event::SSH(_))),
+        "SSH hook must be honored again after the command finishes"
+    );
+}
+
+#[test]
+fn ssh_profile_bootstrap_suppression_ignores_the_remote_init_shell_hook() {
+    let (event_tx, event_rx) = async_channel::unbounded();
+    let event_proxy = ChannelEventListener::builder_for_test()
+        .with_terminal_events_tx(event_tx)
+        .build();
+    let mut terminal = TerminalModel::mock(None, Some(event_proxy));
+    while event_rx.try_recv().is_ok() {}
+
+    terminal.ignore_bootstrapping_messages_until_command_finished();
+    terminal.init_shell(InitShellValue {
+        session_id: Default::default(),
+        shell: "bash".to_string(),
+        is_subshell: true,
+        user: "root".to_string(),
+        hostname: "remote".to_string(),
+        wsl_name: None,
+    });
+
+    let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+    assert!(
+        events.is_empty(),
+        "InitShell must not mark the session Warpified while suppression is armed, got: {events:?}"
+    );
+}
+
+#[test]
+fn ssh_profile_bootstrap_suppression_ignores_sourced_rc_files_in_subshells() {
+    let (event_tx, event_rx) = async_channel::unbounded();
+    let event_proxy = ChannelEventListener::builder_for_test()
+        .with_terminal_events_tx(event_tx)
+        .build();
+    let mut terminal = TerminalModel::mock(None, Some(event_proxy));
+    terminal.command_finished(Default::default());
+    assert!(
+        terminal.block_list().is_bootstrapped(),
+        "the rc-file hook only reports subshell sourcing once the block list is bootstrapped"
+    );
+    while event_rx.try_recv().is_ok() {}
+
+    terminal.ignore_bootstrapping_messages_until_command_finished();
+    terminal.sourced_rc_file(SourcedRcFileForWarpValue {
+        shell: "bash".to_string(),
+        uname: Some("Linux".to_string()),
+    });
+
+    assert!(
+        event_rx.is_empty(),
+        "SourcedRcFile hook must not bootstrap the session while suppression is armed"
+    );
+}
+
+fn ssh_hook_value() -> SSHValue {
+    SSHValue {
+        socket_path: std::path::PathBuf::from("/tmp/warp-ssh-test.sock"),
+        remote_shell: "bash".to_string(),
+        session_id: Default::default(),
+        remote_session_id: Some(4242),
+        external_control_master: false,
+    }
+}
+
+#[test]
 // An empty block that is restored should have a nonzero height and it should not get deleted.
 pub fn test_restored_empty_command_block() {
     let restored_blocks = [create_default_serialized_block().into()];
