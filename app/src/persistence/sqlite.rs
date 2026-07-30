@@ -57,12 +57,13 @@ use super::block_list::{
     upsert_ai_query,
 };
 use super::model::{
-    self, AI_DOCUMENT_PANE_KIND, AI_FACT_PANE_KIND, ActiveMCPServer, CODE_PANE_KIND,
-    CurrentUserInformation, ENV_VAR_COLLECTION_PANE_KIND, EXECUTION_PROFILE_EDITOR_PANE_KIND,
-    MCP_SERVER_PANE_KIND, MCPEnvironmentVariables, NOTEBOOK_PANE_KIND, NewActiveMCPServer, NewApp,
-    NewCommand, NewServerExperiment, NewTab, NewTabGroup, NewTeam, NewWindow, NewWorkspace,
-    NewWorkspaceMetadata, NewWorkspaceTeam, Project, SETTINGS_PANE_KIND, TERMINAL_PANE_KIND, Tab,
-    TabGroup, WORKFLOW_PANE_KIND, Window, WorkspaceMetadata as WorkspaceMetadataModel,
+    self, AI_DOCUMENT_PANE_KIND, AI_FACT_PANE_KIND, ActiveMCPServer, ArchivedSession,
+    CODE_PANE_KIND, CurrentUserInformation, ENV_VAR_COLLECTION_PANE_KIND,
+    EXECUTION_PROFILE_EDITOR_PANE_KIND, MCP_SERVER_PANE_KIND, MCPEnvironmentVariables,
+    NOTEBOOK_PANE_KIND, NewActiveMCPServer, NewApp, NewCommand, NewServerExperiment, NewTab,
+    NewTabGroup, NewTeam, NewWindow, NewWorkspace, NewWorkspaceMetadata, NewWorkspaceTeam, Project,
+    SETTINGS_PANE_KIND, TERMINAL_PANE_KIND, Tab, TabGroup, WORKFLOW_PANE_KIND, Window,
+    WorkspaceMetadata as WorkspaceMetadataModel,
 };
 use super::{
     BlockCompleted, FinishedCommandMetadata, ModelEvent, PersistedData, PersistedDataScope,
@@ -708,6 +709,12 @@ fn handle_model_event(event: ModelEvent, connection: &mut SqliteConnection) -> a
         }
         ModelEvent::DeleteProject { path } => {
             delete_project(connection, &path).context("error deleting project")
+        }
+        ModelEvent::UpsertArchivedSession { session } => {
+            save_archived_session(connection, session).context("error upserting archived session")
+        }
+        ModelEvent::DeleteArchivedSession { id } => {
+            delete_archived_session(connection, &id).context("error deleting archived session")
         }
         ModelEvent::UpsertWorkspace { workspace } => {
             save_workspace(connection, *workspace).context("error upserting workspace")
@@ -1660,6 +1667,38 @@ fn delete_project(conn: &mut SqliteConnection, project_path: &str) -> Result<()>
     Ok(())
 }
 
+fn save_archived_session(conn: &mut SqliteConnection, session: ArchivedSession) -> Result<()> {
+    use schema::archived_sessions::dsl::*;
+
+    diesel::insert_into(archived_sessions)
+        .values(session.clone())
+        .on_conflict(id)
+        .do_update()
+        .set(&session)
+        .execute(conn)?;
+
+    Ok(())
+}
+
+fn get_all_archived_sessions(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<ArchivedSession>, diesel::result::Error> {
+    use schema::archived_sessions::dsl::*;
+
+    Ok(archived_sessions
+        .load_iter::<ArchivedSession, DefaultLoadingMode>(conn)?
+        .filter_map(|item| item.ok())
+        .collect_vec())
+}
+
+fn delete_archived_session(conn: &mut SqliteConnection, session_id: &str) -> Result<()> {
+    use schema::archived_sessions::dsl::*;
+
+    diesel::delete(archived_sessions.filter(id.eq(session_id))).execute(conn)?;
+
+    Ok(())
+}
+
 fn get_all_project_rules(
     conn: &mut SqliteConnection,
 ) -> Result<Vec<ProjectRulePath>, diesel::result::Error> {
@@ -2501,6 +2540,7 @@ fn read_sqlite_data(
             workspace_language_servers: Default::default(),
             multi_agent_conversations: Default::default(),
             projects: Default::default(),
+            archived_sessions: Default::default(),
             project_rules: Default::default(),
             ignored_suggestions: Default::default(),
             mcp_server_installations: Default::default(),
@@ -2891,6 +2931,7 @@ fn read_sqlite_data(
     let (multi_agent_conversations, conversation_summary_backfills) =
         read_agent_conversation_metadata(conn)?;
     let projects = get_all_projects(conn)?;
+    let archived_sessions = get_all_archived_sessions(conn)?;
     let project_rules = get_all_project_rules(conn)?;
     let ignored_suggestions = get_all_ignored_suggestions(conn)?;
     let mcp_server_installations = get_all_mcp_server_installations(conn)?;
@@ -2912,6 +2953,7 @@ fn read_sqlite_data(
         workspace_language_servers,
         multi_agent_conversations,
         projects,
+        archived_sessions,
         project_rules,
         ignored_suggestions,
         mcp_server_installations,

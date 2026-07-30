@@ -343,6 +343,7 @@ use crate::server::telemetry::{
     MCPServerCollectionPaneEntrypoint, NotificationsTurnedOnSource, OpenedWarpAISource,
     PaletteSource, SharingDialogSource, TabRenameEvent, TierLimitHitEvent, WarpDriveSource,
 };
+use crate::session_archive::{NewArchiveEntry, SessionArchiveModel};
 use crate::session_management::{SessionNavigationData, SessionSource, TabNavigationData};
 use crate::settings::cloud_preferences::CloudPreferencesSettings;
 use crate::settings::{
@@ -350,8 +351,8 @@ use crate::settings::{
     AppEditorSettings, BlockVisibilitySettings, ChangelogSettings, CodeSettings,
     CodeSettingsChangedEvent, CtrlTabBehavior, CursorBlink, DebugSettings, DefaultSessionMode,
     FontSettings, GPUSettings, InputModeSettings, InputSettings, MonospaceFontSize, PaneSettings,
-    PrivacySettings, SelectionSettings, Settings, SshSettings, ThemeSettings, active_theme_kind,
-    respect_system_theme,
+    PrivacySettings, SelectionSettings, SessionArchiveSettings, Settings, SshSettings,
+    ThemeSettings, active_theme_kind, respect_system_theme,
 };
 use crate::settings_view::environments_page::EnvironmentsPage;
 use crate::settings_view::handoff_environment_creation_modal::{
@@ -12165,6 +12166,71 @@ impl Workspace {
         true
     }
 
+    /// Records where a tab was working before closing it, so the user can find
+    /// it again in the archive section of the vertical tabs panel.
+    fn archive_tab(&mut self, tab_index: usize, ctx: &mut ViewContext<Self>) {
+        let Some(entry) = self.archive_entry_for_tab(tab_index, ctx) else {
+            log::warn!("Failed to archive tab: no tab at index {tab_index}");
+            return;
+        };
+
+        SessionArchiveModel::handle(ctx).update(ctx, |archive, ctx| archive.archive(entry, ctx));
+        self.close_tab(tab_index, true, false, ctx);
+    }
+
+    fn archive_entry_for_tab(&self, tab_index: usize, ctx: &AppContext) -> Option<NewArchiveEntry> {
+        let tab = self.tabs.get(tab_index)?;
+        let pane_group = tab.pane_group.as_ref(ctx);
+        let terminal_view = pane_group.active_session_view(ctx);
+
+        let cwd = terminal_view
+            .as_ref()
+            .and_then(|view| view.as_ref(ctx).pwd_if_local(ctx));
+        let cli_agent = terminal_view.as_ref().and_then(|view| {
+            CLIAgentSessionsModel::as_ref(ctx)
+                .session(view.id())
+                .map(|session| session.agent)
+        });
+        let branch = terminal_view
+            .as_ref()
+            .and_then(|view| view.as_ref(ctx).current_git_branch(ctx));
+        let last_used_at = terminal_view.as_ref().and_then(|view| {
+            let model = view.as_ref(ctx).model.lock();
+            let block = model.block_list().last_non_hidden_block()?;
+            let timestamp = block.completed_ts().or_else(|| block.start_ts())?;
+            Some(timestamp.naive_utc())
+        });
+
+        Some(NewArchiveEntry {
+            title: pane_group.display_title(ctx),
+            cwd,
+            cli_agent,
+            branch,
+            last_used_at,
+        })
+    }
+
+    fn restore_archived_session(&mut self, id: &str, ctx: &mut ViewContext<Self>) {
+        let session =
+            SessionArchiveModel::handle(ctx).update(ctx, |archive, ctx| archive.remove(id, ctx));
+        let Some(session) = session else {
+            log::warn!("Failed to restore archived session: no session for id={id}");
+            return;
+        };
+
+        match session.cwd {
+            Some(cwd) => self.open_directory_in_new_tab(PathBuf::from(cwd), ctx),
+            None => self.add_new_session_tab_with_default_mode(
+                NewSessionSource::Tab,
+                None,
+                None,
+                None,
+                false,
+                ctx,
+            ),
+        }
+    }
+
     /// Opens a confirmation dialog if necessary, or closes immediately if not.
     /// Always closes immediately if skip_confirmation is true.
     fn close_tab(
@@ -23842,6 +23908,23 @@ impl TypedActionView for Workspace {
             ToggleBlockSnackbar => self.toggle_block_snackbar(ctx),
             ToggleWelcomeTips => self.toggle_welcome_tips_visiblity(ctx),
             CloseTab(index) => self.close_tab(*index, false, true, ctx),
+            ArchiveTab(index) => self.archive_tab(*index, ctx),
+            RestoreArchivedSession(id) => self.restore_archived_session(id, ctx),
+            RemoveArchivedSession(id) => {
+                SessionArchiveModel::handle(ctx).update(ctx, |archive, ctx| {
+                    archive.remove(id, ctx);
+                });
+            }
+            ToggleSessionArchiveCollapsed => {
+                SessionArchiveSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    let collapsed = !*settings.archive_section_collapsed.value();
+                    if let Err(err) = settings.archive_section_collapsed.set_value(collapsed, ctx) {
+                        report_error!(
+                            err.context("Failed to persist the session archive collapsed state")
+                        );
+                    }
+                });
+            }
             CloseActiveTab => self.close_tab(self.active_tab_index, false, true, ctx),
             CloseOtherTabs(index) => self.close_other_tabs(*index, false, ctx),
             CloseNonActiveTabs => self.close_other_tabs(self.active_tab_index, false, ctx),

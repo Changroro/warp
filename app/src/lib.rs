@@ -72,6 +72,7 @@ mod reward_view;
 mod safe_triangle;
 mod search_bar;
 mod server;
+mod session_archive;
 mod session_management;
 mod shell_indicator;
 mod suggestions;
@@ -302,6 +303,7 @@ pub use crate::server::telemetry::{
     AgentModeEntrypoint, AgentModeEntrypointSelectionType, TelemetryEvent,
 };
 use crate::server::telemetry::{AppStartupInfo, CloseTarget, PaletteSource, TelemetryCollector};
+use crate::session_archive::SessionArchiveModel;
 use crate::session_management::{RunningSessionSummary, SessionNavigationData};
 use crate::settings::cloud_preferences_syncer::initialize_cloud_preferences_syncer;
 use crate::settings::manager::SettingsManager;
@@ -1566,6 +1568,7 @@ pub(crate) fn initialize_app(
         workspace_language_servers,
         multi_agent_conversations,
         persisted_projects,
+        persisted_archived_sessions,
         persisted_project_rules,
         persisted_ignored_suggestions,
         persisted_mcp_server_installations,
@@ -1588,6 +1591,7 @@ pub(crate) fn initialize_app(
                 sqlite_data.workspace_language_servers,
                 sqlite_data.multi_agent_conversations,
                 sqlite_data.projects,
+                sqlite_data.archived_sessions,
                 sqlite_data.project_rules,
                 sqlite_data.ignored_suggestions,
                 sqlite_data.mcp_server_installations,
@@ -1596,6 +1600,7 @@ pub(crate) fn initialize_app(
         })
         .unwrap_or_else(|| {
             (
+                Default::default(),
                 Default::default(),
                 Default::default(),
                 Default::default(),
@@ -1928,6 +1933,14 @@ pub(crate) fn initialize_app(
 
     ctx.add_singleton_model(|ctx| {
         ProjectManagementModel::new(persisted_projects, persistence_writer.sender(), ctx)
+    });
+
+    ctx.add_singleton_model(|ctx| {
+        SessionArchiveModel::new(
+            persisted_archived_sessions,
+            persistence_writer.sender(),
+            ctx,
+        )
     });
 
     ctx.add_singleton_model(move |_| History::new(command_history));

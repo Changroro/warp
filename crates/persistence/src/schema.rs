@@ -77,6 +77,18 @@ diesel::table! {
 }
 
 diesel::table! {
+    archived_sessions (id) {
+        id -> Text,
+        title -> Text,
+        cwd -> Nullable<Text>,
+        cli_agent -> Nullable<Text>,
+        branch -> Nullable<Text>,
+        last_used_at -> Timestamp,
+        archived_at -> Timestamp,
+    }
+}
+
+diesel::table! {
     blocks (id) {
         id -> Nullable<Integer>,
         pane_leaf_uuid -> Binary,
