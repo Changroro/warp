@@ -105,7 +105,7 @@ use warpui::event::KeyState;
 use warpui::fonts::{Properties, Weight};
 use warpui::geometry::vector::{Vector2F, vec2f};
 use warpui::keymap::Context;
-use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback};
+use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback, ModalButton};
 use warpui::notification::{NotificationSendError, RequestPermissionsOutcome, UserNotification};
 use warpui::platform::{
     Cursor, FilePickerConfiguration, FullscreenState, SystemTheme, TerminationMode,
@@ -345,7 +345,9 @@ use crate::server::telemetry::{
     MCPServerCollectionPaneEntrypoint, NotificationsTurnedOnSource, OpenedWarpAISource,
     PaletteSource, SharingDialogSource, TabRenameEvent, TierLimitHitEvent, WarpDriveSource,
 };
-use crate::session_archive::{NewArchiveEntry, SessionArchiveModel};
+use crate::session_archive::{
+    NewArchiveEntry, SessionArchiveModel, archive_section_collapsed, set_archive_section_collapsed,
+};
 use crate::session_management::{SessionNavigationData, SessionSource, TabNavigationData};
 use crate::settings::cloud_preferences::CloudPreferencesSettings;
 use crate::settings::{
@@ -353,8 +355,8 @@ use crate::settings::{
     AppEditorSettings, BlockVisibilitySettings, ChangelogSettings, CodeSettings,
     CodeSettingsChangedEvent, CtrlTabBehavior, CursorBlink, DebugSettings, DefaultSessionMode,
     FontSettings, GPUSettings, InputModeSettings, InputSettings, MonospaceFontSize, PaneSettings,
-    PrivacySettings, SelectionSettings, SessionArchiveSettings, Settings, SshSettings,
-    ThemeSettings, active_theme_kind, respect_system_theme,
+    PrivacySettings, SelectionSettings, Settings, SshSettings, ThemeSettings, active_theme_kind,
+    respect_system_theme,
 };
 use crate::settings_view::environments_page::EnvironmentsPage;
 use crate::settings_view::handoff_environment_creation_modal::{
@@ -1154,6 +1156,10 @@ pub struct Workspace {
     /// pinned to this tab for the rest of its lifetime so switching tabs does
     /// not re-show it elsewhere.
     feature_intro_tab_pane_group_id: Option<EntityId>,
+    /// Set while a tab is on its way to the archive. The record is only written
+    /// once the tab is actually removed, so cancelling the close confirmation
+    /// leaves nothing behind.
+    pending_archive: Option<(EntityId, NewArchiveEntry)>,
     auto_handoff_sleep_modal: ViewHandle<AutoHandoffSleepModal>,
     chatgpt_plan_modal: ViewHandle<ChatGPTPlanModal>,
     enable_auto_reload_modal: ViewHandle<EnableAutoReloadModal>,
@@ -3573,6 +3579,7 @@ impl Workspace {
             agent_cli_launch_modal: agent_cli_launch_view,
             feature_intro_modal: feature_intro_view,
             feature_intro_tab_pane_group_id: None,
+            pending_archive: None,
             auto_handoff_sleep_modal: auto_handoff_sleep_view,
             chatgpt_plan_modal: chatgpt_plan_view,
             enable_auto_reload_modal,
@@ -12314,6 +12321,16 @@ impl Workspace {
             return;
         }
 
+        if self
+            .pending_archive
+            .as_ref()
+            .is_some_and(|(id, _)| *id == pane_group.id())
+            && let Some((_, entry)) = self.pending_archive.take()
+        {
+            SessionArchiveModel::handle(ctx)
+                .update(ctx, |archive, ctx| archive.archive(entry, ctx));
+        }
+
         // Preserve split-off child-agent tabs by moving their lone pane back
         // before close cleanup. Skip tab moves so the destination keeps the
         // pane.
@@ -12509,8 +12526,17 @@ impl Workspace {
             return;
         };
 
-        SessionArchiveModel::handle(ctx).update(ctx, |archive, ctx| archive.archive(entry, ctx));
-        self.close_tab(tab_index, true, false, ctx);
+        let Some(pane_group_id) = self.tabs.get(tab_index).map(|tab| tab.pane_group.id()) else {
+            return;
+        };
+        self.pending_archive = Some((pane_group_id, entry));
+        self.close_tabs(
+            vec![tab_index].into_iter(),
+            OpenDialogSource::CloseTab { tab_index },
+            false,
+            false,
+            ctx,
+        );
     }
 
     fn archive_entry_for_tab(&self, tab_index: usize, ctx: &AppContext) -> Option<NewArchiveEntry> {
@@ -12536,13 +12562,88 @@ impl Workspace {
             Some(timestamp.naive_utc())
         });
 
+        // A tab the user never renamed carries whatever title the terminal
+        // happened to report, which reads as someone else's name once it sits
+        // in a list. Fall back to the directory the work was in.
+        let title = pane_group.custom_title(ctx).unwrap_or_else(|| {
+            cwd.as_deref()
+                .map(Path::new)
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| pane_group.display_title(ctx))
+        });
+
         Some(NewArchiveEntry {
-            title: pane_group.display_title(ctx),
+            title,
             cwd,
             cli_agent,
             branch,
             last_used_at,
         })
+    }
+
+    /// Resolves where a dragged archive row landed by comparing its centre
+    /// against the rows rendered in the last frame.
+    fn archive_insertion_index_for_drop(&self, dropped_at: RectF, ctx: &AppContext) -> usize {
+        let session_count = SessionArchiveModel::as_ref(ctx).sessions().len();
+        let dropped_centre = dropped_at.origin().y() + dropped_at.height() / 2.;
+        let window_id = self.window_id;
+
+        let mut index = 0;
+        for row_index in 0..session_count {
+            let Some(row) = ctx.element_position_by_id_at_last_frame(
+                window_id,
+                vertical_tabs::archived_session_position_id(row_index),
+            ) else {
+                continue;
+            };
+            if dropped_centre > row.origin().y() + row.height() / 2. {
+                index = row_index + 1;
+            }
+        }
+        index.min(session_count.saturating_sub(1))
+    }
+
+    fn confirm_restore_archived_session(&mut self, id: &str, ctx: &mut ViewContext<Self>) {
+        let Some(session) = SessionArchiveModel::as_ref(ctx).session(id).cloned() else {
+            log::warn!("Failed to restore archived session: no session for id={id}");
+            return;
+        };
+
+        let workspace = ctx.handle();
+        let session_id = session.id.clone();
+        let directory = session
+            .cwd
+            .clone()
+            .unwrap_or_else(|| "your home directory".to_string());
+
+        let dialog = AlertDialogWithCallbacks {
+            message_text: format!("Open \"{}\" again?", session.title),
+            info_text: format!("A new tab will start in {directory}."),
+            button_data: vec![
+                ModalButton {
+                    title: "Open".to_string(),
+                    on_click: Box::new(move |ctx: &mut AppContext| {
+                        if let Some(workspace) = workspace.upgrade(ctx) {
+                            workspace.update(ctx, |workspace, ctx| {
+                                workspace.restore_archived_session(&session_id, ctx);
+                            });
+                        }
+                    }) as AppModalCallback,
+                },
+                ModalButton {
+                    title: "Cancel".to_string(),
+                    on_click: Box::new(|_ctx: &mut AppContext| {}) as AppModalCallback,
+                },
+            ],
+            on_disable: Box::new(|_ctx: &mut AppContext| {}) as AppModalCallback,
+        };
+
+        if cfg!(all(not(target_family = "wasm"), target_os = "macos")) {
+            AppContext::show_native_platform_modal(ctx, dialog);
+        } else {
+            self.show_native_modal(dialog, ctx);
+        }
     }
 
     fn restore_archived_session(&mut self, id: &str, ctx: &mut ViewContext<Self>) {
@@ -12564,6 +12665,11 @@ impl Workspace {
                 ctx,
             ),
         }
+
+        let last_index = self.tabs.len().saturating_sub(1);
+        if self.active_tab_index != last_index {
+            self.move_tab_to_index(self.active_tab_index, last_index, ctx);
+        }
     }
 
     /// Opens a confirmation dialog if necessary, or closes immediately if not.
@@ -12581,6 +12687,7 @@ impl Workspace {
         }
 
         let closed_tab_id = self.tabs.get(index).map(|tab| tab.pane_group.id());
+        self.pending_archive = None;
 
         let tabs_closed = self.close_tabs(
             vec![index].into_iter(),
@@ -24337,21 +24444,26 @@ impl TypedActionView for Workspace {
             ToggleWelcomeTips => self.toggle_welcome_tips_visiblity(ctx),
             CloseTab(index) => self.close_tab(*index, false, true, ctx),
             ArchiveTab(index) => self.archive_tab(*index, ctx),
-            RestoreArchivedSession(id) => self.restore_archived_session(id, ctx),
+            RestoreArchivedSession(id) => self.confirm_restore_archived_session(id, ctx),
+            ReorderArchivedSession { id, dropped_at } => {
+                let target_index = self.archive_insertion_index_for_drop(*dropped_at, ctx);
+                SessionArchiveModel::handle(ctx).update(ctx, |archive, ctx| {
+                    archive.reorder(id, target_index, ctx);
+                });
+            }
             RemoveArchivedSession(id) => {
                 SessionArchiveModel::handle(ctx).update(ctx, |archive, ctx| {
                     archive.remove(id, ctx);
                 });
             }
             ToggleSessionArchiveCollapsed => {
-                SessionArchiveSettings::handle(ctx).update(ctx, |settings, ctx| {
-                    let collapsed = !*settings.archive_section_collapsed.value();
-                    if let Err(err) = settings.archive_section_collapsed.set_value(collapsed, ctx) {
-                        report_error!(
-                            err.context("Failed to persist the session archive collapsed state")
-                        );
-                    }
-                });
+                let collapsed = !archive_section_collapsed(ctx);
+                if let Err(err) = set_archive_section_collapsed(collapsed, ctx) {
+                    report_error!(
+                        err.context("Failed to persist the session archive collapsed state")
+                    );
+                }
+                ctx.notify();
             }
             CloseActiveTab => self.close_tab(self.active_tab_index, false, true, ctx),
             CloseOtherTabs(index) => self.close_other_tabs(*index, false, ctx),

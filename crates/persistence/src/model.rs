@@ -381,6 +381,7 @@ pub struct ArchivedSession {
     pub branch: Option<String>,
     pub last_used_at: NaiveDateTime,
     pub archived_at: NaiveDateTime,
+    pub sort_order: i32,
 }
 
 /// Persisted form of a tab group. `name` is optional — untitled groups omit
