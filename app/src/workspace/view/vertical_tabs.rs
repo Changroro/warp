@@ -20,12 +20,12 @@ use warp_core::ui::theme::{AnsiColorIdentifier, Fill as WarpThemeFill, WarpTheme
 use warpui::elements::{
     Border, ChildAnchor, Clipped, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
     Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, DragAxis, DragBarSide,
-    Draggable, DropShadow, DropTarget, Element, Empty, EventHandler, Expanded, Fill as ElementFill,
-    Flex, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, Padding,
-    ParentAnchor, ParentElement, ParentOffsetBounds, PositionedElementAnchor,
-    PositionedElementOffsetBounds, Radius, Resizable, ResizableStateHandle, SavePosition,
-    ScrollTarget, ScrollToPositionMode, ScrollbarWidth, Shrinkable, Stack, Text,
-    resizable_state_handle,
+    Draggable, DraggableState, DropShadow, DropTarget, Element, Empty, EventHandler, Expanded,
+    Fill as ElementFill, Flex, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle,
+    OffsetPositioning, Padding, ParentAnchor, ParentElement, ParentOffsetBounds,
+    PositionedElementAnchor, PositionedElementOffsetBounds, Radius, Resizable,
+    ResizableStateHandle, SavePosition, ScrollTarget, ScrollToPositionMode, ScrollbarWidth,
+    Shrinkable, Stack, Text, resizable_state_handle,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
@@ -56,8 +56,9 @@ use crate::pane_group::{
 };
 use crate::persistence::model::ArchivedSession;
 use crate::safe_triangle::SafeTriangle;
-use crate::session_archive::{SessionArchiveModel, deserialize_cli_agent};
-use crate::settings::SessionArchiveSettings;
+use crate::session_archive::{
+    SessionArchiveModel, archive_section_collapsed, deserialize_cli_agent,
+};
 use crate::tab::{SelectedTabColor, TabData, tab_position_id};
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::session_settings::SessionSettings;
@@ -732,6 +733,7 @@ pub(super) struct VerticalTabsPanelState {
     session_archive_header_mouse_state: MouseStateHandle,
     session_archive_row_mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
     session_archive_remove_mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
+    session_archive_drag_states: RefCell<HashMap<String, DraggableState>>,
 }
 
 impl Default for VerticalTabsPanelState {
@@ -773,6 +775,7 @@ impl Default for VerticalTabsPanelState {
             session_archive_header_mouse_state: Default::default(),
             session_archive_row_mouse_states: RefCell::default(),
             session_archive_remove_mouse_states: RefCell::default(),
+            session_archive_drag_states: RefCell::default(),
         }
     }
 }
@@ -1165,6 +1168,14 @@ fn resolve_summary_pane_kind_icons(
 impl VerticalTabsPanelState {
     fn session_archive_row_mouse_state(&self, session_id: &str) -> MouseStateHandle {
         self.session_archive_row_mouse_states
+            .borrow_mut()
+            .entry(session_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    fn session_archive_drag_state(&self, session_id: &str) -> DraggableState {
+        self.session_archive_drag_states
             .borrow_mut()
             .entry(session_id.to_string())
             .or_default()
@@ -7408,13 +7419,11 @@ fn render_session_archive_section(
         .iter()
         .filter(|session| archived_session_matches_query(session, &query))
         .collect();
-    if sessions.is_empty() {
+    if sessions.is_empty() && !query.is_empty() {
         return None;
     }
 
-    let is_collapsed = *SessionArchiveSettings::as_ref(app)
-        .archive_section_collapsed
-        .value();
+    let is_collapsed = archive_section_collapsed(app);
     let main_text_color = theme.main_text_color(theme.background());
     let sub_text_color = theme.sub_text_color(theme.background());
     let count_label = sessions.len().to_string();
@@ -7476,8 +7485,23 @@ fn render_session_archive_section(
         .with_child(header);
 
     if !is_collapsed {
-        for session in sessions {
-            section.add_child(render_archived_session_row(state, session, app));
+        if sessions.is_empty() {
+            section.add_child(
+                Container::new(
+                    Text::new_inline(
+                        "Right-click a tab to move it here.",
+                        appearance.ui_font_family(),
+                        11.,
+                    )
+                    .with_color(theme.disabled_ui_text_color().into())
+                    .finish(),
+                )
+                .with_padding(Padding::uniform(6.))
+                .finish(),
+            );
+        }
+        for (index, session) in sessions.iter().enumerate() {
+            section.add_child(render_archived_session_row(state, session, index, app));
         }
     }
 
@@ -7502,6 +7526,7 @@ fn archived_session_matches_query(session: &ArchivedSession, query_lower: &str) 
 fn render_archived_session_row(
     state: &VerticalTabsPanelState,
     session: &ArchivedSession,
+    index: usize,
     app: &AppContext,
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
@@ -7537,7 +7562,7 @@ fn render_archived_session_row(
         .map(|state| state.is_mouse_over_element())
         .unwrap_or(false);
 
-    Hoverable::new(mouse_state, move |row_state| {
+    let row = Hoverable::new(mouse_state, move |row_state| {
         let icon = agent
             .and_then(|agent| agent.icon())
             .map(|icon| icon.to_warpui_icon(sub_text_color).finish())
@@ -7622,7 +7647,24 @@ fn render_archived_session_row(
     .on_click(move |ctx, _, _| {
         ctx.dispatch_typed_action(WorkspaceAction::RestoreArchivedSession(session_id.clone()));
     })
-    .finish()
+    .finish();
+
+    let drag_id = session.id.clone();
+    let row = Draggable::new(state.session_archive_drag_state(&session.id), row)
+        .with_drag_axis(DragAxis::VerticalOnly)
+        .on_drop(move |ctx, _, rect, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::ReorderArchivedSession {
+                id: drag_id.clone(),
+                dropped_at: rect,
+            });
+        })
+        .finish();
+
+    SavePosition::new(row, &archived_session_position_id(index)).finish()
+}
+
+pub(super) fn archived_session_position_id(index: usize) -> String {
+    format!("archived_session_position_{index}")
 }
 
 fn format_last_used(last_used_at: chrono::NaiveDateTime) -> String {

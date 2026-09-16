@@ -1225,6 +1225,7 @@ fn archived_session(title: &str, cwd: Option<&str>) -> ArchivedSession {
         branch: None,
         last_used_at: timestamp,
         archived_at: timestamp,
+        sort_order: 0,
     }
 }
 

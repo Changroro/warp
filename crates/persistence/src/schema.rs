@@ -85,6 +85,7 @@ diesel::table! {
         branch -> Nullable<Text>,
         last_used_at -> Timestamp,
         archived_at -> Timestamp,
+        sort_order -> Integer,
     }
 }
 

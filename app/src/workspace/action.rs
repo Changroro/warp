@@ -182,6 +182,11 @@ pub enum WorkspaceAction {
     RestoreArchivedSession(String),
     /// Forget an archived session without opening it.
     RemoveArchivedSession(String),
+    /// Move an archived session to the position the cursor dropped it at.
+    ReorderArchivedSession {
+        id: String,
+        dropped_at: RectF,
+    },
     /// Toggle collapsed state for the archive section in the vertical tabs panel.
     ToggleSessionArchiveCollapsed,
     CloseActiveTab,
@@ -1214,6 +1219,7 @@ impl WorkspaceAction {
             | OpenCreateAuthSecretModal { .. }
             | OpenNetworkLogPane
             | RemoveArchivedSession(_)
+            | ReorderArchivedSession { .. }
             | ToggleSessionArchiveCollapsed => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,
