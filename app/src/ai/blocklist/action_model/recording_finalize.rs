@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ai::agent::action_result::{RecordingStopped, StopRecordingResult};
@@ -11,6 +12,7 @@ use super::recording_controller::{
     ActiveRecording, FinalizationClaim, FinalizedRecording, RecordingController,
     StopRecordingControllerError,
 };
+use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent_sdk::artifact_upload::{FileArtifactUploadRequest, FileArtifactUploader};
 use crate::ai::blocklist::BlocklistAIHistoryModel;
@@ -56,6 +58,65 @@ fn format_upload_error(err: &anyhow::Error) -> String {
     } else {
         error_chain
     }
+}
+
+/// Best-effort PR video thumbnail upload.
+///
+/// Generates a thumbnail PNG from the finalized `video_path` (a representative,
+/// downscaled frame with a play-button glyph burned in), then uploads it as a
+/// separate `FILE` artifact. The server links the thumbnail to its video by the
+/// `{video_artifact_uid}-thumb.png` filename convention rather than a schema
+/// back-reference. The local thumbnail file is removed whether the upload
+/// succeeds or fails.
+///
+/// Any error is returned to the caller, which logs and discards it so the video
+/// upload and PR creation are never blocked by a missing or failed thumbnail.
+async fn upload_recording_thumbnail(
+    video_path: &Path,
+    video_artifact_uid: &str,
+    uploader: &FileArtifactUploader,
+    conversation_id: Option<ServerConversationToken>,
+) -> anyhow::Result<()> {
+    let thumbnail_path =
+        computer_use::generate_video_thumbnail(video_path, video_artifact_uid).await?;
+    let upload_result = async {
+        let request = FileArtifactUploadRequest {
+            path: thumbnail_path.clone(),
+            run_id: None,
+            conversation_id,
+            title: None,
+            description: None,
+        };
+        let association = uploader.resolve_upload_association(&request).await?;
+        uploader.upload_with_association(request, association).await
+    }
+    .await;
+    // The thumbnail file is ephemeral regardless of upload outcome.
+    let _ = std::fs::remove_file(&thumbnail_path);
+    upload_result?;
+    Ok(())
+}
+
+async fn validated_recording_for_upload(
+    raw_path: &Path,
+    processed_path: Option<PathBuf>,
+) -> Result<(PathBuf, Duration, Option<PathBuf>), computer_use::RecordingError> {
+    if let Some(processed_path) = processed_path {
+        match computer_use::finalized_video_duration(&processed_path).await {
+            Ok(duration) => {
+                return Ok((processed_path.clone(), duration, Some(processed_path)));
+            }
+            Err(error) => {
+                log::warn!(
+                    "Recording cut/overlay output validation failed; uploading original: {error}"
+                );
+                let _ = std::fs::remove_file(processed_path);
+            }
+        }
+    }
+
+    let duration = computer_use::finalized_video_duration(raw_path).await?;
+    Ok((raw_path.to_path_buf(), duration, None))
 }
 
 /// Stops capture, uploads the finalized file, and produces the result retained
@@ -106,9 +167,7 @@ async fn finalize_recording(
     // before upload. Best-effort: on any failure the original 1x capture is
     // uploaded unannotated (a no-cut video beats no video). The cut/overlay
     // file, when produced, is a sibling of the mp4.
-    let mut upload_path = local_path.clone();
-    let mut overlay_path: Option<std::path::PathBuf> = None;
-    match computer_use::post_process_recording(
+    let processed_path = match computer_use::post_process_recording(
         &local_path,
         &actions,
         (output.width, output.height),
@@ -117,29 +176,31 @@ async fn finalize_recording(
     )
     .await
     {
-        Ok(path) if path != local_path => {
-            overlay_path = Some(path.clone());
-            upload_path = path;
-        }
-        Ok(_) => {}
+        Ok(path) if path != local_path => Some(path),
+        Ok(_) => None,
         Err(error) => {
             log::warn!("Recording cut/overlay burn-in failed; uploading original: {error}");
-        }
-    }
-    let duration = match computer_use::finalized_video_duration(&upload_path).await {
-        Ok(duration) => duration,
-        Err(error) => {
-            log::warn!(
-                "Failed to inspect finalized recording duration; using capture duration: {error}"
-            );
-            output.duration
+            None
         }
     };
+    let (upload_path, duration, overlay_path) =
+        match validated_recording_for_upload(&local_path, processed_path).await {
+            Ok(validated) => validated,
+            Err(error) => {
+                let _ = std::fs::remove_file(&local_path);
+                let _ = std::fs::remove_file(local_path.with_extension("log"));
+                return StopRecordingResult::Error(error.to_string());
+            }
+        };
 
+    // Keep a handle on the finalized video path for thumbnail extraction before
+    // it is moved into the upload request; the thumbnail reads this file with
+    // ffmpeg after the video upload resolves.
+    let thumbnail_source_path = upload_path.clone();
     let request = FileArtifactUploadRequest {
         path: upload_path,
         run_id: None,
-        conversation_id: server_conversation_token,
+        conversation_id: server_conversation_token.clone(),
         title: recording.summary.clone(),
         description: recording.description.clone(),
     };
@@ -148,6 +209,24 @@ async fn finalize_recording(
         uploader.upload_with_association(request, association).await
     }
     .await;
+    // Best-effort PR video thumbnail: after a successful non-discard video
+    // upload, extract a representative frame, composite a play-button glyph, and
+    // upload it as a separate PNG file artifact linked to the video by the
+    // `{video_uuid}-thumb.png` filename convention. Capture is unconditional; the
+    // team setting and feature flag are consulted only at server render time. A
+    // missing/failed thumbnail must never block the video upload or PR creation,
+    // so any error is logged and dropped.
+    if let Ok(upload) = &upload_result
+        && let Err(error) = upload_recording_thumbnail(
+            &thumbnail_source_path,
+            &upload.artifact.artifact_uid,
+            &uploader,
+            server_conversation_token.clone(),
+        )
+        .await
+    {
+        log::warn!("PR video thumbnail capture failed; video upload unaffected: {error}");
+    }
     // Local files are ephemeral regardless of upload outcome. Retrying failed
     // uploads or retaining their files requires a separate persistence policy.
     let _ = std::fs::remove_file(&local_path);

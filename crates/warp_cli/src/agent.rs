@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::builder::PossibleValue;
 use clap::{Args, Subcommand, ValueEnum};
@@ -11,7 +12,7 @@ use crate::environment::EnvironmentCreateArgs;
 use crate::json_filter::JsonOutput;
 use crate::mcp::MCPSpec;
 use crate::model::ModelArgs;
-use crate::scope::ObjectScope;
+use crate::scope::{ObjectScope, TeamSelection};
 use crate::share::ShareArgs;
 use crate::skill::SkillSpec;
 
@@ -37,6 +38,141 @@ impl fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = self.to_possible_value().expect("no values are skipped");
         f.write_str(value.get_name())
+    }
+}
+
+/// Source-control provider for a repository checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RepositoryForge {
+    #[serde(rename = "GITHUB")]
+    GitHub,
+    #[serde(rename = "GITLAB")]
+    GitLab,
+    #[serde(rename = "AZURE_DEVOPS")]
+    AzureDevOps,
+}
+/// Server-supplied repository HEAD used to prepare an agent run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RepositoryHeadRef {
+    CommitSha(String),
+    Branch(String),
+}
+
+impl RepositoryHeadRef {
+    pub fn value(&self) -> &str {
+        match self {
+            Self::CommitSha(value) | Self::Branch(value) => value,
+        }
+    }
+}
+
+/// Canonical repository identity used by server-owned preparation instructions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryIdentity {
+    pub code_forge: RepositoryForge,
+    #[serde(rename = "owner")]
+    pub repo_owner: String,
+    #[serde(rename = "repo")]
+    pub repo_name: String,
+}
+
+impl RepositoryIdentity {
+    pub fn identity(&self) -> (RepositoryForge, String, String) {
+        (
+            self.code_forge,
+            self.repo_owner.to_lowercase(),
+            self.repo_name.to_lowercase(),
+        )
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.repo_owner.is_empty() || self.repo_owner.trim() != self.repo_owner {
+            return Err(
+                "repo_owner must not be empty or contain surrounding whitespace".to_string(),
+            );
+        }
+        if self.repo_name.is_empty() || self.repo_name.trim() != self.repo_name {
+            return Err(
+                "repo_name must not be empty or contain surrounding whitespace".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Server-supplied repository preparation override.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryPreparationOverride {
+    pub code_forge: RepositoryForge,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub head: RepositoryHeadRef,
+    pub clone_from: Option<RepositoryIdentity>,
+    #[serde(default)]
+    pub preserve_origin: bool,
+}
+
+impl RepositoryPreparationOverride {
+    pub fn identity(&self) -> (RepositoryForge, String, String) {
+        (
+            self.code_forge,
+            self.repo_owner.to_lowercase(),
+            self.repo_name.to_lowercase(),
+        )
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        RepositoryIdentity {
+            code_forge: self.code_forge,
+            repo_owner: self.repo_owner.clone(),
+            repo_name: self.repo_name.clone(),
+        }
+        .validate()?;
+        if let Some(clone_from) = &self.clone_from {
+            clone_from.validate()?;
+        }
+        match &self.head {
+            RepositoryHeadRef::CommitSha(commit_sha) => {
+                if commit_sha.len() != 40
+                    || !commit_sha
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                {
+                    return Err(
+                        "commit SHA must be an exact 40-character lowercase hexadecimal SHA"
+                            .to_string(),
+                    );
+                }
+            }
+            RepositoryHeadRef::Branch(branch) => {
+                if branch.is_empty() || branch.trim() != branch {
+                    return Err(
+                        "branch must not be empty or contain surrounding whitespace".to_string()
+                    );
+                }
+            }
+        }
+        if self.clone_from.is_some() && !self.preserve_origin {
+            return Err("clone_from requires preserve_origin".to_string());
+        }
+        if self.preserve_origin && self.clone_from.is_none() {
+            return Err("preserve_origin requires clone_from".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for RepositoryPreparationOverride {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let preparation_override = serde_json::from_str::<Self>(value)
+            .map_err(|error| format!("invalid repository preparation override JSON: {error}"))?;
+        preparation_override.validate()?;
+        Ok(preparation_override)
     }
 }
 
@@ -216,7 +352,7 @@ impl Harness {
 
     pub fn display_name(self) -> &'static str {
         match self {
-            Self::Oz => "Oz",
+            Self::Oz => "Warp Agent",
             Self::Claude => "Claude Code",
             Self::OpenCode => "OpenCode",
             Self::Gemini => "Gemini CLI",
@@ -281,9 +417,9 @@ pub enum AgentProfileCommand {
 /// Agent-related subcommands.
 #[derive(Debug, Clone, Subcommand)]
 pub enum AgentCommand {
-    /// Run a new Oz agent.
+    /// Run a new Warp Agent.
     Run(RunAgentArgs),
-    /// Dispatch an Oz agent that runs remotely.
+    /// Dispatch a cloud agent.
     RunCloud(RunCloudArgs),
     /// Manage agent profiles.
     #[command(subcommand)]
@@ -331,6 +467,8 @@ impl AgentCommand {
 pub struct RunAgentArgs {
     #[command(flatten)]
     pub prompt_arg: PromptArg,
+    #[command(flatten)]
+    pub team_selection: TeamSelection,
 
     #[command(flatten)]
     pub model: ModelArgs,
@@ -402,6 +540,29 @@ pub struct RunAgentArgs {
     )]
     pub idle_on_complete: Option<humantime::Duration>,
 
+    /// Keep the agent's session open after the conversation ends in a terminal error, so a human
+    /// can attach to the failed run and debug in it. The agent process is the shared-session
+    /// sharer, so without this the session dies with the process.
+    ///
+    /// An idle window, not a fixed one: a follow-up cancels the pending exit.
+    ///
+    /// Deliberately separate from `--idle-on-complete`, which covers the success/blocked/cancelled
+    /// lifecycle. Neither flag is a fallback for the other.
+    ///
+    /// Cloud workers set this through `OZ_IDLE_ON_FAIL` rather than the flag, so that a pinned
+    /// CLI predating this option ignores it instead of rejecting an unknown argument.
+    ///
+    /// You can optionally provide a duration (e.g. `--idle-on-fail 10m`).
+    #[arg(
+        long = "idle-on-fail",
+        value_name = "DURATION",
+        env = "OZ_IDLE_ON_FAIL",
+        num_args = 0..=1,
+        default_missing_value = "15m",
+        hide = true
+    )]
+    pub idle_on_fail: Option<humantime::Duration>,
+
     #[command(flatten)]
     pub snapshot: SnapshotArgs,
     /// Identifier for the task that spawned this agent, used to report progress.
@@ -448,7 +609,7 @@ pub struct RunAgentArgs {
 
     /// Execution harness for the agent run.
     ///
-    /// "oz" (default) uses Warp's built-in agent infrastructure.
+    /// "oz" (default) uses Warp Agent.
     /// "claude" delegates to the `claude` CLI.
     #[arg(long = "harness", value_name = "HARNESS", default_value_t = Harness::Oz, hide = true)]
     pub harness: Harness,
@@ -470,6 +631,20 @@ pub struct RunAgentArgs {
 
     #[arg(long = "configure-git-credentials-with-github", hide = true, requires_all = ["task_id"])]
     pub configure_git_credentials_with_github: bool,
+
+    /// Repository preparation override supplied by the server for this task.
+    #[arg(
+        long = "repository-head-override-json",
+        value_name = "JSON",
+        action = clap::ArgAction::Append,
+        requires = "task_id",
+        hide = true
+    )]
+    pub repository_preparation_overrides: Vec<RepositoryPreparationOverride>,
+
+    /// Remove the origin remote from environment repositories after setup.
+    #[arg(long = "remove-repository-origins", requires = "task_id", hide = true)]
+    pub remove_repository_origins: bool,
 }
 
 impl RunAgentArgs {
@@ -535,6 +710,23 @@ pub struct RunCloudArgs {
     /// Name for this agent task.
     #[arg(long = "name", short = 'n')]
     pub name: Option<String>,
+
+    /// Title for this agent task and its conversation.
+    ///
+    /// Unlike `--name`, which sets the agent configuration name, `--title`
+    /// controls the task and conversation title shown for the run. When
+    /// spawning a factory sibling, pass the child task title here.
+    #[arg(long = "title", value_name = "TITLE")]
+    pub title: Option<String>,
+
+    /// Run ID of the parent run that is spawning this run.
+    ///
+    /// Setting this makes the new run an orchestration child of the given
+    /// parent: it inherits the parent's lineage (depth, root run) and scope,
+    /// is attributed to the ORCHESTRATION source, and is tracked on the parent
+    /// run. Pass the current run ID when a factory foreman spawns a sibling.
+    #[arg(long = "parent-run-id", value_name = "RUN_ID")]
+    pub parent_run_id: Option<String>,
 
     /// MCP servers to start before executing the agent.
     ///
@@ -658,6 +850,8 @@ pub enum AgentSortByArg {
 /// Arguments for listing named agents.
 #[derive(Debug, Clone, Args)]
 pub struct AgentListArgs {
+    #[command(flatten)]
+    pub team_selection: TeamSelection,
     /// Sort field. Only supported for pretty, text, and ndjson output.
     #[arg(long = "sort-by", value_enum, value_name = "FIELD")]
     pub sort_by: Option<AgentSortByArg>,
@@ -685,6 +879,8 @@ pub struct AgentGetArgs {
 /// Arguments for creating a named agent.
 #[derive(Debug, Clone, Args)]
 pub struct AgentCreateArgs {
+    #[command(flatten)]
+    pub team_selection: TeamSelection,
     /// Name of the agent.
     #[arg(long = "name", short = 'n')]
     pub name: String,
@@ -830,6 +1026,8 @@ pub struct AgentDeleteArgs {
 /// Arguments for listing available agent skills.
 #[derive(Debug, Clone, Args)]
 pub struct ListAgentSkillsArgs {
+    #[command(flatten)]
+    pub team_selection: TeamSelection,
     /// List skills from a specific GitHub repository.
     ///
     /// Format: `owner/repo` or `https://github.com/owner/repo`

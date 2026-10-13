@@ -33,6 +33,7 @@ fn request_params_with_ask_user_question_enabled(ask_user_question_enabled: bool
         mcp_context: None,
         planning_enabled: true,
         should_redact_secrets: false,
+        member_byo_credentials_allowed: false,
         api_keys: None,
         custom_model_providers: None,
         custom_model_routers: None,
@@ -91,6 +92,8 @@ fn api_keys_with_warp_credit_fallback_setting_preserves_existing_keys() {
             allow_use_of_warp_credits: false,
             aws_credentials: None,
             google_cloud_credentials: None,
+            chatgpt_delegated_access_token: String::new(),
+            skip_chatgpt_subscription: false,
         }),
         true,
     )

@@ -1383,7 +1383,7 @@ impl SshProfileModalView {
 
     fn render_error_text(text: String, appearance: &Appearance) -> Box<dyn Element> {
         Text::new(text, appearance.ui_font_family(), 11.)
-            .with_color(appearance.theme().ui_error_color().into())
+            .with_color(appearance.theme().ui_error_color())
             .finish()
     }
 

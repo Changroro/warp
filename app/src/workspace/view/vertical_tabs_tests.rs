@@ -1,7 +1,8 @@
+use std::collections::{HashMap, HashSet};
+use std::iter::once;
 use std::path::PathBuf;
 
 use chrono::NaiveDate;
-
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
 use warpui::EntityId;
@@ -14,15 +15,16 @@ use super::{
     VerticalTabsSummaryPrimaryLabel, archived_session_matches_query, branch_label_display,
     coalesce_summary_branch_entries, code_detail_kind_label, compact_branch_subtitle_display,
     detail_sidecar_width_and_bounds, detail_target_for_hovered_row, format_last_used,
+    group_display_name, group_name_highlight_indices, matched_group_ids, merge_group_name_matches,
     non_terminal_search_text_fragments, pane_ids_for_display_granularity,
     pane_search_text_fragments, preferred_agent_tab_titles, push_normalized_unique_summary_label,
     search_fragments_contain_query, select_summary_pane_kind_icons,
     should_keep_detail_sidecar_visible_for_mouse_position, should_show_tab_group_header,
-    sort_summary_primary_labels_status_first, summary_overflow_count,
-    summary_search_text_fragments, terminal_kind_badge_label, terminal_primary_line_data,
-    terminal_pull_request_badge_label, terminal_search_text_fragments,
-    terminal_title_fallback_font, uses_outer_group_container, visible_pane_ids_for_detail_target,
-    vtab_diff_stats_text,
+    shows_synced_inputs_indicator, sort_summary_primary_labels_status_first,
+    summary_overflow_count, summary_search_text_fragments, tab_admitted_by_group_name,
+    terminal_kind_badge_label, terminal_primary_line_data, terminal_pull_request_badge_label,
+    terminal_search_text_fragments, terminal_title_fallback_font, uses_outer_group_container,
+    visible_pane_ids_for_detail_target, vtab_diff_stats_text,
 };
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::context_chips::display_chip::GitLineChanges;
@@ -30,7 +32,9 @@ use crate::pane_group::pane::IPaneType;
 use crate::pane_group::{PaneId, TerminalPaneId};
 use crate::persistence::model::ArchivedSession;
 use crate::safe_triangle::SafeTriangle;
+use crate::tab::{ShortcutModifierKind, reveals_shortcut_hints};
 use crate::terminal::CLIAgent;
+use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::VerticalTabsDisplayGranularity;
 
 fn label(text: &str) -> VerticalTabsSummaryPrimaryLabel {
@@ -157,8 +161,8 @@ fn summary_pane_kind_icons_distinguish_ambient_claude_from_local_claude() {
 #[test]
 fn preferred_agent_tab_titles_default_to_title_like_text() {
     let agent_text = TerminalAgentText {
-        conversation_display_title: Some("Generated Oz title".to_string()),
-        conversation_latest_user_prompt: Some("Latest Oz prompt".to_string()),
+        conversation_display_title: Some("Generated Warp Agent title".to_string()),
+        conversation_latest_user_prompt: Some("Latest Warp Agent prompt".to_string()),
         cli_agent_title: Some("CLI summary".to_string()),
         cli_agent_latest_user_prompt: Some("Latest CLI prompt".to_string()),
         is_oz_agent: true,
@@ -168,7 +172,7 @@ fn preferred_agent_tab_titles_default_to_title_like_text() {
     assert_eq!(
         preferred_agent_tab_titles(&agent_text, AgentTabTextPreference::ConversationTitle),
         (
-            Some("Generated Oz title".to_string()),
+            Some("Generated Warp Agent title".to_string()),
             Some("CLI summary".to_string())
         )
     );
@@ -227,8 +231,8 @@ fn terminal_primary_line_uses_terminal_title_when_disabled_cli_has_only_prompt()
 #[test]
 fn preferred_agent_tab_titles_use_latest_prompt_when_enabled() {
     let agent_text = TerminalAgentText {
-        conversation_display_title: Some("Generated Oz title".to_string()),
-        conversation_latest_user_prompt: Some("Latest Oz prompt".to_string()),
+        conversation_display_title: Some("Generated Warp Agent title".to_string()),
+        conversation_latest_user_prompt: Some("Latest Warp Agent prompt".to_string()),
         cli_agent_title: Some("CLI summary".to_string()),
         cli_agent_latest_user_prompt: Some("Latest CLI prompt".to_string()),
         is_oz_agent: true,
@@ -238,7 +242,7 @@ fn preferred_agent_tab_titles_use_latest_prompt_when_enabled() {
     assert_eq!(
         preferred_agent_tab_titles(&agent_text, AgentTabTextPreference::LatestUserPrompt),
         (
-            Some("Latest Oz prompt".to_string()),
+            Some("Latest Warp Agent prompt".to_string()),
             Some("Latest CLI prompt".to_string())
         )
     );
@@ -299,7 +303,7 @@ fn terminal_primary_line_uses_cli_prompt_when_enabled_cli_is_long_running() {
 #[test]
 fn preferred_agent_tab_titles_fall_back_when_preferred_text_is_missing() {
     let agent_text = TerminalAgentText {
-        conversation_display_title: Some("Generated Oz title".to_string()),
+        conversation_display_title: Some("Generated Warp Agent title".to_string()),
         conversation_latest_user_prompt: None,
         cli_agent_title: None,
         cli_agent_latest_user_prompt: Some("Latest CLI prompt".to_string()),
@@ -310,7 +314,7 @@ fn preferred_agent_tab_titles_fall_back_when_preferred_text_is_missing() {
     assert_eq!(
         preferred_agent_tab_titles(&agent_text, AgentTabTextPreference::LatestUserPrompt),
         (
-            Some("Generated Oz title".to_string()),
+            Some("Generated Warp Agent title".to_string()),
             Some("Latest CLI prompt".to_string())
         )
     );
@@ -1151,6 +1155,38 @@ fn sort_summary_primary_labels_moves_status_first_and_preserves_order() {
 }
 
 #[test]
+fn synced_inputs_indicator_shows_on_synced_terminal_rows() {
+    assert!(shows_synced_inputs_indicator(true, true, true));
+}
+
+#[test]
+fn synced_inputs_indicator_hidden_when_tab_is_not_synced() {
+    assert!(!shows_synced_inputs_indicator(true, false, true));
+}
+
+#[test]
+fn synced_inputs_indicator_respects_tab_indicators_setting() {
+    assert!(!shows_synced_inputs_indicator(true, true, false));
+}
+
+#[test]
+fn synced_inputs_indicator_hidden_on_non_terminal_rows() {
+    assert!(!shows_synced_inputs_indicator(false, true, true));
+}
+
+#[test]
+fn reveals_shortcut_hints_requires_overlap_with_binding_modifiers() {
+    let super_kind = once(ShortcutModifierKind::Super).collect();
+    assert!(reveals_shortcut_hints(&super_kind, &super_kind));
+
+    let alt_kind = once(ShortcutModifierKind::Alt).collect();
+    assert!(!reveals_shortcut_hints(&alt_kind, &super_kind));
+
+    let empty = std::collections::HashSet::new();
+    assert!(!reveals_shortcut_hints(&empty, &super_kind));
+}
+
+#[test]
 fn summary_search_fragments_include_hidden_overflow_values() {
     let summary = VerticalTabsSummaryData {
         primary_labels: vec![
@@ -1158,7 +1194,7 @@ fn summary_search_fragments_include_hidden_overflow_values() {
                 text: "Claude".to_string(),
                 status: Some(ConversationStatus::InProgress),
             },
-            label("Oz"),
+            label("Warp Agent"),
             label("cargo"),
             label("code review"),
             label("hidden work"),
@@ -1229,6 +1265,13 @@ fn archived_session(title: &str, cwd: Option<&str>) -> ArchivedSession {
     }
 }
 
+fn tab_group(name: Option<&str>) -> TabGroup {
+    TabGroup {
+        name: name.map(str::to_string),
+        ..TabGroup::new()
+    }
+}
+
 #[test]
 fn an_empty_query_keeps_every_archived_session() {
     let session = archived_session("warp", Some("/home/me/warp"));
@@ -1268,5 +1311,231 @@ fn last_used_labels_step_from_minutes_to_a_date() {
     assert_eq!(
         format_last_used(long_ago),
         long_ago.format("%Y-%m-%d").to_string()
+    );
+}
+
+#[test]
+fn group_display_name_uses_the_group_name_when_set() {
+    assert_eq!(group_display_name(&tab_group(Some("backend"))), "backend");
+}
+
+#[test]
+fn group_display_name_falls_back_to_the_untitled_header_text() {
+    assert_eq!(group_display_name(&tab_group(None)), "New Group");
+}
+
+#[test]
+fn group_name_match_includes_members_that_did_not_match_on_their_own() {
+    let group = TabGroupId::new();
+    let tab_group_ids = vec![Some(group), Some(group), None];
+
+    let merged = merge_group_name_matches(
+        &tab_group_ids,
+        &HashSet::from([group]),
+        // Only the second tab matched on its own title.
+        vec![(1, None)],
+    );
+
+    assert_eq!(merged, vec![(0, None), (1, None)]);
+}
+
+#[test]
+fn group_name_match_keeps_results_ordered_by_tab_index() {
+    let group = TabGroupId::new();
+    // Ungrouped tabs on either side of the group.
+    let tab_group_ids = vec![None, Some(group), Some(group), None];
+
+    let merged = merge_group_name_matches(
+        &tab_group_ids,
+        &HashSet::from([group]),
+        vec![(0, None), (3, None)],
+    );
+
+    assert_eq!(
+        merged,
+        vec![(0, None), (1, None), (2, None), (3, None)],
+        "group members must be interleaved in tab order, not appended"
+    );
+}
+
+#[test]
+fn group_name_match_upgrades_a_pane_filtered_member_to_all_panes() {
+    let group = TabGroupId::new();
+    let tab_group_ids = vec![Some(group)];
+
+    let merged = merge_group_name_matches(
+        &tab_group_ids,
+        &HashSet::from([group]),
+        // The tab matched on one pane row only.
+        vec![(0, Some(vec![pane_id()]))],
+    );
+
+    assert_eq!(
+        merged,
+        vec![(0, None)],
+        "a group-name match shows the whole tab, not a pane-filtered slice"
+    );
+}
+
+#[test]
+fn group_name_match_for_a_group_with_no_members_changes_nothing() {
+    let empty_group = TabGroupId::new();
+    let tab_group_ids = vec![None, None];
+
+    let merged = merge_group_name_matches(
+        &tab_group_ids,
+        &HashSet::from([empty_group]),
+        vec![(1, None)],
+    );
+
+    assert_eq!(merged, vec![(1, None)]);
+}
+
+#[test]
+fn group_name_match_leaves_tabs_outside_the_group_filtered() {
+    let matched = TabGroupId::new();
+    let other = TabGroupId::new();
+    let tab_group_ids = vec![Some(matched), Some(other), None];
+
+    let merged = merge_group_name_matches(&tab_group_ids, &HashSet::from([matched]), vec![]);
+
+    assert_eq!(
+        merged,
+        vec![(0, None)],
+        "only members of the name-matched group are force-included"
+    );
+}
+
+#[test]
+fn no_group_name_match_leaves_the_filtered_tabs_untouched() {
+    let group = TabGroupId::new();
+    let tab_group_ids = vec![Some(group), None];
+    let own_matches = vec![(1, Some(vec![pane_id()]))];
+
+    let merged = merge_group_name_matches(&tab_group_ids, &HashSet::new(), own_matches.clone());
+
+    assert_eq!(merged, own_matches);
+}
+
+fn tab_groups_map(groups: Vec<TabGroup>) -> HashMap<TabGroupId, TabGroup> {
+    groups.into_iter().map(|group| (group.id, group)).collect()
+}
+
+#[test]
+fn matched_group_ids_selects_groups_whose_displayed_name_contains_the_query() {
+    let backend = tab_group(Some("backend"));
+    let frontend = tab_group(Some("frontend"));
+    let backend_id = backend.id;
+    let groups = tab_groups_map(vec![backend, frontend]);
+
+    assert_eq!(
+        matched_group_ids(&groups, "backend"),
+        HashSet::from([backend_id])
+    );
+}
+
+#[test]
+fn matched_group_ids_is_case_insensitive() {
+    let group = tab_group(Some("Backend Services"));
+    let id = group.id;
+    let groups = tab_groups_map(vec![group]);
+
+    assert_eq!(matched_group_ids(&groups, "backend"), HashSet::from([id]));
+}
+
+#[test]
+fn matched_group_ids_matches_the_untitled_group_placeholder() {
+    let group = tab_group(None);
+    let id = group.id;
+    let groups = tab_groups_map(vec![group]);
+
+    assert_eq!(matched_group_ids(&groups, "new group"), HashSet::from([id]));
+}
+
+#[test]
+fn matched_group_ids_is_empty_when_nothing_matches() {
+    let groups = tab_groups_map(vec![tab_group(Some("backend"))]);
+
+    assert!(matched_group_ids(&groups, "nomatch").is_empty());
+}
+
+#[test]
+fn tab_is_admitted_by_group_name_only_when_its_group_matched() {
+    let matched = TabGroupId::new();
+    let other = TabGroupId::new();
+    let matched_groups = HashSet::from([matched]);
+
+    assert!(tab_admitted_by_group_name(Some(matched), &matched_groups));
+    assert!(!tab_admitted_by_group_name(Some(other), &matched_groups));
+    assert!(
+        !tab_admitted_by_group_name(None, &matched_groups),
+        "an ungrouped tab is never admitted by a group-name match"
+    );
+}
+
+#[test]
+fn group_name_highlights_case_insensitive_substrings() {
+    assert_eq!(
+        group_name_highlight_indices("My Backend", "BACK"),
+        vec![3, 4, 5, 6]
+    );
+}
+
+#[test]
+fn group_name_highlights_repeated_matches() {
+    assert_eq!(
+        group_name_highlight_indices("dev / DEV", "dev"),
+        vec![0, 1, 2, 6, 7, 8]
+    );
+}
+
+#[test]
+fn group_name_highlights_overlapping_matches() {
+    assert_eq!(
+        group_name_highlight_indices("banana", "ana"),
+        vec![1, 2, 3, 4, 5]
+    );
+}
+
+#[test]
+fn group_name_highlights_use_character_indices_after_multibyte_text() {
+    assert_eq!(group_name_highlight_indices("🚀 Équipe", "éq"), vec![2, 3]);
+}
+
+#[test]
+fn group_name_highlights_map_expanding_lowercase_to_original_characters() {
+    assert_eq!(
+        group_name_highlight_indices("İ Backend", "back"),
+        vec![2, 3, 4, 5]
+    );
+    assert_eq!(group_name_highlight_indices("İ Backend", "i"), vec![0]);
+}
+
+#[test]
+fn group_name_highlights_preserve_contextual_lowercasing() {
+    assert_eq!(group_name_highlight_indices("ΟΣ", "ος"), vec![0, 1]);
+}
+
+#[test]
+fn group_name_highlights_clear_for_empty_query() {
+    assert_eq!(
+        group_name_highlight_indices("Backend", ""),
+        Vec::<usize>::new()
+    );
+}
+
+#[test]
+fn group_name_highlights_do_not_use_fuzzy_matching() {
+    assert_eq!(
+        group_name_highlight_indices("Backend", "bkd"),
+        Vec::<usize>::new()
+    );
+}
+
+#[test]
+fn group_name_highlights_match_untitled_fallback() {
+    assert_eq!(
+        group_name_highlight_indices(&group_display_name(&tab_group(None)), "group"),
+        vec![4, 5, 6, 7, 8]
     );
 }

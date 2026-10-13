@@ -25,21 +25,34 @@ Environment variables:
 - `WS_SERVER_URL` - WebSocket endpoint (default: `ws://localhost:8080/graphql/v2`)
 
 ### Testing
-- `cargo nextest run --no-fail-fast --workspace --exclude command-signatures-v2` - Run tests with nextest
-- `cargo nextest run -p warp_completer --features v2` - Run completer tests with v2 features
+- `cargo nextest run --no-fail-fast --workspace` - Run tests with nextest
 - `cargo test --doc` - Run doc tests
-- `cargo test` - Run standard tests for individual packages
+- `cargo nextest run -p <package>` - Run tests for an individual package
 
 ### Linting and Formatting
-- `./script/presubmit` - Run all presubmit checks (fmt, clippy, tests)
+- `./script/presubmit` - Run the full local presubmit only when explicitly requested
 - `./script/format` - Format code
-- `cargo clippy --workspace --all-targets --all-features --tests -- -D warnings` - Run clippy
-- `./script/run-clang-format.py -r --extensions 'c,h,cpp,m' ./crates/warpui/src/ ./app/src/` - Format C/C++/Obj-C code
+- `cargo clippy -p <package> --all-targets --tests -- -D warnings` - Run targeted Clippy
+- `./script/run-clang-format.py -r --extensions 'c,h,cpp,m' ./crates/warpui/src/ ./app/src/` - Check C/C++/Obj-C formatting
+- `./script/run-clang-format.py -i -r --extensions 'c,h,cpp,m' ./crates/warpui/src/ ./app/src/` - Format C/C++/Obj-C code in place
 - `find . -name "*.wgsl" -exec wgslfmt --check {} +` - Check WGSL shader formatting
+- `find . -name "*.wgsl" -exec wgslfmt {} +` - Format WGSL shaders in place
+
+### Implementation Validation Order
+Optimize for fast delivery and let CI catch uncommon failures outside targeted local coverage.
+
+1. While editing, run only the smallest targeted `cargo check` or `cargo nextest` command that gives useful feedback; defer checks and tests until after implementation where possible.
+2. Once the code and self-review are complete, run the relevant tests and fix the code until they pass.
+3. Run the relevant Clippy and other lint, typecheck, or build checks and fix their findings. Return to affected tests only when a fix materially changes behavior.
+4. Run every applicable mutating formatter once, after all other code changes are complete.
+5. Open or update the PR without rerunning tests or lint after formatting and without adding a full `./script/presubmit` run.
+
+Run the full presubmit only when the user, task, or approved spec explicitly requires it. For agent-driven implementation, this section replaces the broader pre-push presubmit guidance in `CONTRIBUTING.md`; that document still describes the human contributor workflow. A later source, test, manifest, generated-code, or configuration change creates a new candidate: rerun the affected portion of the sequence and finish with the applicable formatter. Local commits are checkpoints rather than validation boundaries and do not each need to pass independently. PR text, comments, labels, and other metadata do not invalidate code validation.
 
 ### Platform Setup
 - `./script/bootstrap` - Platform-specific setup plus common agent skill installation from `skills-lock.json`; prompts for project/global when an install or update is needed unless a target flag or environment override is provided.
 - `./script/bootstrap --skip-common-skills` - Platform setup without installing or updating common agent skills.
+- `WARP_SKIP_COMMON_SKILLS_INSTALL=1 ./script/run` (or `./script/bootstrap`) - Skip the common-skills install/update check, including its interactive upstream-lock-update prompt, without passing a flag on every invocation.
 - `./script/bootstrap --install-common-skills` - Explicitly install common agent skills from `skills-lock.json`; this is the default behavior.
 - `./script/bootstrap --install-common-skills-in-repo` - Platform setup plus common agent skill installation in this checkout's `.agents/skills`.
 - `./script/bootstrap --install-common-skills-globally` - Platform setup plus common agent skill installation in `~/.agents/skills`.
@@ -120,8 +133,46 @@ Warp has two front-ends that share the `warp_core`/`warpui` Entity/model core (A
 - Always remove unused parameters completely rather than prefixing them with `_`. Update the function signature and all call sites accordingly.
 - Prefer inline format arguments in macros like `println!`, `eprintln!`, and `format!` (for example, `eprintln!("{message}")` instead of `eprintln!("{}", message)`) to satisfy Clippy's `uninlined_format_args` lint.
 - Do not pass `Itertools::format` results directly to logging macros (`log::*`, `safe_*`, etc.). `Itertools::format` produces a single-use formatter, while logging implementations may format a message more than once. Use a reusable `String` such as `iter.join(", ")` for logging arguments instead. Direct use in `format!` or `write!` is fine.
-- Do not remove existing comments when making unrelated changes. Only remove or modify a comment if the logic it describes has changed.
 - When adding a toggleable setting, also add the matching Command Palette enable/disable entry and any required context flags so the setting is discoverable outside Settings.
+
+**Comments**:
+Comments have a cost. They carry a maintenance burden, because they must be kept in sync
+with the code they describe. It is tempting to assume that more comments is always better,
+but be judicious about when a comment is actually necessary because the code cannot speak
+for itself.
+- **Minimalist Comments**: Assume the reader is a Senior Software Engineer. Never comment
+  to explain WHAT or HOW code works if self-documenting names accomplish that.
+- **Strictly "Why" Only**: Reserve inline comments strictly for non-obvious business
+  rationale, workarounds for third-party bugs, complex algorithms, unidiomatic code, or
+  unexpected edge cases.
+- **No Line-by-Line Narrations**: Never add comments restating the syntax (e.g., omit
+  `# Initialize array`, `# Loop over users`).
+- **Clean Docstrings**: Keep doc comments concise. Document public APIs, arguments, types,
+  and returns. Do not narrate the method's internal implementation steps.
+- **Single-source of documentation**: For items/members that have a doc comment explaining
+  their purpose, you do not need to repeat that explanation anywhere else. A good example
+  is a float const specifying an amount of spacing. You may use a doc comment on the
+  declaration if necessary, but do not repeat that where the const is *referenced*. Another
+  example is function call sites. Function doc comments explain what they do. Do not repeat
+  the explanation at the call site.
+- **Container docs describe the whole, member docs describe the parts**: A field's, variant's,
+  or parameter's own doc comment is where that member gets explained. A container's item-level
+  doc comment (struct, enum, trait) describes the item as a whole and must not enumerate or
+  re-explain its members. Do not name members in the container's doc comment just to describe
+  them, and do not restate in a member's doc comment what the container's doc comment already
+  said. Behavior genuinely shared by several members belongs in exactly one place, not both.
+- **Don't enumerate function call sites in doc comments**: Function doc comments should
+  document their behavior and NOT their callers, e.g. it should never say things like,
+  "this is used by [certain callers]" or "this is used when...".
+- **No "transformation comments"**: Do not add comments that explain *your edits*. Comments
+  only need explain the *current state* of the code. Explanations of edits belong in pull
+  request comments instead. You shouldn't add comments with phrases like, "this used to do
+  so-and-so".
+- Do not remove existing comments when making unrelated changes. Only remove or modify a
+  comment if the logic it describes has changed.
+- The formatter (`./script/format`) is configured with a `max_width` (max line length) of
+  100. Flow (reflow) comment line-wrapping to fill that full width rather than wrapping
+  early at a narrower column, so comments span as few lines as possible.
 
 **Terminal Model Locking**:
 - Be extremely careful when calling `model.lock()` on the terminal model (`TerminalModel`). Acquiring multiple locks on the same model from different call sites can cause a deadlock, resulting in a UI freeze (beach ball on macOS).
@@ -132,7 +183,7 @@ Warp has two front-ends that share the `warp_core`/`warpui` Entity/model core (A
 **Testing**:
 - Use `cargo nextest` for parallel test execution
 - Integration tests use the custom framework in `crates/integration/` — this is **GUI-only**. TUI elements/screens are covered by render-to-lines unit tests instead (see the `tui-testing` skill).
-- Tests should be run via presubmit script before submitting
+- Follow the Implementation Validation Order above; do not add a full presubmit run after targeted tests unless it was explicitly required.
 - Unit tests should be placed in separate files using the naming convention `${filename}_tests.rs` or `mod_test.rs`
 - Test files should be included at the end of their corresponding module with:
   ```rust
@@ -142,15 +193,9 @@ Warp has two front-ends that share the `warp_core`/`warpui` Entity/model core (A
   ```
 
 **Pull Request Workflow**:
-- **ALWAYS** run `./script/format` and `cargo clippy` (the versions specified in ./script/presubmit) before opening a PR or pushing updates to an existing PR branch
-- Those commands must pass completely before creating or updating a pull request
-- Specifically, ensure `./script/format` and `cargo clippy` checks pass
-- If they fail, fix all issues before proceeding with the PR
+- Follow the Implementation Validation Order before opening a PR or pushing a code update. Do not repeat validation when the candidate has not changed.
+- CI is the broad cross-platform and workspace gate. Push once the targeted tests and lint checks pass and the formatter has run; address a later CI failure as a new revision.
 - Do not create public pull requests or public issues that disclose a non-public security vulnerability. Refer users to `SECURITY.md` for the proper disclosure methods instead.
-- This applies to:
-  - Opening new pull requests
-  - Pushing new commits to existing PR branches
-  - Any branch updates that will be reviewed
  - When opening PRs, use the PR template at `.github/pull_request_template.md`
  - Add changelog entries when appropriate using the format at the bottom of the PR template. Use the following prefixes (without the `{{}}` brackets):
    - `CHANGELOG-NEW-FEATURE:` for new, relatively sizable features (use sparingly - these may get marketing/docs)

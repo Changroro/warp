@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use crate::object::ObjectMetadata;
 use crate::object_permissions::ObjectPermissions;
 use crate::queries::get_conversation_usage::{TokenUsage, ToolUsageMetadata, convert_token_usage};
@@ -10,6 +12,37 @@ pub enum RequestLimitRefreshDuration {
     Monthly,
     Weekly,
     EveryTwoWeeks,
+}
+
+#[derive(cynic::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum AICreditAvailabilityDenialReason {
+    None,
+    OutOfCredits,
+    Delinquent,
+    EnterpriseTeamSpendLimitHit,
+    EnterprisePerUserSpendLimitHit,
+    EnterprisePerUnassignedUserSpendLimitHit,
+    EnterpriseWorkspaceSpendLimitHit,
+    #[cynic(fallback)]
+    Other(String),
+}
+
+#[derive(cynic::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum AICreditAvailabilitySource {
+    BaseLimit,
+    BonusGrant,
+    Payg,
+    Overage,
+    AmbientBonusGrant,
+    #[cynic(fallback)]
+    Other(String),
+}
+
+#[derive(cynic::QueryFragment, Debug, Clone)]
+pub struct AICreditAvailability {
+    pub available: bool,
+    pub denial_reason: AICreditAvailabilityDenialReason,
+    pub credit_source: Option<AICreditAvailabilitySource>,
 }
 
 #[derive(cynic::QueryFragment, Debug)]
@@ -51,6 +84,10 @@ pub enum AgentTaskState {
 /// See platformerrors package for the canonical definitions.
 #[derive(cynic::Enum, Clone, Copy, Debug, PartialEq)]
 pub enum PlatformErrorCode {
+    #[cynic(rename = "AGENT_STREAM_FAILURE")]
+    AgentStreamFailure,
+    #[cynic(rename = "AGENT_STREAM_NETWORK_ERROR")]
+    AgentStreamNetworkError,
     #[cynic(rename = "AUTHENTICATION_REQUIRED")]
     AuthenticationRequired,
     #[cynic(rename = "BUDGET_EXCEEDED")]
@@ -79,6 +116,30 @@ pub enum PlatformErrorCode {
     ResourceUnavailable,
     #[cynic(rename = "RESOURCE_NOT_FOUND")]
     ResourceNotFound,
+}
+
+impl FromStr for PlatformErrorCode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "authentication_required" => Ok(Self::AuthenticationRequired),
+            "budget_exceeded" => Ok(Self::BudgetExceeded),
+            "content_policy_violation" => Ok(Self::ContentPolicyViolation),
+            "environment_setup_failed" => Ok(Self::EnvironmentSetupFailed),
+            "external_authentication_required" => Ok(Self::ExternalAuthenticationRequired),
+            "feature_not_available" => Ok(Self::FeatureNotAvailable),
+            "insufficient_credits" => Ok(Self::InsufficientCredits),
+            "integration_disabled" => Ok(Self::IntegrationDisabled),
+            "integration_not_configured" => Ok(Self::IntegrationNotConfigured),
+            "internal_error" => Ok(Self::InternalError),
+            "invalid_request" => Ok(Self::InvalidRequest),
+            "not_authorized" => Ok(Self::NotAuthorized),
+            "resource_unavailable" => Ok(Self::ResourceUnavailable),
+            "resource_not_found" => Ok(Self::ResourceNotFound),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
@@ -171,6 +232,7 @@ pub struct ConversationUsageMetadata {
     pub context_window_segments: Vec<ContextWindowSegment>,
     pub credits_spent: f64,
     pub platform_credits_spent: f64,
+    pub total_provider_cost_in_cents: Option<f64>,
     pub summarized: bool,
     pub warp_token_usage: Vec<TokenUsage>,
     pub byok_token_usage: Vec<TokenUsage>,
@@ -184,7 +246,12 @@ impl From<&ConversationUsageMetadata> for persistence::model::ConversationUsageM
             context_window_usage: gql.context_window_usage as f32,
             credits_spent: gql.credits_spent as f32,
             platform_credits_spent: gql.platform_credits_spent as f32,
+            total_provider_cost_in_cents: gql.total_provider_cost_in_cents.map(|cost| cost as f32),
             credits_spent_for_last_block: None,
+            // Not yet fetched by this GraphQL query (persisted-history
+            // vertical, milestone 3) -- left `None` rather than fabricated.
+            charged_usage_for_last_block: None,
+            total_charged_usage: None,
             token_usage: convert_token_usage(&gql.warp_token_usage, &gql.byok_token_usage),
             tool_usage_metadata: (&gql.tool_usage_metadata).into(),
             context_window_segments: gql.context_window_segments.iter().map(Into::into).collect(),

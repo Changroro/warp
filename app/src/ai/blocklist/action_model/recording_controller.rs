@@ -1,15 +1,27 @@
 //! Runtime-global state machine for the single per-runtime video recording.
 
 use std::mem;
+use std::path::Path;
 use std::time::Duration;
 
 use ai::agent::action_result::StopRecordingResult;
 use futures::channel::oneshot;
 use instant::Instant;
 use thiserror::Error;
+use warp_core::features::FeatureFlag;
 use warpui::{Entity, SingletonEntity};
 
 use crate::ai::agent::conversation::AIConversationId;
+
+/// Returns whether computer-use video recording is available on the current platform.
+///
+/// Callers should prefer this over reading [`FeatureFlag::VideoRecording`] directly, so the
+/// Windows-only [`FeatureFlag::WindowsVideoRecording`] gate stays consistent across the
+/// recording tool surface.
+pub(crate) fn video_recording_enabled() -> bool {
+    FeatureFlag::VideoRecording.is_enabled()
+        && (!cfg!(windows) || FeatureFlag::WindowsVideoRecording.is_enabled())
+}
 
 /// Why a recording finalization ran. Distinct from the caller's claimed reason
 /// (see [`FinalizationClaim::InProgress`]): the reason lives here so the
@@ -119,6 +131,8 @@ pub(crate) struct ActiveRecording {
     /// The surface being recorded, used to resolve pointer-event coordinates
     /// into capture space for the post-stop burn-in.
     pub(crate) target: computer_use::Target,
+    /// The immutable physical-pixel geometry selected when capture started.
+    pub(crate) geometry: computer_use::RecordingGeometry,
     /// Recording-scoped pointer session shared with each `UseComputer` call's
     /// `PointerSink`, persisting the last resolved point and active button across
     /// calls so a drag split into separate `Down`/`Move`/`Up` calls records its
@@ -133,6 +147,25 @@ pub(crate) struct ActiveRecording {
     /// The currently in-flight `UseComputer` group, if any. It is committed with
     /// its finish offset on success or discarded on failure/cancellation.
     pub(crate) pending_group: Option<PendingActionGroup>,
+}
+
+impl ActiveRecording {
+    /// Commits any in-flight action group using the current elapsed time as its
+    /// finish offset (clamped to the group's start). The in-flight call's
+    /// pointer events live in that call's own buffer and are not reachable
+    /// here, so the entry keeps the labels but no pointer geometry. No-op when
+    /// no group is pending.
+    fn commit_pending_group_now(&mut self) {
+        if let Some(pending) = self.pending_group.take() {
+            let finish_offset = self.started_at.elapsed().max(pending.start_offset);
+            self.actions.push(computer_use::ActionLogEntry {
+                offset: pending.start_offset,
+                finish_offset,
+                labels: pending.labels,
+                pointer_events: Vec::new(),
+            });
+        }
+    }
 }
 
 /// A pending (in-flight) `UseComputer` action group: its start offset and labels
@@ -235,6 +268,7 @@ impl RecordingController {
                 conversation_id: owner
             } if owner == conversation_id
         ) {
+            let geometry = handle.geometry();
             self.state = RecordingState::Active(Box::new(ActiveRecording {
                 id: recording_id,
                 conversation_id,
@@ -242,6 +276,7 @@ impl RecordingController {
                 started_at: Instant::now(),
                 frame_rate,
                 target,
+                geometry,
                 pointer_session: computer_use::PointerSession::new(),
                 actions: Vec::new(),
                 summary,
@@ -253,10 +288,10 @@ impl RecordingController {
 
     /// Begins an in-flight `UseComputer` action group for the owning
     /// conversation, recording the group's start offset and labels. Returns the
-    /// recording's capture start instant, its capture target, and a clone of the
-    /// recording-scoped pointer session so the caller can share it with this
-    /// call's `PointerSink` and a later split-call release can reuse the last
-    /// resolved point. A pointer-only group is begun with empty labels;
+    /// recording's capture start instant, capture target and geometry, and a
+    /// clone of the recording-scoped pointer session so the caller can share it
+    /// with this call's `PointerSink` and a later split-call release can reuse
+    /// the last resolved point. A pointer-only group is begun with empty labels;
     /// wait-only/no-op calls should not call this. The pending group is
     /// committed with its finish offset on success ([`commit_action_group`]) or
     /// discarded on failure ([`discard_action_group`]). Returns `None` (and
@@ -269,7 +304,12 @@ impl RecordingController {
         &mut self,
         conversation_id: AIConversationId,
         labels: Vec<String>,
-    ) -> Option<(Instant, computer_use::Target, computer_use::PointerSession)> {
+    ) -> Option<(
+        Instant,
+        computer_use::Target,
+        computer_use::RecordingGeometry,
+        computer_use::PointerSession,
+    )> {
         if let RecordingState::Active(recording) = &mut self.state
             && recording.conversation_id == conversation_id
         {
@@ -277,20 +317,7 @@ impl RecordingController {
             // with the current clock as its implicit finish offset. This can
             // happen when a `UseComputer` call completes and `begin_action_group`
             // is called for the next call before `commit_action_group` fires.
-            if let Some(pending) = recording.pending_group.take() {
-                let implicit_finish = recording.started_at.elapsed().max(pending.start_offset);
-                // Defensive fallback: in the normal flow the executor commits or
-                // discards each group in its completion callback before the next
-                // `begin`, so this rarely fires. The prior group's pointer events
-                // live in that call's own buffer and are not reachable here, so
-                // this path keeps the labels but no pointer geometry.
-                recording.actions.push(computer_use::ActionLogEntry {
-                    offset: pending.start_offset,
-                    finish_offset: implicit_finish,
-                    labels: pending.labels,
-                    pointer_events: Vec::new(),
-                });
-            }
+            recording.commit_pending_group_now();
             let start_offset = recording.started_at.elapsed();
             recording.pending_group = Some(PendingActionGroup {
                 start_offset,
@@ -299,10 +326,32 @@ impl RecordingController {
             return Some((
                 recording.started_at,
                 recording.target,
+                recording.geometry,
                 recording.pointer_session.clone(),
             ));
         }
         None
+    }
+
+    /// Opens a recording action group for a shell `command` whose on-screen
+    /// work should survive the smart cut (currently `playwright-cli` browser
+    /// automation). Returns whether a group was opened, so the caller can settle
+    /// it with [`commit_action_group_now`] or [`discard_action_group`] once the
+    /// command resolves. Returns `false` for other commands or when no recording
+    /// is active for this conversation.
+    ///
+    /// [`commit_action_group_now`]: Self::commit_action_group_now
+    /// [`discard_action_group`]: Self::discard_action_group
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub fn maybe_begin_action_group(
+        &mut self,
+        conversation_id: AIConversationId,
+        command: &str,
+    ) -> bool {
+        is_playwright_cli_command(command)
+            && self
+                .begin_action_group(conversation_id, Vec::new())
+                .is_some()
     }
 
     /// Commits the in-flight action group with its finish offset, derived from
@@ -332,6 +381,19 @@ impl RecordingController {
                 labels: pending.labels,
                 pointer_events,
             });
+        }
+    }
+
+    /// Commits the in-flight action group using the active recording's current
+    /// elapsed time as the finish offset, for callers that cannot thread the
+    /// capture start instant through to completion. No-op unless a recording is
+    /// active for this conversation with a pending group.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub fn commit_action_group_now(&mut self, conversation_id: AIConversationId) {
+        if let RecordingState::Active(recording) = &mut self.state
+            && recording.conversation_id == conversation_id
+        {
+            recording.commit_pending_group_now();
         }
     }
 
@@ -396,9 +458,14 @@ impl RecordingController {
         matches: impl Fn(&str, AIConversationId) -> bool,
     ) -> FinalizationClaim {
         match mem::replace(&mut self.state, RecordingState::Idle) {
-            RecordingState::Active(recording)
+            RecordingState::Active(mut recording)
                 if matches(&recording.id, recording.conversation_id) =>
             {
+                // A group can still be pending here (e.g. a long-running
+                // `playwright-cli` command whose finish was never observed);
+                // settle it so its window up to the stop point is kept rather
+                // than dropped by the smart cut.
+                recording.commit_pending_group_now();
                 let (sender, receiver) = oneshot::channel();
                 self.state = RecordingState::Finalizing {
                     id: recording.id.clone(),
@@ -513,6 +580,27 @@ impl RecordingController {
             | RecordingState::Finalized { .. } => None,
         }
     }
+}
+
+/// Whether a requested command invokes the `playwright-cli` binary, whose
+/// on-screen browser automation should be kept in an active computer-use
+/// recording rather than trimmed away with other shell work.
+fn is_playwright_cli_command(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .find(|token| {
+            let is_env_assignment = token
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && token.contains('=');
+            !is_env_assignment
+        })
+        .is_some_and(|program| {
+            Path::new(program)
+                .file_name()
+                .is_some_and(|name| name == "playwright-cli")
+        })
 }
 
 impl Entity for RecordingController {

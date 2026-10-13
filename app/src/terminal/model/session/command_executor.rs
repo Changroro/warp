@@ -349,7 +349,7 @@ fn new_command_executor_for_local_tty_session(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub mod testing {
     use anyhow::anyhow;
     use command::r#async::Command;
@@ -374,6 +374,7 @@ pub mod testing {
             _execute_command_options: ExecuteCommandOptions,
         ) -> Result<CommandOutput> {
             let mut command_process = Command::new(match shell.shell_type() {
+                ShellType::PowerShell if cfg!(windows) => "powershell.exe",
                 ShellType::PowerShell => "pwsh",
                 _ => "bash",
             });

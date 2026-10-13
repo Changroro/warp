@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Local;
+use pathfinder_color::ColorU;
 use smol_str::SmolStr;
 use warp_editor::render::model::LineCount;
 use warp_util::path::EscapeChar;
@@ -20,6 +21,7 @@ use crate::code_review::comments::{
 use crate::server::ids::ServerId;
 use crate::server::server_api::team::MockTeamClient;
 use crate::server::server_api::workspace::MockWorkspaceClient;
+use crate::ui_components::icons::Icon;
 use crate::workspaces::team::Team;
 use crate::workspaces::user_workspaces::UserWorkspaces;
 use crate::workspaces::workspace::Workspace;
@@ -266,6 +268,7 @@ fn test_detect_known_agents() {
                 ("vibe", CLIAgent::Vibe),
                 ("agy", CLIAgent::Antigravity),
                 ("omp", CLIAgent::OhMyPi),
+                ("grok", CLIAgent::Grok),
                 ("warp", CLIAgent::WarpTui),
                 ("warp-dev", CLIAgent::WarpTui),
                 ("./script/run-tui", CLIAgent::WarpTui),
@@ -294,6 +297,15 @@ fn test_detect_with_arguments() {
             );
         });
     });
+}
+
+#[test]
+fn test_grok_public_configuration() {
+    assert_eq!(CLIAgent::Grok.command_prefix(), "grok");
+    assert_eq!(CLIAgent::Grok.display_name(), "Grok Build");
+    assert!(CLIAgent::Grok.supports_bash_mode());
+    assert_eq!(CLIAgent::Grok.skill_command_prefix(), "/");
+    assert_eq!(CLIAgent::Grok.icon(), Some(Icon::GrokLogo));
 }
 
 #[test]
@@ -452,7 +464,9 @@ fn workspace_with_team_uid(uid: &str) -> Workspace {
             None,
             None,
             None,
+            None,
         )]),
+        None,
     )
 }
 
@@ -640,8 +654,9 @@ fn test_warp_tui_variant_properties() {
         ]
     );
     assert_eq!(CLIAgent::WarpTui.display_name(), "Warp TUI");
-    assert_eq!(CLIAgent::WarpTui.brand_color(), None);
-    assert_eq!(CLIAgent::WarpTui.icon(), None);
+    assert_eq!(CLIAgent::WarpTui.brand_color(), Some(ColorU::black()));
+    assert_eq!(CLIAgent::WarpTui.icon(), Some(Icon::Warp));
+    assert_eq!(CLIAgent::WarpTui.brand_icon_color(), ColorU::white());
     assert!(CLIAgent::WarpTui.supported_skill_providers().is_empty());
     assert!(!CLIAgent::WarpTui.supports_bash_mode());
     assert!(!CLIAgent::WarpTui.supports_cli_agent_footer());

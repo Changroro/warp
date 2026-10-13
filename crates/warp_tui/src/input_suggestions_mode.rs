@@ -13,10 +13,13 @@ pub(crate) enum TuiInputSuggestionsMode {
     #[default]
     Closed,
     SlashCommands,
+    ApiKeys,
     ConversationMenu,
     ModelSelector,
+    TeamSelector,
     SkillMenu,
     Mcp,
+    McpInstall,
     PromptAndCommandHistory,
     CompletionSuggestions,
     ReadOnlyMenu(TuiReadOnlyMenuKind),
@@ -32,10 +35,13 @@ impl TuiInputSuggestionsMode {
             Self::ReadOnlyMenu(kind) => Some(kind),
             Self::Closed
             | Self::SlashCommands
+            | Self::ApiKeys
             | Self::ConversationMenu
             | Self::ModelSelector
+            | Self::TeamSelector
             | Self::SkillMenu
             | Self::Mcp
+            | Self::McpInstall
             | Self::PromptAndCommandHistory
             | Self::CompletionSuggestions => None,
         }
@@ -87,10 +93,13 @@ impl TuiInputSuggestionsModeModel {
             }
             active_mode if active_mode == mode => true,
             TuiInputSuggestionsMode::SlashCommands
+            | TuiInputSuggestionsMode::ApiKeys
             | TuiInputSuggestionsMode::ConversationMenu
             | TuiInputSuggestionsMode::ModelSelector
+            | TuiInputSuggestionsMode::TeamSelector
             | TuiInputSuggestionsMode::SkillMenu
             | TuiInputSuggestionsMode::Mcp
+            | TuiInputSuggestionsMode::McpInstall
             | TuiInputSuggestionsMode::PromptAndCommandHistory
             | TuiInputSuggestionsMode::CompletionSuggestions
             | TuiInputSuggestionsMode::ReadOnlyMenu(_) => false,

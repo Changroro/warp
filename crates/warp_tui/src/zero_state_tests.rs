@@ -1,53 +1,189 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
+use ai::api_keys::{
+    ApiKeyManager, CustomEndpoint, CustomEndpointDefinitions, CustomEndpointModel,
+    CustomEndpointSchema,
+};
+use channel_versions::{Changelog, MarkdownSection, Section};
+use chrono::DateTime;
 use uuid::Uuid;
 use warp::tui_export::{
-    TuiMcpConfigState, TuiMcpServerId, TuiMcpServerSnapshot, TuiMcpServerStatus, TuiMcpSnapshot,
-    TuiMcpTransport, register_tui_session_view_test_singletons,
+    TuiMcpConfigDiagnostic, TuiMcpServerId, TuiMcpServerSnapshot, TuiMcpServerSource,
+    TuiMcpServerStatus, TuiMcpSnapshot, TuiMcpTransport, TuiUserInfoSnapshot,
+    register_tui_session_view_test_singletons,
 };
 use warpui::{EntityIdMap, SingletonEntity};
+use warpui_core::elements::animation::AnimationClock;
 use warpui_core::elements::tui::{
-    TuiBuffer, TuiBufferExt, TuiConstraint, TuiElement, TuiLayoutContext, TuiPaintContext,
-    TuiPaintSurface, TuiRect, TuiScreenPosition, TuiSize, text_width,
+    Color, TuiBuffer, TuiBufferExt, TuiConstraint, TuiElement, TuiLayoutContext, TuiPaintContext,
+    TuiPaintSurface, TuiRect, TuiScreenPosition, TuiSize, TuiStyle, TuiText, text_width,
 };
 use warpui_core::{App, AppContext};
 
-use super::{LEFT_COLUMN_COLS, build_zero_state_overlay, mcp_status_label};
+use super::{
+    ANIMATION_PANEL_COLS, LEFT_COLUMN_COLS, ZeroStateSectionVisibility, autoupdate_status_label,
+    build_zero_state_layout, build_zero_state_overlay, build_zero_state_stack_layout,
+    changelog_bullets_from_changelog, custom_endpoint_status_label, mcp_status_label,
+    render_bottom_section, render_first_run_top_section,
+};
+use crate::autoupdate::TuiAutoupdateStatus;
 use crate::tui_builder::TuiUiBuilder;
+use crate::zero_state_animation::{
+    WarpLogoStyles, ZeroStateAnimationConfig, ZeroStateAnimationElement,
+    ZeroStateInteractionHandle, ZeroStateStarfieldElement,
+};
 
 fn server(id: u64, status: TuiMcpServerStatus) -> TuiMcpServerSnapshot {
     TuiMcpServerSnapshot {
-        id: TuiMcpServerId(id),
-        installation_uuid: Uuid::from_u128(id as u128),
+        id: TuiMcpServerId::Installation(Uuid::from_u128(id as u128)),
+        installation_uuid: Some(Uuid::from_u128(id as u128)),
         name: format!("server-{id}"),
-        transport: TuiMcpTransport::Stdio,
+        description: None,
+        source: TuiMcpServerSource::Installation,
+        transport: Some(TuiMcpTransport::Stdio),
         status,
         tool_count: 2,
         resource_count: 0,
-        has_credentials: false,
+        can_log_out: false,
         authorization_url: None,
     }
 }
 
+fn changelog(tui_updates: Vec<&str>) -> Changelog {
+    Changelog {
+        date: DateTime::parse_from_rfc3339("2026-07-30T12:00:00+00:00").unwrap(),
+        sections: vec![Section {
+            title: "Improvements".to_owned(),
+            items: vec!["Unrelated GUI improvement".to_owned()],
+        }],
+        markdown_sections: vec![MarkdownSection {
+            title: "Improvements".to_owned(),
+            markdown: "* Unrelated GUI improvement\n".to_owned(),
+        }],
+        image_url: None,
+        oz_updates: vec!["Unrelated Oz improvement".to_owned()],
+        tui_updates: tui_updates.into_iter().map(ToOwned::to_owned).collect(),
+    }
+}
+
+fn endpoint_definitions() -> CustomEndpointDefinitions {
+    let endpoints = ["One", "Two"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| CustomEndpoint {
+            name: name.to_owned(),
+            url: format!("https://endpoint-{index}.example.com/v1"),
+            api_key: String::new(),
+            schema: CustomEndpointSchema::default(),
+            models: vec![CustomEndpointModel {
+                name: format!("model-{index}"),
+                alias: None,
+                config_key: format!("config-{index}"),
+            }],
+        })
+        .collect::<Vec<_>>();
+    CustomEndpointDefinitions::from_legacy(&endpoints)
+        .expect("test endpoints should be valid")
+        .0
+}
+
 #[test]
-fn mcp_summary_keeps_missing_config_action_short() {
+fn changelog_bullets_use_only_the_first_three_tui_updates() {
+    let changelog = changelog(vec!["First", "Second", "Third", "Fourth"]);
+    assert_eq!(
+        changelog_bullets_from_changelog(&changelog),
+        ["First", "Second", "Third"]
+    );
+}
+
+#[test]
+fn changelog_bullets_are_empty_when_only_other_surfaces_have_updates() {
+    assert!(changelog_bullets_from_changelog(&changelog(Vec::new())).is_empty());
+}
+
+#[test]
+fn failed_autoupdate_status_has_visible_label() {
+    assert_eq!(
+        autoupdate_status_label(TuiAutoupdateStatus::Failed),
+        Some("automatic update failed")
+    );
+}
+
+#[test]
+fn homebrew_update_status_shows_the_upgrade_command() {
+    assert_eq!(
+        autoupdate_status_label(TuiAutoupdateStatus::UpdateAvailable),
+        Some("update available — run brew upgrade --cask warp-agent-cli")
+    );
+}
+
+#[test]
+fn first_zero_state_matches_welcome_design_copy() {
+    App::test((), |mut app| async move {
+        register_tui_session_view_test_singletons(&mut app);
+
+        let lines = app.read(|ctx| {
+            let builder = TuiUiBuilder::from_app(ctx);
+            render_element_lines(
+                render_first_run_top_section(&builder, ZeroStateSectionVisibility::default(), ctx)
+                    .finish(),
+                ctx,
+                LEFT_COLUMN_COLS,
+                16,
+            )
+        });
+        let rendered = lines.join("\n");
+        for expected in [
+            "Welcome to Warp",
+            "What’s different about Warp",
+            "✶ State of the art coding agents",
+            "✶ Frontier and open-weight models",
+            "✶ Fully customizable model routers",
+            "✶ Orchestration for fleets of agents",
+            "✶ Better shell command support",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "first zero state should contain {expected:?}:\n{rendered}"
+            );
+        }
+        for unexpected in [
+            "/natural-language-detection",
+            "/modify-settings",
+            "/orchestrate",
+            "Run full-screen terminal apps",
+            "Orchestrate fleets of agents",
+            "Work with shell commands like in a native terminal",
+        ] {
+            assert!(
+                !rendered.contains(unexpected),
+                "first zero state should not contain {unexpected:?}:\n{rendered}"
+            );
+        }
+        assert!(!rendered.contains("What's new"));
+        assert!(!rendered.contains("████"));
+    });
+}
+
+#[test]
+fn mcp_summary_keeps_empty_catalog_action_short() {
     let snapshot = TuiMcpSnapshot {
-        config_path: PathBuf::from("/tmp/.mcp.json"),
-        config_state: TuiMcpConfigState::Missing,
+        diagnostics: Vec::new(),
         servers: Vec::new(),
     };
 
     assert_eq!(
         mcp_status_label(&snapshot),
-        ("Not configured · /mcp".to_string(), false)
+        ("No servers available · run /mcp".to_string(), false)
     );
 }
 
 #[test]
 fn mcp_summary_reports_mixed_runtime_states() {
     let snapshot = TuiMcpSnapshot {
-        config_path: PathBuf::from("/tmp/.mcp.json"),
-        config_state: TuiMcpConfigState::Ready,
+        diagnostics: Vec::new(),
         servers: vec![
             server(1, TuiMcpServerStatus::Running),
             server(2, TuiMcpServerStatus::Starting),
@@ -60,13 +196,14 @@ fn mcp_summary_reports_mixed_runtime_states() {
                 },
             ),
             server(6, TuiMcpServerStatus::Offline),
+            server(7, TuiMcpServerStatus::Available),
         ],
     };
 
     assert_eq!(
         mcp_status_label(&snapshot),
         (
-            "1 connected · 1 starting · 1 needs auth · 1 stopping · 1 failed · 1 offline · /mcp"
+            "1 connected · 1 starting · 1 needs auth · 1 stopping · 1 failed · 1 offline · 1 available · /mcp"
                 .to_string(),
             false
         )
@@ -76,17 +213,139 @@ fn mcp_summary_reports_mixed_runtime_states() {
 #[test]
 fn mcp_summary_marks_config_errors() {
     let snapshot = TuiMcpSnapshot {
-        config_path: PathBuf::from("/tmp/.mcp.json"),
-        config_state: TuiMcpConfigState::Invalid {
-            message: "invalid JSON".to_string(),
-        },
+        diagnostics: vec![
+            TuiMcpConfigDiagnostic {
+                provider: "Claude".to_owned(),
+                config_path: PathBuf::from("/tmp/.claude.json"),
+                message: "invalid JSON".to_owned(),
+            },
+            TuiMcpConfigDiagnostic {
+                provider: "Codex".to_owned(),
+                config_path: PathBuf::from("/tmp/config.toml"),
+                message: "invalid TOML".to_owned(),
+            },
+        ],
         servers: Vec::new(),
     };
 
     assert_eq!(
         mcp_status_label(&snapshot),
-        ("Config error · run /mcp".to_string(), true)
+        ("2 config errors · /mcp".to_string(), true)
     );
+}
+
+#[test]
+fn custom_endpoint_summary_tracks_configuration_and_local_keys() {
+    App::test((), |mut app| async move {
+        register_tui_session_view_test_singletons(&mut app);
+        app.read(|ctx| {
+            assert_eq!(
+                custom_endpoint_status_label(ApiKeyManager::as_ref(ctx)),
+                None
+            );
+        });
+
+        let definitions = endpoint_definitions();
+        let first = definitions.id_at(0).unwrap().clone();
+        let second = definitions.id_at(1).unwrap().clone();
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_custom_endpoint_definitions(definitions, ctx);
+        });
+        app.read(|ctx| {
+            assert_eq!(
+                custom_endpoint_status_label(ApiKeyManager::as_ref(ctx)),
+                Some(("2 need API keys · /api-keys".to_owned(), false))
+            );
+        });
+
+        ApiKeyManager::handle(&app)
+            .update(&mut app, |manager, ctx| {
+                manager.persist_custom_endpoint_key(first, Some("first-secret".to_owned()), ctx)
+            })
+            .unwrap();
+        app.read(|ctx| {
+            assert_eq!(
+                custom_endpoint_status_label(ApiKeyManager::as_ref(ctx)),
+                Some((
+                    "1 connected · 1 need API keys · /api-keys".to_owned(),
+                    false
+                ))
+            );
+        });
+
+        ApiKeyManager::handle(&app)
+            .update(&mut app, |manager, ctx| {
+                manager.persist_custom_endpoint_key(second, Some("second-secret".to_owned()), ctx)
+            })
+            .unwrap();
+        app.read(|ctx| {
+            assert_eq!(
+                custom_endpoint_status_label(ApiKeyManager::as_ref(ctx)),
+                Some(("2 connected · /api-keys".to_owned(), false))
+            );
+        });
+
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.invalidate_custom_endpoint_definitions(ctx);
+        });
+        app.read(|ctx| {
+            assert_eq!(
+                custom_endpoint_status_label(ApiKeyManager::as_ref(ctx)),
+                Some((
+                    "Configuration error · fix agents.custom_endpoints".to_owned(),
+                    true
+                ))
+            );
+        });
+    });
+}
+
+#[test]
+fn custom_endpoint_section_is_hidden_until_an_endpoint_is_configured() {
+    App::test((), |mut app| async move {
+        register_tui_session_view_test_singletons(&mut app);
+        app.read(|ctx| {
+            let builder = TuiUiBuilder::from_app(ctx);
+            let rendered = render_element_lines(
+                render_bottom_section(
+                    None,
+                    None,
+                    ZeroStateSectionVisibility::default(),
+                    &builder,
+                    ctx,
+                )
+                .finish(),
+                ctx,
+                LEFT_COLUMN_COLS,
+                20,
+            )
+            .join("\n");
+            assert!(!rendered.contains("Custom endpoints"));
+        });
+
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_custom_endpoint_definitions(endpoint_definitions(), ctx);
+        });
+        app.read(|ctx| {
+            let builder = TuiUiBuilder::from_app(ctx);
+            let rendered = render_element_lines(
+                render_bottom_section(
+                    None,
+                    None,
+                    ZeroStateSectionVisibility::default(),
+                    &builder,
+                    ctx,
+                )
+                .finish(),
+                ctx,
+                LEFT_COLUMN_COLS,
+                20,
+            )
+            .join("\n");
+            assert!(rendered.contains("Custom endpoints"));
+            assert!(rendered.contains("2 need API keys · /api-keys"));
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +401,175 @@ fn render_element_lines(
     height: u16,
 ) -> Vec<String> {
     render_to_buffer(element, ctx, width, height).to_lines()
+}
+
+fn static_zero_state_layers(
+    width: u16,
+    height: u16,
+) -> (
+    Box<dyn TuiElement>,
+    Box<dyn TuiElement>,
+    Box<dyn TuiElement>,
+) {
+    let stars = (0..height)
+        .map(|_| "*".repeat(usize::from(width)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (
+        TuiText::new(stars).finish(),
+        TuiText::new("animation").finish(),
+        TuiText::new("copy here\n\nsecond line").finish(),
+    )
+}
+
+#[test]
+fn direct_zero_state_layers_match_scratch_composition() {
+    App::test((), |app| async move {
+        app.read(|ctx| {
+            for (width, height) in [(60, 12), (80, 24), (120, 40), (240, 80)] {
+                let (stars, animation, overlay) = static_zero_state_layers(width, height);
+                let direct = render_to_buffer(
+                    build_zero_state_layout(stars, animation, overlay),
+                    ctx,
+                    width,
+                    height,
+                );
+                let (stars, animation, overlay) = static_zero_state_layers(width, height);
+                let scratch = render_to_buffer(
+                    build_zero_state_stack_layout(stars, animation, overlay),
+                    ctx,
+                    width,
+                    height,
+                );
+                assert_eq!(direct, scratch, "layout differs at {width}x{height}");
+            }
+        });
+    });
+}
+
+#[test]
+fn zero_state_copy_rectangle_is_opaque_without_changing_the_background_color() {
+    App::test((), |app| async move {
+        app.read(|ctx| {
+            let stars = (0..9)
+                .map(|_| "*".repeat(80))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let layout = build_zero_state_layout(
+                TuiText::new(stars).finish(),
+                TuiText::new("").finish(),
+                TuiText::new("copy here\n\nline").finish(),
+            );
+            let buffer = render_to_buffer(layout, ctx, 80, 9);
+            let lines = buffer.to_lines();
+            assert_eq!(&lines[3][..9], "copy here");
+            assert_eq!(&lines[5][..4], "line");
+            for y in 3..=5 {
+                for x in 0..9 {
+                    assert_ne!(buffer[(x, y)].symbol(), "*");
+                    assert_eq!(buffer[(x, y)].bg, Color::Reset);
+                }
+            }
+            assert_eq!(buffer[(1, 2)].symbol(), "*");
+            assert_eq!(buffer[(1, 6)].symbol(), "*");
+            assert_eq!(buffer[(9, 3)].symbol(), "*");
+            assert_eq!(buffer[(1, 2)].bg, Color::Reset);
+            assert_eq!(buffer[(1, 6)].bg, Color::Reset);
+            assert_eq!(buffer[(9, 3)].bg, Color::Reset);
+        });
+    });
+}
+#[test]
+fn zero_state_starfield_spans_the_full_width() {
+    App::test((), |app| async move {
+        app.read(|ctx| {
+            let layout = build_zero_state_layout(
+                ZeroStateStarfieldElement::new(
+                    AnimationClock::starting_at(Duration::ZERO),
+                    TuiStyle::default(),
+                    LEFT_COLUMN_COLS,
+                    ANIMATION_PANEL_COLS,
+                )
+                .finish(),
+                TuiText::new("").finish(),
+                TuiText::new("").finish(),
+            );
+            let buffer = render_to_buffer(layout, ctx, 120, 20);
+            let occupied_columns = buffer
+                .content
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cell)| {
+                    (cell.symbol() != " ").then_some(index % usize::from(buffer.area.width))
+                })
+                .collect::<Vec<_>>();
+
+            assert!(occupied_columns.iter().any(|column| *column < 30));
+            assert!(occupied_columns.iter().any(|column| *column >= 90));
+        });
+    });
+}
+
+#[test]
+fn zero_state_animation_is_centered_in_remaining_space_and_hidden_when_space_is_tight() {
+    App::test((), |app| async move {
+        app.read(|ctx| {
+            let animation = || {
+                let style = TuiStyle::default();
+                ZeroStateAnimationElement::new(
+                    AnimationClock::starting_at(Duration::ZERO),
+                    Arc::new(ZeroStateAnimationConfig::default()),
+                    ZeroStateInteractionHandle::default(),
+                    WarpLogoStyles {
+                        front: style,
+                        back: style,
+                        side: style,
+                        background: style,
+                    },
+                )
+                .without_background_stars()
+                .finish()
+            };
+            let layout = build_zero_state_layout(
+                TuiText::new("").finish(),
+                animation(),
+                TuiText::new("").finish(),
+            );
+            let wide_width = 120;
+            let wide = render_to_buffer(layout, ctx, wide_width, 20);
+            let occupied = wide
+                .content
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cell)| {
+                    (cell.symbol() != " ").then_some(index % usize::from(wide.area.width))
+                })
+                .collect::<Vec<_>>();
+            let remaining_cols = wide_width - LEFT_COLUMN_COLS;
+            let animation_start = LEFT_COLUMN_COLS + (remaining_cols - ANIMATION_PANEL_COLS) / 2;
+            let animation_end = animation_start + ANIMATION_PANEL_COLS;
+
+            assert!(!occupied.is_empty());
+            assert!(
+                occupied
+                    .iter()
+                    .all(|column| *column >= usize::from(animation_start)
+                        && *column < usize::from(animation_end))
+            );
+
+            let layout = build_zero_state_layout(
+                TuiText::new("").finish(),
+                animation(),
+                TuiText::new("").finish(),
+            );
+            assert!(
+                render_to_buffer(layout, ctx, 60, 20)
+                    .content
+                    .iter()
+                    .all(|cell| cell.symbol() == " ")
+            );
+        });
+    });
 }
 /// When the terminal is wide enough, the path header must stay on one row and
 /// must not be capped at LEFT_COLUMN_COLS.
@@ -231,6 +659,30 @@ fn login_line_shows_signed_in_account_email() {
             lines.join("\n")
         );
     });
+}
+
+#[test]
+fn login_line_never_claims_signed_in_without_an_identity() {
+    let snapshot = TuiUserInfoSnapshot {
+        is_logged_in: true,
+        ..Default::default()
+    };
+
+    assert_eq!(super::login_line_label("Signed in as", snapshot), None);
+}
+
+#[test]
+fn login_line_falls_back_to_validated_user_id() {
+    let snapshot = TuiUserInfoSnapshot {
+        is_logged_in: true,
+        user_id: Some("user-123".to_owned()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        super::login_line_label("Signed in as", snapshot),
+        Some("Signed in as user-123".to_owned())
+    );
 }
 
 /// At a narrow terminal the complete displayed path must wrap across rows

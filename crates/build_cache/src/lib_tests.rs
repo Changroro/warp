@@ -1,21 +1,23 @@
-use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
-use std::rc::Rc;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_io::Timer;
 use command::r#async::Command;
-use futures::executor::block_on;
 #[cfg(unix)]
 use instant::Instant;
 use warp_errors::ErrorExt as _;
 
 use super::{
-    CacheScope, CacheSetupError, DetectedCacheModes, RepoCacheKey, RepoIdentity,
-    RepositoryCacheSource, aggregate_mode_stats, construct_plan, create_retained_scratch_directory,
-    is_valid_env_name, run_command_with_timeout, setup_cache,
+    CacheConfiguration, CacheScope, CacheSetupError, CacheSetupPlan, CandidateKey,
+    DetectedCacheModes, RepoCacheKey, RepoIdentity, RepositoryCacheSource, aggregate_mode_stats,
+    construct_plan, create_retained_scratch_directory, is_valid_env_name, produce_candidates,
+    run_command_with_timeout, setup_cache,
 };
 #[cfg(unix)]
 use super::{create_cache_dir_all, current_owner};
@@ -36,8 +38,13 @@ fn source(root: &Path, host: &str, owner: &str, repo: &str) -> RepositoryCacheSo
 }
 
 fn detection(source: RepositoryCacheSource, modes: &[&str]) -> DetectedCacheModes {
+    let key = RepoCacheKey::derive(&source.identity);
     DetectedCacheModes {
-        key: RepoCacheKey::derive(&source.identity),
+        order: CandidateKey {
+            repo_key: key.clone(),
+            normalized_relative_path: None,
+        },
+        relative_cache_dir: Path::new("repos").join(key.as_str()),
         source,
         modes: modes.iter().map(ToString::to_string).collect(),
     }
@@ -68,6 +75,14 @@ fn response(modes: &[&str], envs: &[(&str, &str)], mounts: &[(&str, bool)]) -> V
 fn command_args(command: &Command) -> Vec<OsString> {
     command.get_args().map(ToOwned::to_owned).collect()
 }
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(future)
+}
 #[cfg(unix)]
 #[test]
 fn permission_denied_cache_directory_uses_noninteractive_sudo_mkdir_and_chown() {
@@ -82,18 +97,18 @@ fn permission_denied_cache_directory_uses_noninteractive_sudo_mkdir_and_chown() 
     fs::create_dir(&locked).unwrap();
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
     let target = locked.join("child").join("grandchild");
-    let commands = Rc::new(RefCell::new(Vec::new()));
-    let result = block_on(create_cache_dir_all(&target, &mut {
-        let commands = Rc::clone(&commands);
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let result = block_on(create_cache_dir_all(&target, &{
+        let commands = Arc::clone(&commands);
         move |command| {
-            commands.borrow_mut().push(command_args(&command));
+            commands.lock().unwrap().push(command_args(&command));
             futures::future::ready(Ok(Vec::new()))
         }
     }));
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
 
     assert_eq!(result, Ok(()));
-    let commands = commands.borrow();
+    let commands = commands.lock().unwrap();
     assert_eq!(commands.len(), 2);
     assert_eq!(
         commands[0],
@@ -298,16 +313,16 @@ fn json_parse_failure_is_classified_and_does_not_abort_later_repos() {
         source(temp.path(), "github.com", "warp", "one"),
         source(temp.path(), "github.com", "warp", "two"),
     ];
-    let calls = Rc::new(RefCell::new(0usize));
+    let calls = Arc::new(Mutex::new(0usize));
     let report = block_on(setup_cache(
         temp.path().join("cache"),
         repositories,
         Vec::new(),
         {
-            let calls = Rc::clone(&calls);
+            let calls = Arc::clone(&calls);
             move |_| {
                 let call = {
-                    let mut count = calls.borrow_mut();
+                    let mut count = calls.lock().unwrap();
                     *count += 1;
                     *count
                 };
@@ -319,7 +334,7 @@ fn json_parse_failure_is_classified_and_does_not_abort_later_repos() {
             }
         },
     ));
-    assert_eq!(*calls.borrow(), 4);
+    assert_eq!(*calls.lock().unwrap(), 4);
     assert_eq!(
         report.invocations[0].error,
         Some(CacheSetupError::JsonParseFailed)
@@ -330,16 +345,16 @@ fn json_parse_failure_is_classified_and_does_not_abort_later_repos() {
 #[test]
 fn destructive_execution_uses_resolved_modes_without_redetection() {
     let temp = tempfile::tempdir().unwrap();
-    let commands = Rc::new(RefCell::new(Vec::new()));
+    let commands = Arc::new(Mutex::new(Vec::new()));
     let report = block_on(setup_cache(
         temp.path().join("cache"),
         vec![source(temp.path(), "github.com", "warp", "client")],
         Vec::new(),
         {
-            let commands = Rc::clone(&commands);
+            let commands = Arc::clone(&commands);
             move |command| {
                 let detect = is_detect(&command);
-                commands.borrow_mut().push(command_args(&command));
+                commands.lock().unwrap().push(command_args(&command));
                 futures::future::ready(Ok(if detect {
                     response(&["go", "cargo", "go"], &[], &[])
                 } else {
@@ -349,7 +364,7 @@ fn destructive_execution_uses_resolved_modes_without_redetection() {
         },
     ));
     assert!(report.plan.is_some());
-    let commands = commands.borrow();
+    let commands = commands.lock().unwrap();
     assert_eq!(commands.len(), 3);
     for args in &commands[1..] {
         assert!(args.iter().any(|arg| arg == "--mode=cargo,go"));
@@ -361,7 +376,7 @@ fn destructive_execution_uses_resolved_modes_without_redetection() {
 #[test]
 fn repo_failure_continues_and_global_still_executes() {
     let temp = tempfile::tempdir().unwrap();
-    let destructive_calls = Rc::new(RefCell::new(0));
+    let destructive_calls = Arc::new(Mutex::new(0));
     let report = block_on(setup_cache(
         temp.path().join("cache"),
         vec![
@@ -370,22 +385,25 @@ fn repo_failure_continues_and_global_still_executes() {
         ],
         Vec::new(),
         {
-            let destructive_calls = Rc::clone(&destructive_calls);
+            let destructive_calls = Arc::clone(&destructive_calls);
             move |command| {
                 if is_detect(&command) {
                     return futures::future::ready(Ok(response(&["cargo"], &[], &[])));
                 }
-                let mut calls = destructive_calls.borrow_mut();
+                let mut calls = destructive_calls.lock().unwrap();
                 *calls += 1;
                 if *calls == 1 {
-                    futures::future::ready(Err(CacheSetupError::NonzeroExit { exit_code: Some(1) }))
+                    futures::future::ready(Err(CacheSetupError::NonzeroExit {
+                        exit_code: Some(1),
+                        stderr: "repository mount failed".to_owned(),
+                    }))
                 } else {
                     futures::future::ready(Ok(response(&["cargo"], &[], &[])))
                 }
             }
         },
     ));
-    assert_eq!(*destructive_calls.borrow(), 3);
+    assert_eq!(*destructive_calls.lock().unwrap(), 3);
     assert!(
         report
             .invocations
@@ -397,7 +415,7 @@ fn repo_failure_continues_and_global_still_executes() {
 #[test]
 fn spacectl_calls_are_bounded_by_two_repos_plus_one_global() {
     let temp = tempfile::tempdir().unwrap();
-    let calls = Rc::new(RefCell::new(0));
+    let calls = Arc::new(Mutex::new(0));
     let report = block_on(setup_cache(
         temp.path().join("cache"),
         vec![
@@ -406,15 +424,196 @@ fn spacectl_calls_are_bounded_by_two_repos_plus_one_global() {
         ],
         Vec::new(),
         {
-            let calls = Rc::clone(&calls);
+            let calls = Arc::clone(&calls);
             move |_| {
-                *calls.borrow_mut() += 1;
+                *calls.lock().unwrap() += 1;
                 futures::future::ready(Ok(response(&["cargo"], &[], &[])))
             }
         },
     ));
-    assert_eq!(*calls.borrow(), 5);
+    assert_eq!(*calls.lock().unwrap(), 5);
     assert_eq!(report.invocations.len(), 5);
+}
+#[test]
+fn nested_roots_share_one_bounded_detection_pool_and_mount_serially() {
+    let temp = tempfile::tempdir().unwrap();
+    let repositories = vec![
+        source(temp.path(), "github.com", "warp", "client-a"),
+        source(temp.path(), "github.com", "warp", "client-b"),
+    ];
+    for repository in &repositories {
+        for index in 0..6 {
+            let child = repository.cwd.join(format!("child-{index:02}"));
+            fs::create_dir_all(&child).unwrap();
+            fs::write(child.join("Cargo.toml"), "").unwrap();
+        }
+    }
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+    produce_candidates(repositories.clone(), sender);
+    let mut expected_candidates =
+        std::iter::from_fn(|| receiver.blocking_recv()).collect::<Vec<_>>();
+    expected_candidates.sort_by(|left, right| left.key.cmp(&right.key));
+    let expected_detection_order = expected_candidates
+        .iter()
+        .map(|candidate| candidate.relative_cache_dir.clone())
+        .collect::<Vec<_>>();
+    let detect_delays = expected_candidates
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(index, candidate)| (candidate.source.cwd.clone(), index as u64 + 1))
+        .collect::<BTreeMap<_, _>>();
+    let active_detects = Arc::new(AtomicUsize::new(0));
+    let max_active_detects = Arc::new(AtomicUsize::new(0));
+    let detect_count = Arc::new(AtomicUsize::new(0));
+    let active_mounts = Arc::new(AtomicUsize::new(0));
+    let max_active_mounts = Arc::new(AtomicUsize::new(0));
+    let mount_order = Arc::new(Mutex::new(Vec::new()));
+    let report = block_on(setup_cache(
+        temp.path().join("cache"),
+        repositories,
+        Vec::new(),
+        {
+            let active_detects = Arc::clone(&active_detects);
+            let max_active_detects = Arc::clone(&max_active_detects);
+            let detect_count = Arc::clone(&detect_count);
+            let active_mounts = Arc::clone(&active_mounts);
+            let max_active_mounts = Arc::clone(&max_active_mounts);
+            let mount_order = Arc::clone(&mount_order);
+            move |command| {
+                let active_detects = Arc::clone(&active_detects);
+                let max_active_detects = Arc::clone(&max_active_detects);
+                let detect_count = Arc::clone(&detect_count);
+                let active_mounts = Arc::clone(&active_mounts);
+                let max_active_mounts = Arc::clone(&max_active_mounts);
+                let mount_order = Arc::clone(&mount_order);
+                let delay = command
+                    .get_current_dir()
+                    .and_then(|cwd| detect_delays.get(cwd))
+                    .copied()
+                    .unwrap_or_default();
+                async move {
+                    if is_detect(&command) {
+                        detect_count.fetch_add(1, Ordering::SeqCst);
+                        let active = active_detects.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active_detects.fetch_max(active, Ordering::SeqCst);
+                        Timer::after(Duration::from_millis(delay)).await;
+                        active_detects.fetch_sub(1, Ordering::SeqCst);
+                    } else {
+                        let active = active_mounts.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active_mounts.fetch_max(active, Ordering::SeqCst);
+                        Timer::after(Duration::from_millis(1)).await;
+                        mount_order
+                            .lock()
+                            .unwrap()
+                            .push(command.get_current_dir().unwrap().to_path_buf());
+                        active_mounts.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    Ok(response(&["cargo"], &[], &[]))
+                }
+            }
+        },
+    ));
+
+    assert_eq!(detect_count.load(Ordering::SeqCst), 14);
+    assert!(max_active_detects.load(Ordering::SeqCst) > 1);
+    assert!(max_active_detects.load(Ordering::SeqCst) <= 8);
+    assert_eq!(max_active_mounts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        report.invocations[..expected_detection_order.len()]
+            .iter()
+            .map(|invocation| invocation.relative_cache_dir.clone())
+            .collect::<Vec<_>>(),
+        expected_detection_order
+    );
+    let plan = report.plan.as_ref().unwrap();
+    assert_eq!(plan.configurations.len(), 15);
+    assert_eq!(
+        plan.configurations
+            .iter()
+            .filter(|configuration| matches!(configuration.scope, CacheScope::Repository { .. }))
+            .count(),
+        14
+    );
+    let mount_order = mount_order.lock().unwrap();
+    assert_eq!(
+        mount_order.as_slice(),
+        plan.configurations
+            .iter()
+            .map(|configuration| configuration.cwd.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn plan_accepts_repeated_repo_keys_with_distinct_roots_and_cache_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = source(temp.path(), "github.com", "warp", "client");
+    let mut child = root.clone();
+    child.cwd = root.cwd.join("nested");
+    fs::create_dir_all(&child.cwd).unwrap();
+    let key = RepoCacheKey::derive(&root.identity);
+    let plan = CacheSetupPlan::try_new(
+        temp.path().join("cache"),
+        vec![
+            CacheConfiguration {
+                scope: CacheScope::Repository {
+                    name: root.name,
+                    key: key.clone(),
+                },
+                cwd: root.cwd,
+                relative_cache_dir: Path::new("repos").join(key.as_str()),
+                modes: vec!["cargo".to_owned()],
+            },
+            CacheConfiguration {
+                scope: CacheScope::Repository {
+                    name: child.name,
+                    key,
+                },
+                cwd: child.cwd,
+                relative_cache_dir: PathBuf::from("repos/key/nested/id"),
+                modes: vec!["cargo".to_owned()],
+            },
+            CacheConfiguration {
+                scope: CacheScope::Global,
+                cwd: temp.path().join("scratch"),
+                relative_cache_dir: PathBuf::from("shared"),
+                modes: vec!["cargo".to_owned()],
+            },
+        ],
+    );
+
+    assert!(plan.is_ok());
+}
+
+#[test]
+fn plan_rejects_duplicate_repository_working_or_cache_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = source(temp.path(), "github.com", "warp", "client");
+    let key = RepoCacheKey::derive(&repo.identity);
+    let configuration = CacheConfiguration {
+        scope: CacheScope::Repository {
+            name: repo.name,
+            key,
+        },
+        cwd: repo.cwd,
+        relative_cache_dir: PathBuf::from("repos/key"),
+        modes: vec!["cargo".to_owned()],
+    };
+    let global = CacheConfiguration {
+        scope: CacheScope::Global,
+        cwd: temp.path().join("scratch"),
+        relative_cache_dir: PathBuf::from("shared"),
+        modes: vec!["cargo".to_owned()],
+    };
+
+    assert!(
+        CacheSetupPlan::try_new(
+            temp.path().join("cache"),
+            vec![configuration.clone(), configuration, global],
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -588,27 +787,46 @@ fn scratch_directories_are_unique_0700_outside_repo_and_retained() {
     }
 }
 
-#[test]
-fn process_runner_classifies_spawn_nonzero_and_timeout() {
-    let missing = block_on(run_command_with_timeout(
-        Command::new_with_process_group("/definitely/missing/spacectl"),
-        Duration::from_millis(50),
-    ));
-    assert_eq!(missing, Err(CacheSetupError::SpawnFailed));
+/// A budget no spawn or immediate exit can plausibly exceed, used by the tests that classify a
+/// finished process. They assert on the classification, not on the clock, so the timeout must
+/// never be the thing that wins the race — process-spawn latency varies by orders of magnitude
+/// under load, and a tight budget made this suite flaky on Windows CI.
+const UNREACHABLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+#[test]
+fn process_runner_classifies_spawn_failed() {
+    let result = block_on(run_command_with_timeout(
+        Command::new_with_process_group("/definitely/missing/spacectl"),
+        UNREACHABLE_TIMEOUT,
+    ));
+    assert_eq!(result, Err(CacheSetupError::SpawnFailed));
+}
+
+#[test]
+fn process_runner_classifies_nonzero_exit() {
     let mut nonzero = Command::new_with_process_group("sh");
-    nonzero.args(["-c", "exit 17"]);
+    nonzero.args(["-c", "printf 'mount failed' >&2; exit 17"]);
     assert_eq!(
-        block_on(run_command_with_timeout(nonzero, Duration::from_secs(1))),
+        block_on(run_command_with_timeout(nonzero, UNREACHABLE_TIMEOUT)),
         Err(CacheSetupError::NonzeroExit {
-            exit_code: Some(17)
+            exit_code: Some(17),
+            stderr: "mount failed".to_owned(),
         })
     );
+}
 
+#[test]
+fn process_runner_classifies_timeout() {
+    // This must stay a shell builtin loop rather than a shelled-out `sleep`: process-group kill
+    // is Unix-only (see the `TODO(roland)` in `Command::new_with_process_group`), so on Windows a
+    // subprocess spawned by `sh` could survive when only the immediate `sh` process is killed.
     let mut timeout = Command::new_with_process_group("sh");
-    timeout.args(["-c", "sleep 1"]);
+    timeout.args(["-c", "while :; do :; done"]);
     assert_eq!(
-        block_on(run_command_with_timeout(timeout, Duration::from_millis(10))),
+        block_on(run_command_with_timeout(
+            timeout,
+            Duration::from_millis(100)
+        )),
         Err(CacheSetupError::Timeout)
     );
 }
@@ -632,10 +850,17 @@ fn timeout_returns_bounded_when_descendant_keeps_stdout_open() {
 fn cache_setup_error_variants_have_expected_is_actionable_classification() {
     assert!(!CacheSetupError::RootCreationFailed.is_actionable());
     assert!(!CacheSetupError::SpawnFailed.is_actionable());
-    assert!(!CacheSetupError::NonzeroExit { exit_code: Some(1) }.is_actionable());
+    assert!(
+        !CacheSetupError::NonzeroExit {
+            exit_code: Some(1),
+            stderr: String::new(),
+        }
+        .is_actionable()
+    );
     assert!(!CacheSetupError::Timeout.is_actionable());
     assert!(CacheSetupError::JsonParseFailed.is_actionable());
     assert!(CacheSetupError::EnvExportFailed.is_actionable());
+    assert!(CacheSetupError::PlanInvariantFailed.is_actionable());
 }
 
 #[test]
@@ -645,6 +870,7 @@ fn failure_categories_are_preserved() {
         CacheSetupError::SpawnFailed,
         CacheSetupError::NonzeroExit {
             exit_code: Some(17),
+            stderr: "mount failed".to_owned(),
         },
         CacheSetupError::Timeout,
     ] {
@@ -682,7 +908,7 @@ fn failure_categories_are_preserved() {
 #[test]
 fn queued_executor_can_return_each_failure_category() {
     let temp = tempfile::tempdir().unwrap();
-    let queue = Rc::new(RefCell::new(VecDeque::from([
+    let queue = Arc::new(Mutex::new(VecDeque::from([
         Err(CacheSetupError::JsonParseFailed),
         Err(CacheSetupError::Timeout),
     ])));
@@ -694,8 +920,8 @@ fn queued_executor_can_return_each_failure_category() {
         ],
         Vec::new(),
         {
-            let queue = Rc::clone(&queue);
-            move |_| futures::future::ready(queue.borrow_mut().pop_front().unwrap())
+            let queue = Arc::clone(&queue);
+            move |_| futures::future::ready(queue.lock().unwrap().pop_front().unwrap())
         },
     ));
     assert_eq!(report.invocations.len(), 2);

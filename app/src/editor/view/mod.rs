@@ -45,8 +45,9 @@ use vim::vim::{
     VimTextObject, WordBound, WordMotion, WordType,
 };
 use vim::{
-    vim_a_block, vim_a_paragraph, vim_a_quote, vim_a_word, vim_inner_block, vim_inner_paragraph,
-    vim_inner_quote, vim_inner_word, vim_word_iterator_from_offset,
+    vim_a_block, vim_a_paragraph, vim_a_quote, vim_a_word, vim_all_lines, vim_inner_block,
+    vim_inner_line, vim_inner_paragraph, vim_inner_quote, vim_inner_word,
+    vim_word_iterator_from_offset,
 };
 use warp_completer::completer::Description;
 use warp_core::semantic_selection::SemanticSelection;
@@ -2204,9 +2205,45 @@ impl VimHandler for EditorView {
         });
     }
 
-    fn replace_char(&mut self, c: char, char_count: u32, ctx: &mut ViewContext<Self>) {
-        if char_count <= self.distance_to_line_end(ctx) {
+    fn replace_char(
+        &mut self,
+        c: char,
+        char_count: u32,
+        advance: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if advance {
+            if self.distance_to_line_end(ctx) > 0 {
+                self.replace_characters(c, 1, ctx);
+                self.move_right(true, ctx);
+            } else {
+                self.user_insert(&c.to_string(), ctx);
+            }
+        } else if char_count <= self.distance_to_line_end(ctx) {
             self.replace_characters(c, char_count, ctx);
+        }
+    }
+
+    fn replace_text(
+        &mut self,
+        text: &str,
+        count: u32,
+        already_applied: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let repeat_count = count.saturating_sub(u32::from(already_applied));
+        for _ in 0..repeat_count {
+            for c in text.chars() {
+                if self.distance_to_line_end(ctx) > 0 {
+                    self.replace_characters(c, 1, ctx);
+                    self.move_right(true, ctx);
+                } else {
+                    self.user_insert(&c.to_string(), ctx);
+                }
+            }
+        }
+        if !text.is_empty() {
+            self.move_left(true, ctx);
         }
     }
 
@@ -2332,13 +2369,7 @@ impl VimHandler for EditorView {
 
         let motion_type = match operand {
             VimOperand::Motion { motion_type, .. } => *motion_type,
-            VimOperand::TextObject(text_object) => match text_object {
-                VimTextObject {
-                    object_type: TextObjectType::Paragraph,
-                    ..
-                } => MotionType::Linewise,
-                _ => MotionType::Charwise,
-            },
+            VimOperand::TextObject(text_object) => text_object.motion_type(),
             VimOperand::Line => MotionType::Linewise,
         };
 
@@ -2835,6 +2866,10 @@ impl VimHandler for EditorView {
                     (TextObjectType::Paragraph, TextObjectInclusion::Inner) => {
                         vim_inner_paragraph(buffer, offset).map(|range| range.start..range.end + 1)
                     }
+                    (TextObjectType::Line, TextObjectInclusion::Around) => vim_all_lines(buffer),
+                    (TextObjectType::Line, TextObjectInclusion::Inner) => {
+                        vim_inner_line(buffer, offset)
+                    }
                     (TextObjectType::Quote(quote_type), TextObjectInclusion::Around) => {
                         vim_a_quote(buffer, offset, *quote_type)
                     }
@@ -2857,8 +2892,11 @@ impl VimHandler for EditorView {
                 let Ok(mut end_point) = buffer.point_for_offset(end) else {
                     continue;
                 };
-                // Cursor always snaps to column 0 on paragraph text objects.
-                if let TextObjectType::Paragraph = text_object.object_type {
+                if matches!(
+                    (&text_object.object_type, text_object.inclusion),
+                    (TextObjectType::Paragraph, _)
+                        | (TextObjectType::Line, TextObjectInclusion::Around)
+                ) {
                     end_point.column = 0;
                 }
                 let Ok(new_head) = buffer.anchor_at(end_point, AnchorBias::Left) else {
@@ -4412,14 +4450,13 @@ impl EditorView {
                 .is_some_and(|ai_block| {
                     let block = ai_block.as_ref(ctx);
                     // Ctrl+c should dismiss the passive ai block only if the keybindings for the block are not hidden.
-                    let is_pending_code_diff = block.find_undismissed_code_diff(ctx).is_some();
-                    let is_pending_suggested_prompt = block
-                        .pending_unit_test_suggestion(ctx)
-                        .is_some_and(|suggested_prompt| {
-                            !suggested_prompt.as_ref(ctx).is_keybindings_hidden()
-                        });
-                    block.is_passive_conversation(ctx)
-                        && (is_pending_code_diff || is_pending_suggested_prompt)
+                    block.is_passive_conversation()
+                        && (block.find_undismissed_code_diff(ctx).is_some()
+                            || block.pending_unit_test_suggestion(ctx).is_some_and(
+                                |suggested_prompt| {
+                                    !suggested_prompt.as_ref(ctx).is_keybindings_hidden()
+                                },
+                            ))
                 })
         });
 

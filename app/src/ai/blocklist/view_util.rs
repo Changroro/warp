@@ -3,6 +3,8 @@ use std::sync::LazyLock;
 
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
+use thousands::Separable;
+use warp_core::features::FeatureFlag;
 use warp_core::ui::appearance::Appearance;
 use warpui::elements::{
     ChildAnchor, ConstrainedBox, Container, CrossAxisAlignment, Flex, Hoverable, MainAxisAlignment,
@@ -17,6 +19,7 @@ use warpui::{AppContext, Element, EntityId, EventContext, SingletonEntity};
 
 use crate::ai::AIRequestUsageModel;
 use crate::ai::agent::RenderableAIError;
+use crate::settings::UsageDisplayUnit;
 use crate::themes::theme::{AnsiColorIdentifier, Fill, WarpTheme};
 use crate::ui_components::icons::Icon;
 use crate::workspaces::user_workspaces::UserWorkspaces;
@@ -32,7 +35,7 @@ pub const OUT_OF_CREDITS_SUBSCRIBE_LABEL: &str = "Subscribe";
 pub static ATTACH_AS_AGENT_MODE_CONTEXT_TEXT: LazyLock<&'static str> =
     LazyLock::new(|| "Attach as agent context");
 
-/// Label we use for the the command palette action to create a new local Oz agent pane.
+/// Label we use for the the command palette action to create a new local Warp Agent pane.
 pub static NEW_AGENT_PANE_LABEL: LazyLock<&'static str> = LazyLock::new(|| "New Agent Pane");
 
 /// Claude/Anthropic brand color (official brand orange #D97757).
@@ -158,11 +161,17 @@ pub fn failed_output_presentation(
         RenderableAIError::TransientNetworkError { .. } => {
             FailedOutputPresentation::Message(error.to_string())
         }
-        RenderableAIError::Other { error_message, .. } => {
+        RenderableAIError::AgentStreamFailure { error_message }
+        | RenderableAIError::Other { error_message, .. } => {
             FailedOutputPresentation::Message(format!("{ERROR_APOLOGY_TEXT}\n\n{error_message}"))
         }
-        RenderableAIError::AgentExitedShell => {
+        RenderableAIError::AgentExitedShell { .. } => {
             FailedOutputPresentation::Message(format!("{ERROR_APOLOGY_TEXT}\n\n{error}"))
+        }
+        // Cloud startup failures surface the raw server message directly, matching the
+        // dedicated GUI error card which shows the message without an apology prefix.
+        RenderableAIError::CloudStartupFailed(msg) => {
+            FailedOutputPresentation::Message(msg.clone())
         }
     })
 }
@@ -275,9 +284,13 @@ pub fn get_ai_block_overflow_menu_element_position_id(view_id: EntityId) -> Stri
 }
 
 /// Formats credit count to display as whole numbers when the value is effectively a whole number,
-/// otherwise displays with one decimal place.
+/// otherwise displays with one decimal place. A non-zero amount below the displayed precision is
+/// shown as `<0.1 credits` rather than rounding to zero, which would read as no cost.
 /// Returns a formatted string with proper pluralization ("credit" vs "credits").
 pub fn format_credits(credits: f32) -> String {
+    if credits > 0.0 && credits < 0.1 {
+        return "<0.1 credits".to_string();
+    }
     // If the first part of the decimal is 0, we just display the whole number.
     if credits.fract() < 0.1 {
         let whole = credits.trunc() as i32;
@@ -289,6 +302,99 @@ pub fn format_credits(credits: f32) -> String {
     } else {
         format!("{credits:.1} credits")
     }
+}
+
+/// Formats a US-cent amount as dollars without rounding a positive charge down to zero.
+pub fn format_dollars(cost_in_cents: f32) -> String {
+    // Accumulated costs can produce negative zero, which would otherwise render as `$-0.00`.
+    let cost_in_cents = if cost_in_cents == 0.0 {
+        0.0
+    } else {
+        cost_in_cents
+    };
+    let dollars = cost_in_cents / 100.0;
+    if cost_in_cents > 0.0 && dollars < 0.01 {
+        "<$0.01".to_string()
+    } else {
+        format!("${dollars:.2}")
+    }
+}
+
+fn effective_usage_unit(unit: UsageDisplayUnit, cost_in_cents: Option<f32>) -> UsageDisplayUnit {
+    if !FeatureFlag::PricingTransparency.is_enabled() {
+        return UsageDisplayUnit::Credits;
+    }
+    match unit {
+        UsageDisplayUnit::Credits => UsageDisplayUnit::Credits,
+        UsageDisplayUnit::Dollars if cost_in_cents.is_some() => UsageDisplayUnit::Dollars,
+        UsageDisplayUnit::Dollars => UsageDisplayUnit::Credits,
+    }
+}
+
+fn format_usage_unit_value(
+    credits: f32,
+    cost_in_cents: Option<f32>,
+    unit: UsageDisplayUnit,
+) -> String {
+    match unit {
+        UsageDisplayUnit::Credits => format_credits(credits),
+        UsageDisplayUnit::Dollars => cost_in_cents
+            .map(format_dollars)
+            .unwrap_or_else(|| format_credits(credits)),
+    }
+}
+
+/// Formats tokens with the selected unit, falling back to credits when dollars are unavailable.
+pub fn format_usage(
+    credits: f32,
+    tokens: Option<u32>,
+    cost_in_cents: Option<f32>,
+    unit: UsageDisplayUnit,
+) -> String {
+    let resolved_unit = effective_usage_unit(unit, cost_in_cents);
+    if !FeatureFlag::PricingTransparency.is_enabled() || resolved_unit != unit {
+        return format_credits(credits);
+    }
+    let unit_text = format_usage_unit_value(credits, cost_in_cents, resolved_unit);
+    let Some(tokens) = tokens.filter(|&tokens| tokens > 0) else {
+        return unit_text;
+    };
+    format!("{} tokens / {unit_text}", tokens.separate_with_commas())
+}
+
+#[derive(Clone, Copy)]
+pub enum UsageLabelKind {
+    LastResponse,
+    Total,
+    Plain,
+    DetailsPanel,
+}
+
+/// Matches the label to the unit [`format_usage`] will render.
+pub fn usage_label(
+    kind: UsageLabelKind,
+    cost_in_cents: Option<f32>,
+    unit: UsageDisplayUnit,
+) -> String {
+    let unit = effective_usage_unit(unit, cost_in_cents);
+    let base = match (kind, unit) {
+        (UsageLabelKind::DetailsPanel, UsageDisplayUnit::Credits) => "Credits used",
+        (UsageLabelKind::DetailsPanel, UsageDisplayUnit::Dollars) => "Usage",
+        (
+            UsageLabelKind::LastResponse | UsageLabelKind::Total | UsageLabelKind::Plain,
+            UsageDisplayUnit::Credits,
+        ) => "Credits spent",
+        (
+            UsageLabelKind::LastResponse | UsageLabelKind::Total | UsageLabelKind::Plain,
+            UsageDisplayUnit::Dollars,
+        ) => "Usage charged",
+    };
+    let suffix = match kind {
+        UsageLabelKind::LastResponse => " (last response)",
+        UsageLabelKind::Total => " (total)",
+        UsageLabelKind::Plain | UsageLabelKind::DetailsPanel => "",
+    };
+    format!("{base}{suffix}")
 }
 
 /// Renders a secondary button with an MCP/skill provider icon and a text label.
@@ -350,3 +456,7 @@ where
         })
         .finish()
 }
+
+#[cfg(test)]
+#[path = "view_util_tests.rs"]
+mod tests;

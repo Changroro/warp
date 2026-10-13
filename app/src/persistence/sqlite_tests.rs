@@ -20,6 +20,7 @@ use crate::app_state::{
     AppState, CodePaneSnapShot, CodePaneTabSnapshot, LeafContents, LeafSnapshot, PaneNodeSnapshot,
     TabGroupSnapshot, TabSnapshot, TerminalPaneSnapshot, WindowSnapshot,
 };
+use crate::auth::UserUid;
 use crate::cloud_object::{CloudObjectPermissions, Owner};
 use crate::code::editor_management::CodeSource;
 use crate::notebooks::{CloudNotebook, CloudNotebookModel};
@@ -27,13 +28,16 @@ use crate::persistence::model::ObjectPermissions;
 use crate::persistence::{
     BlockCompleted, ModelEvent, PersistedDataScope, PersistenceScope, StartedCommandMetadata,
 };
-use crate::server::ids::ClientId;
+use crate::server::ids::{ClientId, ServerId};
 use crate::tab::SelectedTabColor;
 use crate::terminal::ShellLaunchData;
 use crate::terminal::model::block::SerializedBlock;
 use crate::terminal::model::session::SessionId;
 use crate::themes::theme::AnsiColorIdentifier;
 use crate::workspace::tab_group::TabGroupId;
+use crate::workspaces::team::{MembershipRole, Team, TeamMember};
+use crate::workspaces::user_profiles::UserProfileWithUID;
+use crate::workspaces::workspace::Workspace;
 
 #[test]
 fn app_scope_database_path_matches_app_database_path() {
@@ -203,6 +207,17 @@ fn tui_database_in_tui_subdirectory_round_trips_data() {
         .expect("insert command event should send");
     writer
         .sender
+        .send(ModelEvent::UpsertUserProfiles {
+            profiles: vec![UserProfileWithUID {
+                firebase_uid: UserUid::new("creator-uid"),
+                display_name: Some("MCP Creator".to_owned()),
+                email: "creator@example.com".to_owned(),
+                photo_url: String::new(),
+            }],
+        })
+        .expect("user profile event should send");
+    writer
+        .sender
         .send(ModelEvent::Terminate)
         .expect("terminate event should send");
     writer.handle.join().expect("writer should terminate");
@@ -213,9 +228,15 @@ fn tui_database_in_tui_subdirectory_round_trips_data() {
         .expect("persisted data should load");
     // The TUI data scope skips GUI session restoration...
     assert!(restored.app_state.is_none());
-    // ...but restores command history and shared data like codebase index metadata.
+    // ...but restores command history and shared data like creator profiles and
+    // codebase index metadata.
     assert_eq!(restored.command_history.len(), 1);
     assert_eq!(restored.command_history[0].command, "ls");
+    assert_eq!(restored.user_profiles.len(), 1);
+    assert_eq!(
+        restored.user_profiles[0].display_name.as_deref(),
+        Some("MCP Creator")
+    );
     assert_eq!(restored.codebase_indices.len(), 1);
     assert_eq!(restored.codebase_indices[0].path, metadata.path);
 }
@@ -383,6 +404,7 @@ fn test_terminal_window_snapshot(vertical_tabs_panel_open: bool) -> WindowSnapsh
             pinned: false,
         }],
         active_tab_index: 0,
+        team_uid: None,
         bounds: None,
         fullscreen_state: Default::default(),
         quake_mode: false,
@@ -434,6 +456,33 @@ fn test_sqlite_round_trips_vertical_tabs_panel_open() {
 }
 
 #[test]
+fn test_sqlite_round_trips_window_team_uid() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let database_path = tempdir.path().join("warp.sqlite");
+    let mut conn = setup_database(&database_path).expect("database should initialize");
+    let team_uid = ServerId::from(123);
+    let mut assigned_window = test_terminal_window_snapshot(false);
+    assigned_window.team_uid = Some(team_uid);
+
+    let app_state = AppState {
+        windows: vec![assigned_window, test_terminal_window_snapshot(true)],
+        active_window_index: Some(0),
+        block_lists: Default::default(),
+        running_mcp_servers: Default::default(),
+    };
+
+    save_app_state(&mut conn, &app_state).expect("app state should save");
+
+    let restored = read_sqlite_data(&mut conn, None, PersistedDataScope::Full)
+        .expect("app state should load")
+        .app_state
+        .expect("app state should be present for the full scope");
+
+    assert_eq!(restored.windows[0].team_uid, Some(team_uid));
+    assert_eq!(restored.windows[1].team_uid, None);
+}
+
+#[test]
 fn test_sqlite_round_trips_custom_vertical_tabs_title() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let database_path = tempdir.path().join("warp.sqlite");
@@ -470,6 +519,7 @@ fn test_sqlite_round_trips_custom_vertical_tabs_title() {
                 pinned: false,
             }],
             active_tab_index: 0,
+            team_uid: None,
             bounds: None,
             fullscreen_state: Default::default(),
             quake_mode: false,
@@ -548,6 +598,7 @@ fn test_sqlite_round_trips_code_pane_with_multiple_tabs() {
                 pinned: false,
             }],
             active_tab_index: 0,
+            team_uid: None,
             bounds: None,
             fullscreen_state: Default::default(),
             quake_mode: false,
@@ -666,6 +717,7 @@ fn test_sqlite_round_trips_tab_groups() {
         windows: vec![WindowSnapshot {
             tabs: vec![tab_in_group, tab_outside_group],
             active_tab_index: 0,
+            team_uid: None,
             bounds: None,
             fullscreen_state: Default::default(),
             quake_mode: false,
@@ -817,6 +869,7 @@ fn test_sqlite_round_trips_pinned_state() {
         windows: vec![WindowSnapshot {
             tabs: vec![pinned_tab, tab_in_pinned_group, unpinned_tab],
             active_tab_index: 0,
+            team_uid: None,
             bounds: None,
             fullscreen_state: Default::default(),
             quake_mode: false,
@@ -1041,4 +1094,68 @@ fn test_sqlite_drops_too_small_bounds_on_read() {
         restored.windows[0].bounds.is_none(),
         "tiny persisted bounds must be discarded on read so users recover from a corrupt DB"
     );
+}
+
+#[test]
+fn team_member_is_disabled_round_trips_through_sqlite_cache() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let database_path = tempdir.path().join("warp.sqlite");
+    let conn = setup_database(&database_path).expect("database should initialize");
+
+    let team = Team::from_local_cache(
+        ServerId::from_string_lossy(format!("{:0>22}", "team")),
+        "Team".to_string(),
+        None,
+        None,
+        Some(vec![
+            TeamMember {
+                uid: UserUid::new("active-user"),
+                email: "active@example.com".to_string(),
+                role: MembershipRole::User,
+                is_disabled: false,
+            },
+            TeamMember {
+                uid: UserUid::new("disabled-user"),
+                email: "disabled@example.com".to_string(),
+                role: MembershipRole::User,
+                is_disabled: true,
+            },
+        ]),
+        None,
+    );
+    let workspace = Workspace::from_local_cache(
+        format!("{:0>22}", "workspace").into(),
+        "Workspace".to_string(),
+        Some(vec![team]),
+        None,
+    );
+
+    let writer = start_writer(conn, database_path.clone()).expect("writer should start");
+    writer
+        .sender
+        .send(ModelEvent::UpsertWorkspaces {
+            workspaces: vec![workspace],
+        })
+        .expect("upsert workspaces event should send");
+    writer
+        .sender
+        .send(ModelEvent::Terminate)
+        .expect("terminate event should send");
+    writer.handle.join().expect("writer should terminate");
+
+    let mut conn = setup_database(&database_path).expect("database should reopen");
+    let restored = read_sqlite_data(&mut conn, None, PersistedDataScope::Full)
+        .expect("persisted data should load");
+
+    let members = &restored.workspaces[0].teams[0].members;
+    let active_member = members
+        .iter()
+        .find(|member| member.email == "active@example.com")
+        .expect("active member should be present");
+    let disabled_member = members
+        .iter()
+        .find(|member| member.email == "disabled@example.com")
+        .expect("disabled member should be present");
+    assert!(!active_member.is_disabled);
+    assert!(disabled_member.is_disabled);
 }
