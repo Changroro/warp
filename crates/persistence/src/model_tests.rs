@@ -94,14 +94,17 @@ fn is_restorable_accepts_empty_and_single_task_conversations() {
     assert!(conversation_with_tasks(vec![parentless_task("root", 0)]).is_restorable());
 }
 
+/// Conversations persisted before the provider cost was dropped still carry it; the blob must
+/// keep deserializing and the stale key must not be written back.
 #[test]
-fn conversation_usage_metadata_defaults_missing_provider_cost_to_unknown() {
+fn conversation_usage_metadata_ignores_a_persisted_provider_cost() {
     let metadata: ConversationUsageMetadata = serde_json::from_str(
-        r#"{"was_summarized":false,"context_window_usage":0.0,"credits_spent":0.0}"#,
+        r#"{"was_summarized":false,"context_window_usage":0.0,"credits_spent":1.5,"total_provider_cost_in_cents":3.2}"#,
     )
     .unwrap();
 
-    assert_eq!(metadata.total_provider_cost_in_cents, None);
+    assert_eq!(metadata.credits_spent, 1.5);
+    assert_eq!(metadata.total_billed_cost_in_cents, None);
     assert!(
         !serde_json::to_string(&metadata)
             .unwrap()
@@ -110,18 +113,46 @@ fn conversation_usage_metadata_defaults_missing_provider_cost_to_unknown() {
 }
 
 #[test]
-fn conversation_usage_metadata_preserves_known_zero_provider_cost() {
+fn conversation_usage_metadata_defaults_missing_billed_cost_to_unknown() {
     let metadata: ConversationUsageMetadata = serde_json::from_str(
-        r#"{"was_summarized":false,"context_window_usage":0.0,"credits_spent":0.0,"total_provider_cost_in_cents":0.0}"#,
+        r#"{"was_summarized":false,"context_window_usage":0.0,"credits_spent":0.0}"#,
     )
     .unwrap();
 
-    assert_eq!(metadata.total_provider_cost_in_cents, Some(0.0));
+    assert_eq!(metadata.total_billed_cost_in_cents, None);
+    assert_eq!(metadata.billed_cost_in_cents(), None);
     assert!(
-        serde_json::to_string(&metadata)
+        !serde_json::to_string(&metadata)
             .unwrap()
-            .contains("\"total_provider_cost_in_cents\":0.0")
+            .contains("total_billed_cost_in_cents")
     );
+}
+
+#[test]
+fn billed_cost_prefers_summed_charges_over_graphql_total() {
+    let metadata = ConversationUsageMetadata {
+        total_billed_cost_in_cents: Some(12.0),
+        total_charged_usage: Some(ChargedUsageTotals {
+            input_cost_in_cents: 3.0,
+            output_cost_in_cents: 4.0,
+            platform_cost_in_cents: 1.0,
+            web_search_cost_in_cents: 0.5,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert_eq!(metadata.billed_cost_in_cents(), Some(8.5));
+}
+
+#[test]
+fn billed_cost_falls_back_to_graphql_total_without_summed_charges() {
+    let metadata = ConversationUsageMetadata {
+        total_billed_cost_in_cents: Some(12.0),
+        ..Default::default()
+    };
+
+    assert_eq!(metadata.billed_cost_in_cents(), Some(12.0));
 }
 
 fn inference_usage_with_web_search(
@@ -441,6 +472,22 @@ fn agent_conversation_data_skips_serializing_none_last_event_sequence() {
         !json.contains("last_event_sequence"),
         "None should be skipped in serialized output: {json}"
     );
+}
+
+#[test]
+fn agent_conversation_data_roundtrips_use_warp_credits_instead_of_chatgpt() {
+    let data = AgentConversationData {
+        use_warp_credits_instead_of_chatgpt: true,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&data).expect("serialize");
+    let roundtripped: AgentConversationData = serde_json::from_str(&json).expect("deserialize");
+    assert!(roundtripped.use_warp_credits_instead_of_chatgpt);
+
+    let legacy_json = r#"{"server_conversation_token":null}"#;
+    let legacy: AgentConversationData =
+        serde_json::from_str(legacy_json).expect("legacy rows must deserialize");
+    assert!(!legacy.use_warp_credits_instead_of_chatgpt);
 }
 
 #[test]

@@ -48,6 +48,7 @@ use crate::cloud_object::model::view::CloudViewModel;
 use crate::context_chips::prompt::Prompt;
 use crate::editor::Event;
 use crate::gpu_state::GPUState;
+use crate::menu::MenuAction;
 use crate::network::NetworkStatus;
 use crate::notebooks::editor::keys::NotebookKeybindings;
 use crate::notebooks::notebook::NotebookView;
@@ -1238,6 +1239,114 @@ fn test_open_file_with_target_event_preserves_requested_line() {
                 }
             );
         });
+    });
+}
+
+/// Pressing the Markdown display mode shortcut should swap a Markdown file between its raw code
+/// pane and its rendered pane, and should be left unhandled by a code pane showing any other file.
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_markdown_toggle_shortcut_switches_between_raw_and_rendered_panes() {
+    use warpui::keymap::Keystroke;
+
+    use crate::code::editor_management::CodeManager;
+    use crate::code::global_buffer_model::GlobalBufferModel;
+    use crate::notebooks::file::TOGGLE_MARKDOWN_DISPLAY_MODE_KEY_BINDING;
+    use crate::terminal::local_shell::LocalShellState;
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.add_singleton_model(|_| CodeManager::default());
+        app.add_singleton_model(|_| LocalShellState::NotLoaded);
+        app.add_singleton_model(GlobalBufferModel::new);
+        app.update(crate::code::view::init);
+        app.update(crate::notebooks::file::init);
+        let workspace = mock_workspace(&mut app);
+        let window_id = app.read(|ctx| workspace.window_id(ctx));
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let markdown_path = temp_dir.path().join("README.md");
+        std::fs::write(&markdown_path, "# Test\n").expect("failed to write markdown file");
+        let code_path = temp_dir.path().join("main.rs");
+        std::fs::write(&code_path, "fn main() {}\n").expect("failed to write code file");
+        let keystroke = Keystroke::parse(TOGGLE_MARKDOWN_DISPLAY_MODE_KEY_BINDING).unwrap();
+
+        let open_in_code_editor = |app: &mut App, path: &std::path::Path| {
+            workspace.update(app, |workspace, ctx| {
+                let pane_group = workspace.active_tab_pane_group().clone();
+                workspace.handle_file_tree_event(
+                    pane_group,
+                    &crate::pane_group::Event::OpenFileWithTarget {
+                        path: path.to_path_buf(),
+                        target: FileTarget::CodeEditor(EditorLayout::SplitPane),
+                        line_col: None,
+                    },
+                    ctx,
+                );
+            });
+        };
+        // The ids of the views backing the code panes and rendered file panes, respectively.
+        let pane_view_ids = |app: &App| {
+            workspace.read(app, |workspace, ctx| {
+                let pane_group = workspace.active_tab_pane_group().as_ref(ctx);
+                (
+                    pane_group
+                        .code_panes(ctx)
+                        .map(|(_, view)| view.id())
+                        .collect_vec(),
+                    pane_group
+                        .file_notebook_panes(ctx)
+                        .map(|(_, view)| view.id())
+                        .collect_vec(),
+                )
+            })
+        };
+
+        // Sends the keystroke the way a real key press is routed: through the focused view and its
+        // ancestors, so a binding on the focused editor would take precedence over the pane's.
+        // Returns whether it was handled, after checking that focus is on a view inside `pane`.
+        let press_shortcut_in_focused_child_of = |app: &mut App, pane: EntityId| {
+            let responder_chain = app.read(|ctx| {
+                let focused = ctx
+                    .focused_view_id(window_id)
+                    .expect("a view should be focused");
+                ctx.view_ancestors(window_id, focused)
+            });
+            assert!(
+                responder_chain.contains(&pane) && responder_chain.last() != Some(&pane),
+                "focus should be on a child of the pane"
+            );
+            app.dispatch_keystroke(window_id, &responder_chain, &keystroke, false)
+                .unwrap()
+        };
+
+        open_in_code_editor(&mut app, &markdown_path);
+        let (code_views, file_views) = pane_view_ids(&app);
+        assert_eq!((code_views.len(), file_views.len()), (1, 0));
+
+        // Raw -> rendered.
+        assert!(press_shortcut_in_focused_child_of(&mut app, code_views[0]));
+        let (code_views, file_views) = pane_view_ids(&app);
+        assert_eq!((code_views.len(), file_views.len()), (0, 1));
+
+        // Rendered -> raw.
+        assert!(press_shortcut_in_focused_child_of(&mut app, file_views[0]));
+        let (code_views, file_views) = pane_view_ids(&app);
+        assert_eq!((code_views.len(), file_views.len()), (1, 0));
+
+        // A code pane showing a file with no rendered view leaves the keystroke unhandled.
+        open_in_code_editor(&mut app, &code_path);
+        let (all_code_views, _) = pane_view_ids(&app);
+        let non_markdown_views = all_code_views
+            .into_iter()
+            .filter(|id| !code_views.contains(id))
+            .collect_vec();
+        assert_eq!(non_markdown_views.len(), 1);
+        assert!(!press_shortcut_in_focused_child_of(
+            &mut app,
+            non_markdown_views[0]
+        ));
+        let (code_views, file_views) = pane_view_ids(&app);
+        assert_eq!((code_views.len(), file_views.len()), (2, 0));
     });
 }
 
@@ -2472,25 +2581,21 @@ fn test_closing_tab_context_menu_restores_active_tab_focus() {
         initialize_app(&mut app);
 
         let workspace = mock_workspace(&mut app);
-        let (window_id, menu_id) = workspace.update(&mut app, |workspace, ctx| {
-            workspace.show_tab_right_click_menu =
-                Some((0, TabContextMenuAnchor::Pointer(Vector2F::zero())));
-            ctx.focus(&workspace.tab_right_click_menu);
-            (ctx.window_id(), workspace.tab_right_click_menu.id())
-        });
-        assert_eq!(app.focused_view_id(window_id), Some(menu_id));
-
-        workspace.update(&mut app, |workspace, ctx| {
-            workspace.handle_tab_right_click_menu_event(
-                &MenuEvent::Close {
-                    via_select_item: true,
-                },
+        let (window_id, menu) = workspace.update(&mut app, |workspace, ctx| {
+            workspace.toggle_tab_right_click_menu(
+                0,
+                TabContextMenuAnchor::Pointer(Vector2F::zero()),
                 ctx,
             );
+            (ctx.window_id(), workspace.tab_right_click_menu.clone())
         });
+        assert_eq!(app.focused_view_id(window_id), Some(menu.id()));
 
-        assert_ne!(app.focused_view_id(window_id), Some(menu_id));
+        menu.update(&mut app, |menu, ctx| {
+            menu.handle_action(&MenuAction::Close(false), ctx);
+        });
         workspace.update(&mut app, |workspace, ctx| {
+            assert!(workspace.show_tab_right_click_menu.is_none());
             assert!(
                 workspace
                     .active_tab_pane_group()
@@ -2499,6 +2604,115 @@ fn test_closing_tab_context_menu_restores_active_tab_focus() {
         });
     });
 }
+
+#[test]
+fn test_selecting_rename_from_tab_context_menu_preserves_editor_focus() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        let menu = workspace.update(&mut app, |workspace, ctx| {
+            workspace.toggle_tab_right_click_menu(
+                0,
+                TabContextMenuAnchor::Pointer(Vector2F::zero()),
+                ctx,
+            );
+            workspace.tab_right_click_menu.clone()
+        });
+
+        menu.update(&mut app, |menu, ctx| {
+            assert!(menu.set_selected_by_name("Rename tab", ctx));
+            menu.handle_action(&MenuAction::Enter, ctx);
+        });
+
+        workspace.read(&app, |workspace, ctx| {
+            assert!(workspace.show_tab_right_click_menu.is_none());
+            assert_eq!(
+                workspace.current_workspace_state.tab_being_renamed(),
+                Some(0)
+            );
+            assert!(workspace.tab_rename_editor.is_focused(ctx));
+        });
+    });
+}
+
+#[test]
+fn test_selecting_rename_from_pane_context_menu_preserves_editor_focus() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        let (menu, locator) = workspace.update(&mut app, |workspace, ctx| {
+            let pane_group = workspace.active_tab_pane_group();
+            let locator = PaneViewLocator {
+                pane_group_id: pane_group.id(),
+                pane_id: pane_group.as_ref(ctx).pane_id_from_index(0).unwrap(),
+            };
+            workspace.toggle_vertical_tabs_pane_context_menu(
+                0,
+                VerticalTabsPaneContextMenuTarget::ClickedPane(locator),
+                Vector2F::zero(),
+                ctx,
+            );
+            (workspace.tab_right_click_menu.clone(), locator)
+        });
+
+        menu.update(&mut app, |menu, ctx| {
+            assert!(menu.set_selected_by_name("Rename pane", ctx));
+            menu.handle_action(&MenuAction::Enter, ctx);
+        });
+
+        workspace.read(&app, |workspace, ctx| {
+            assert!(workspace.show_tab_right_click_menu.is_none());
+            assert_eq!(
+                workspace.current_workspace_state.pane_being_renamed(),
+                Some(locator)
+            );
+            assert!(workspace.pane_rename_editor.is_focused(ctx));
+        });
+    });
+}
+
+#[test]
+fn test_selecting_rename_from_tab_group_context_menu_preserves_editor_focus() {
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        let menu = workspace.update(&mut app, |workspace, ctx| {
+            let group = TabGroup::new();
+            let group_id = group.id;
+            workspace.tab_groups.insert(group_id, group);
+            workspace.tabs[0].group_id = Some(group_id);
+            workspace.toggle_tab_group_right_click_menu(
+                group_id,
+                TabContextMenuAnchor::Pointer(Vector2F::zero()),
+                ctx,
+            );
+            workspace.tab_right_click_menu.clone()
+        });
+
+        menu.update(&mut app, |menu, ctx| {
+            assert!(menu.set_selected_by_name("Rename", ctx));
+            menu.handle_action(&MenuAction::Enter, ctx);
+        });
+
+        workspace.read(&app, |workspace, ctx| {
+            assert!(workspace.show_tab_group_right_click_menu.is_none());
+            assert!(
+                workspace
+                    .current_workspace_state
+                    .is_any_tab_group_being_renamed()
+            );
+            assert!(workspace.tab_group_rename_editor.is_focused(ctx));
+        });
+    });
+}
+
 #[test]
 fn test_close_tabs_right_confirmation_dialog() {
     let _guard = FeatureFlag::CreatingSharedSessions.override_enabled(true);
@@ -5393,7 +5607,6 @@ mod simplified_wasm_tab_bar {
                 context_window_usage: 0.0,
                 credits_spent: 0.0,
                 platform_credits_spent: 0.0,
-                total_provider_cost_in_cents: None,
                 credits_spent_for_last_block: None,
                 charged_usage_for_last_block: None,
                 total_charged_usage: None,

@@ -239,18 +239,42 @@ enum AddonCreditAutoReloadStatus {
 type AddonCreditsOption {
   credits: Int!
   priceUsdCents: Int!
+
+  """
+  The usage, in cents, that the pack buys when add-on packs are sold in dollars.
+  Null while packs are sold in credits.
+  """
+  usageCents: Int
 }
 
 type AddonCreditsSettings {
   autoReloadEnabled: Boolean!
   maxMonthlySpendCents: Int
+
+  """
+  The credit count the selected auto-reload pack is listed under in the add-on options.
+  """
   selectedAutoReloadCreditDenomination: Int
+
+  """
+  The list price of the selected auto-reload pack, which is the usage it buys for a team
+  billed in dollars.
+  """
+  selectedAutoReloadUsageCents: Int
 }
 
 input AddonCreditsSettingsInput {
   autoReloadEnabled: Boolean
   maxMonthlySpendCents: Int
+
+  """Selects the auto-reload pack by the credit count it is listed under."""
   selectedAutoReloadCreditDenomination: Int
+
+  """
+  Selects the auto-reload pack by its list price. Takes precedence over the credit
+  denomination, which must name the same pack when both are given.
+  """
+  selectedAutoReloadUsageCents: Int
 }
 
 enum AdminEnablementSetting {
@@ -586,6 +610,8 @@ type BonusGrant {
   requestCreditsGranted: Int!
   requestCreditsRemaining: Int!
   scope: BonusGrantScope!
+  usageCentsGranted: Float
+  usageCentsRemaining: Float
   userFacingMessage: String
 }
 
@@ -688,6 +714,22 @@ type ByoEndpointPolicy {
 type CategoryTokenBreakdown {
   category: String!
   tokens: Int!
+}
+
+enum ChargeUnit {
+  CREDITS
+  CENTS
+}
+
+type ChatGPTConnection {
+  connectedAt: Time!
+  email: String
+
+  """
+  Whether the server currently holds delegated ChatGPT credentials that can be
+  attached to OpenAI requests on the user's behalf.
+  """
+  tokenSharingActive: Boolean!
 }
 
 input ClientContext {
@@ -895,6 +937,23 @@ type ConversationUsageMetadata {
   platformCreditsSpent: Float!
   """The cumulative provider cost in US cents, when available."""
   totalProviderCostInCents: Float
+
+  """
+  The cumulative inference cost billed to the customer so far in the
+  conversation, in US cents (fractional cents allowed), at the customer's own
+  price: usage drawn from a grant or metered at what was paid for it, and
+  included usage at the plan's allowance rate. Null when the server cannot
+  establish a complete historical baseline, or when pricing transparency is
+  disabled server-side.
+  """
+  totalBilledCostInCents: Float
+
+  """
+  Aggregate platform cost (in US cents) charged so far in the conversation,
+  summed across every usage category and model. Null when pricing
+  transparency is disabled server-side.
+  """
+  totalPlatformCostInCents: Float
   summarized: Boolean!
 
   """
@@ -922,6 +981,9 @@ input CreateAgentTaskInput {
 
   """Optional environment UID to run the task in."""
   environmentUid: ID
+
+  """Optional JSON-serialized string-to-string run metadata."""
+  metadata: String
 
   """Optional run ID of the parent that spawned this local task."""
   parentRunId: ID
@@ -1208,6 +1270,30 @@ enum DelinquencyStatus {
 type DirectApiUsOnlyInferencePolicy {
   default: Boolean!
 }
+
+"""
+disconnectChatGPT unlinks the calling user's ChatGPT account and discards any
+delegated credentials held for it. Succeeds even when nothing is linked.
+"""
+type DisconnectChatGPTOutput implements Response {
+  responseContext: ResponseContext!
+}
+
+union DisconnectChatGPTResult = DisconnectChatGPTOutput | UserFacingError
+
+"""
+startChatGPTLink begins linking a ChatGPT account to the calling user's Warp
+account, regardless of the ChatGPT account's email. The returned URL must be
+opened in a browser; it is bound to the caller by a short-lived, single-use
+ticket. The browser flow ends at continueUrl with `chatgpt_linked=1` on
+success or `chatgpt_error=<code>` on failure.
+"""
+type StartChatGPTLinkOutput implements Response {
+  authorizationUrl: String!
+  responseContext: ResponseContext!
+}
+
+union StartChatGPTLinkResult = StartChatGPTLinkOutput | UserFacingError
 
 type DirectLinkSharingPolicy {
   toggleable: Boolean!
@@ -2954,6 +3040,12 @@ type RequestLimitInfo {
   acceptedAutosuggestionsLimit: Int! @deprecated(reason: "No longer tracked. Always returns 0.")
   acceptedAutosuggestionsSinceLastRefresh: Int! @deprecated(reason: "No longer tracked. Always returns 0.")
   embeddingGenerationBatchSize: Int!
+
+  """
+  The dollar value of requestLimit, in cents. Null for a subject billed in credits
+  rather than dollars, and when usage is unlimited.
+  """
+  includedUsageCents: Float
   isUnlimited: Boolean!
   isUnlimitedAutosuggestions: Boolean!
   isUnlimitedCodebaseIndices: Boolean!
@@ -2968,6 +3060,12 @@ type RequestLimitInfo {
   requestsUsedSinceLastRefresh: Int!
   suggestedCodeDiffsLimit: Int!
   suggestedCodeDiffsSurfacedSinceLastRefresh: Int!
+
+  """
+  The dollar value of requestsUsedSinceLastRefresh, in cents. Null for a subject billed
+  in credits rather than dollars, and when usage is unlimited.
+  """
+  usageCentsUsedSinceLastRefresh: Float
   voiceRequestLimit: Int!
   voiceRequestsUsedSinceLastRefresh: Int!
   voiceTokenLimit: Int!
@@ -3211,6 +3309,7 @@ type RootMutation {
   deleteManagedSecret(input: DeleteManagedSecretInput!, requestContext: RequestContext!): DeleteManagedSecretResult!
   deleteObject(input: DeleteObjectInput!, requestContext: RequestContext!): DeleteObjectResult!
   deleteTeamInvite(input: DeleteTeamInviteInput!, requestContext: RequestContext!): DeleteTeamInviteResult!
+  disconnectChatGPT(requestContext: RequestContext!): DisconnectChatGPTResult!
   emptyTrash(input: EmptyTrashInput!, requestContext: RequestContext!): EmptyTrashResult!
   expireApiKey(input: ExpireApiKeyInput!, requestContext: RequestContext!): ExpireApiKeyResult!
   generateApiKey(input: GenerateApiKeyInput!, requestContext: RequestContext!): GenerateApiKeyResult!
@@ -3260,6 +3359,7 @@ type RootMutation {
   setTeamMemberRole(input: SetTeamMemberRoleInput!, requestContext: RequestContext!): SetTeamMemberRoleResult!
   setUserIsOnboarded(requestContext: RequestContext!): SetUserIsOnboardedResult!
   shareBlock(input: ShareBlockInput!, requestContext: RequestContext!): ShareBlockResult!
+  startChatGPTLink(requestContext: RequestContext!, continueUrl: String!): StartChatGPTLinkResult!
   stripeBillingPortal(input: StripeBillingPortalInput!, requestContext: RequestContext!): StripeBillingPortalResult!
   transferGenericStringObjectOwner(input: TransferGenericStringObjectOwnerInput!, requestContext: RequestContext!): TransferGenericStringObjectOwnerResult!
   transferNotebookOwner(input: TransferNotebookOwnerInput!, requestContext: RequestContext!): TransferNotebookOwnerResult!
@@ -3772,6 +3872,10 @@ merged with other task queries into a single unified query.
 type Task {
   """List of attachments (images/files) associated with this task."""
   attachments: [TaskAttachment!]!
+  """
+  Configuration for the active cloud execution. Requires the execution's workload token.
+  """
+  executionConfig(executionId: ID!, supportsDeferredRepositories: Boolean = false): ExecutionConfiguration!
 
   """The ID of the task."""
   taskId: ID!
@@ -3828,6 +3932,7 @@ input TaskGitCredentialsInput {
   partial list.
   """
   acceptsPartialRefresh: Boolean
+  useFactoryRepositories: Boolean
 
   """The ID of the task."""
   taskId: ID!
@@ -4104,6 +4209,7 @@ type Tier {
   anyoneWithLinkSharingPolicy: AnyoneWithLinkSharingPolicy
   byoApiKeyPolicy: ByoApiKeyPolicy
   byoEndpointPolicy: ByoEndpointPolicy
+  chargeUnit: ChargeUnit!
   cloudConversationStoragePolicy: CloudConversationStoragePolicy
   codebaseContextPolicy: CodebaseContextPolicy
   customLlmPolicy: CustomLlmPolicy
@@ -4671,6 +4777,11 @@ type User {
   billingMetadata: BillingMetadata
   blocks: [Block!]!
   bonusGrants: [BonusGrant!]!
+
+  """
+  The ChatGPT account linked to this user, or null when none is linked.
+  """
+  chatgptConnection: ChatGPTConnection
   completedOzWebappFtue: Boolean!
 
   """
@@ -4991,10 +5102,21 @@ type WorkspaceMember {
 }
 
 type WorkspaceMemberUsageInfo {
+  """
+  The dollar value of requestLimit, in cents. Null for a workspace billed in credits
+  rather than dollars, and when usage is unlimited.
+  """
+  includedUsageCents: Float
   isRequestLimitProrated: Boolean!
   isUnlimited: Boolean!
   requestLimit: Int!
   requestsUsedSinceLastRefresh: Int!
+
+  """
+  The dollar value of requestsUsedSinceLastRefresh, in cents. Null for a workspace billed
+  in credits rather than dollars, and when usage is unlimited.
+  """
+  usageCentsUsedSinceLastRefresh: Float
 }
 
 type WorkspaceSettings {
@@ -5025,4 +5147,112 @@ enum WriteToPtyAutonomyValue {
   ALWAYS_ASK
   ASK_ON_FIRST_WRITE
   RESPECT_USER_SETTING
+}
+
+
+type ExecutionSkillSpec {
+  spec: String!
+}
+
+enum ExecutionRepositoryRefType {
+  COMMIT_SHA
+  BRANCH
+}
+
+type ExecutionRepositoryRef {
+  type: ExecutionRepositoryRefType!
+  value: String!
+}
+
+
+type ExecutionRepository {
+  forge: CodeForge!
+  owner: String!
+  name: String!
+  ref: ExecutionRepositoryRef
+  cloneFrom: SourceRepo
+  preserveOrigin: Boolean!
+}
+
+
+enum SessionSharingSubjectType {
+  TEAM
+  USER_EMAIL
+  PUBLIC
+}
+
+enum SessionSharingAccessLevel {
+  VIEW
+  EDIT
+}
+
+type SessionSharingAclSpec {
+  subjectType: SessionSharingSubjectType!
+  email: String
+  access: SessionSharingAccessLevel!
+}
+
+type GCPCloudProviderClientConfig {
+  projectNumber: String!
+  poolId: String!
+  providerId: String!
+  serviceAccountEmail: String
+}
+
+type AWSCloudProviderClientConfig {
+  roleArn: String!
+}
+
+type CloudProviderClientConfigs {
+  gcp: GCPCloudProviderClientConfig
+  aws: AWSCloudProviderClientConfig
+}
+
+type AWSBedrockInferenceClientConfig {
+  roleArn: String!
+  region: String
+}
+
+type InferenceProviderClientConfigs {
+  awsBedrock: AWSBedrockInferenceClientConfig
+}
+
+type ExecutionConfiguration {
+  taskId: ID!
+  executionId: ID!
+  conversationId: ID
+  parentRunId: ID
+  """The owning team's UID, or null for a personal task."""
+  teamId: ID
+  harness: AgentHarness!
+  modelId: String
+  reasoningLevel: String
+  profileId: ID
+  mcpServersJson: String!
+  skills: [ExecutionSkillSpec!]!
+  factorySkillDirs: [String!]!
+  computerUseEnabled: Boolean!
+  computerUseModelId: String
+  inferenceProviders: InferenceProviderClientConfigs
+  repositories: [ExecutionRepository!]!
+  deferredRepositories: [SourceRepo!]!
+  setupCommands: [String!]!
+  providers: CloudProviderClientConfigs
+  sessionSharingAcls: [SessionSharingAclSpec!]!
+  skipInitialTurn: Boolean!
+  idleOnCompleteSeconds: Int
+  idleOnFailSeconds: Int
+  snapshotDisabled: Boolean!
+}
+
+enum CodeForge {
+  GITHUB
+  GITLAB
+  AZURE_DEVOPS
+}
+
+type SourceRepo {
+  codeForge: CodeForge!
+  owner: String!
+  repo: String!
 }

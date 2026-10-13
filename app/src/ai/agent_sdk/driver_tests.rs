@@ -8,13 +8,15 @@ use std::time::Duration;
 
 use chrono::Local;
 use cloud_object_models::CodeForge;
+use command::blocking::Command as ProcessCommand;
 use futures::channel::oneshot;
 use futures::executor::block_on;
+use futures::poll;
 use repo_metadata::{DirectoryWatcher, RepoMetadataEvent, RepoMetadataModel, RepositoryIdentifier};
 use serde_json::json;
 use session_sharing_protocol::common::{AgentAttachment, ParticipantId};
 use tempfile::TempDir;
-use warp_cli::agent::Harness;
+use warp_cli::agent::{Harness, HarnessTransport};
 use warp_cli::skill::SkillSpec;
 use warp_cli::{
     OZ_CLI_ENV, OZ_HARNESS_ENV, OZ_PARENT_RUN_ID_ENV, OZ_RUN_ID_ENV, SERVER_ROOT_URL_OVERRIDE_ENV,
@@ -31,12 +33,13 @@ use warpui::{App, SingletonEntity as _};
 
 use super::{
     AgentDriver, AgentDriverError, AgentRunPrompt, CLIAgentSessionStatus, DebugWindowController,
-    IdleTimeoutSender, LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
+    HarnessIdleAction, IdleTimeoutSender, LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
     LEGACY_OZ_PARENT_STATE_ROOT_ENV, OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
-    OZ_MESSAGE_LISTENER_STATE_ROOT_ENV, PlatformErrorCode, SDKConversationOutputStatus,
-    WARP_MESSAGE_LISTENER_STATE_ROOT_ENV, build_secret_env_vars, debug_turn_task_state,
+    OZ_MESSAGE_LISTENER_STATE_ROOT_ENV, PlatformErrorCode, PluginInstallError,
+    SDKConversationOutputStatus, WARP_MESSAGE_LISTENER_STATE_ROOT_ENV, build_secret_env_vars,
+    debug_turn_task_state, harness_idle_action_for_conversation_status,
     idle_window_for_cli_session_status, idle_window_for_terminal_status,
-    setup_failure_status_update, terminal_status_log_outcome,
+    inject_deferred_repos_instruction, setup_failure_status_update, terminal_status_log_outcome,
 };
 use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
 use crate::ai::agent::task::TaskId;
@@ -46,6 +49,7 @@ use crate::ai::agent::{
     UploadArtifactResult,
 };
 use crate::ai::agent_sdk::driver::environment::PrepareEnvironmentError;
+use crate::ai::agent_sdk::driver::harness::{HarnessKind, harness_kind};
 use crate::ai::agent_sdk::task_env_vars;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::orchestration_events::{
@@ -63,6 +67,37 @@ use crate::test_util::terminal::{add_window_with_terminal, initialize_app_for_te
 use crate::workspace::view::tests::initialize_app as initialize_workspace_test_app;
 
 // ── IdleTimeoutSender tests ──────────────────────────────────────────────────────
+
+#[test]
+fn setup_timeout_does_not_retain_a_potentially_running_command() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let temp = TempDir::new().unwrap();
+        let driver = app.add_model(|ctx| {
+            let terminal_driver =
+                super::terminal::TerminalDriver::create_from_existing_view(terminal, ctx);
+            let mut driver =
+                AgentDriver::new_for_test(temp.path().to_path_buf(), terminal_driver, ctx);
+            driver.idle_on_fail = Some(Duration::from_secs(30 * 60));
+            driver
+        });
+        let spawner = driver.update(&mut app, |_, ctx| ctx.spawner());
+        let error = AgentDriverError::SetupCommandTimedOut {
+            message: "Setup command #1 timed out after 1800s: ./setup.sh".to_string(),
+        };
+        let mut linger = Box::pin(AgentDriver::linger_after_failure(
+            &spawner,
+            "environment_setup",
+            &error,
+        ));
+        assert!(poll!(linger.as_mut()).is_ready());
+        assert_eq!(
+            setup_failure_status_update(&error).error_code,
+            Some(PlatformErrorCode::EnvironmentSetupFailed)
+        );
+    });
+}
 
 #[test]
 fn driver_keeps_uninterpreted_factory_experiments() {
@@ -612,6 +647,61 @@ fn failed_cli_harness_session_defers_by_idle_on_fail() {
 }
 
 #[test]
+fn native_conversation_status_drives_the_harness_exit_like_a_cli_session() {
+    let idle_on_complete = Some(Duration::from_secs(45 * 60));
+    let idle_on_fail = Some(Duration::from_secs(15 * 60));
+    let action = |status: &ConversationStatus| {
+        harness_idle_action_for_conversation_status(status, idle_on_complete, idle_on_fail)
+    };
+
+    assert_eq!(
+        action(&ConversationStatus::InProgress),
+        HarnessIdleAction::CancelIdle
+    );
+    assert_eq!(
+        action(&ConversationStatus::Success),
+        HarnessIdleAction::Exit {
+            window: idle_on_complete,
+            failed: false,
+        }
+    );
+    assert_eq!(
+        action(&ConversationStatus::Cancelled),
+        HarnessIdleAction::Exit {
+            window: idle_on_complete,
+            failed: false,
+        }
+    );
+    assert_eq!(
+        action(&ConversationStatus::Error),
+        HarnessIdleAction::Exit {
+            window: idle_on_fail,
+            failed: true,
+        }
+    );
+    assert_eq!(
+        harness_idle_action_for_conversation_status(
+            &ConversationStatus::Error,
+            idle_on_complete,
+            None
+        ),
+        HarnessIdleAction::Exit {
+            window: None,
+            failed: true,
+        },
+        "--idle-on-complete must not act as a fallback for a failed turn"
+    );
+    assert_eq!(
+        action(&ConversationStatus::WaitingForEvents),
+        HarnessIdleAction::Ignore
+    );
+    assert_eq!(
+        action(&ConversationStatus::TransientError),
+        HarnessIdleAction::Ignore
+    );
+}
+
+#[test]
 fn terminal_status_log_outcome_labels_are_low_cardinality() {
     assert_eq!(
         terminal_status_log_outcome(&SDKConversationOutputStatus::Success),
@@ -887,6 +977,29 @@ fn json_format_input_omits_filepath_and_description_for_proto_upload_result() {
 
 #[test]
 #[serial_test::serial]
+fn metadata_secret_collision_rejects_even_an_empty_injected_value() {
+    let previous = std::env::var_os("WARP_METADATA_SECRET_TEST");
+    unsafe { std::env::set_var("WARP_METADATA_SECRET_TEST", "") };
+    let secrets = HashMap::from([(
+        "warp_metadata_secret_test".to_string(),
+        ManagedSecretValue::raw_value("managed-value"),
+    )]);
+
+    let result = build_secret_env_vars(&secrets);
+
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("WARP_METADATA_SECRET_TEST", value),
+            None => std::env::remove_var("WARP_METADATA_SECRET_TEST"),
+        }
+    }
+    assert!(
+        matches!(result, Err(AgentDriverError::EnvironmentSetupFailed(message)) if message.contains("WARP_METADATA_SECRET_TEST"))
+    );
+}
+
+#[test]
+#[serial_test::serial]
 fn raw_value_only_writes_under_secret_name() {
     // TODO: Audit that the environment access only happens in single-threaded code.
     unsafe { std::env::remove_var("MY_SECRET") };
@@ -894,7 +1007,7 @@ fn raw_value_only_writes_under_secret_name() {
         "MY_SECRET".to_string(),
         ManagedSecretValue::raw_value("s3cret"),
     )]);
-    let env_vars = build_secret_env_vars(&secrets);
+    let env_vars = build_secret_env_vars(&secrets).unwrap();
     assert_eq!(
         env_vars.get(&OsString::from("MY_SECRET")),
         Some(&OsString::from("s3cret"))
@@ -911,7 +1024,7 @@ fn anthropic_api_key_writes_anthropic_env_var() {
         "my-custom-name".to_string(),
         ManagedSecretValue::anthropic_api_key("sk-ant-test-key"),
     )]);
-    let env_vars = build_secret_env_vars(&secrets);
+    let env_vars = build_secret_env_vars(&secrets).unwrap();
     assert_eq!(
         env_vars.get(&OsString::from("ANTHROPIC_API_KEY")),
         Some(&OsString::from("sk-ant-test-key"))
@@ -937,7 +1050,7 @@ fn typed_secret_overrides_raw_value_with_same_env_name() {
     ]);
     // Run multiple times to defeat HashMap iteration order flakiness.
     for _ in 0..20 {
-        let env_vars = build_secret_env_vars(&secrets);
+        let env_vars = build_secret_env_vars(&secrets).unwrap();
         assert_eq!(
             env_vars.get(&OsString::from("ANTHROPIC_API_KEY")),
             Some(&OsString::from(typed_key)),
@@ -965,7 +1078,7 @@ fn bedrock_api_key_writes_all_bedrock_env_vars() {
             ManagedSecretValue::raw_value("eu-west-1"),
         ),
     ]);
-    let env_vars = build_secret_env_vars(&secrets);
+    let env_vars = build_secret_env_vars(&secrets).unwrap();
     assert_eq!(
         env_vars.get(&OsString::from("AWS_BEARER_TOKEN_BEDROCK")),
         Some(&OsString::from("token-123"))
@@ -1003,7 +1116,7 @@ fn bedrock_access_key_writes_all_aws_env_vars() {
             "ap-southeast-1",
         ),
     )]);
-    let env_vars = build_secret_env_vars(&secrets);
+    let env_vars = build_secret_env_vars(&secrets).unwrap();
     assert_eq!(
         env_vars.get(&OsString::from("AWS_ACCESS_KEY_ID")),
         Some(&OsString::from("AKID"))
@@ -1035,7 +1148,7 @@ fn raw_value_skipped_when_process_env_already_set() {
         "WORKER_TOKEN".to_string(),
         ManagedSecretValue::raw_value("managed-value"),
     )]);
-    let env_vars = build_secret_env_vars(&secrets);
+    let env_vars = build_secret_env_vars(&secrets).unwrap();
     // The worker-injected env var wins; env_vars should NOT contain it
     // because the child inherits the process env directly.
     assert!(!env_vars.contains_key(&OsString::from("WORKER_TOKEN")));
@@ -1052,7 +1165,7 @@ fn worker_injected_env_wins_over_typed_secret() {
         "my-auth".to_string(),
         ManagedSecretValue::anthropic_api_key("managed-key"),
     )]);
-    let env_vars = build_secret_env_vars(&secrets);
+    let env_vars = build_secret_env_vars(&secrets).unwrap();
     // The typed secret should be skipped entirely; the child inherits
     // ANTHROPIC_API_KEY from the process env.
     assert!(!env_vars.contains_key(&OsString::from("ANTHROPIC_API_KEY")));
@@ -1075,7 +1188,7 @@ fn worker_injected_env_skips_entire_bedrock_secret() {
         "bedrock-secret".to_string(),
         ManagedSecretValue::anthropic_bedrock_api_key("token-456", "eu-central-1"),
     )]);
-    let env_vars = build_secret_env_vars(&secrets);
+    let env_vars = build_secret_env_vars(&secrets).unwrap();
     assert!(
         !env_vars.contains_key(&OsString::from("AWS_BEARER_TOKEN_BEDROCK")),
         "Entire Bedrock secret must be skipped when any field is worker-injected"
@@ -1093,7 +1206,7 @@ fn docker_registry_secret_never_injected_as_env_var() {
         "my-registry".to_string(),
         ManagedSecretValue::docker_registry("us-docker.pkg.dev", "_json_key", "s3cret-pass"),
     )]);
-    let env_vars = build_secret_env_vars(&secrets);
+    let env_vars = build_secret_env_vars(&secrets).unwrap();
     assert!(
         env_vars.is_empty(),
         "a registry credential authenticates an image pull, not the agent process, and must \
@@ -2383,6 +2496,171 @@ fn ambient_driver_resumed_conversation_elapsed_idle_window_commits_exiting() {
 }
 
 #[test]
+fn deferred_skill_publication_uses_inventory_after_workspace_consumption() {
+    if std::env::var_os("WARP_TEST_DEFERRED_SKILL_PUBLICATION").is_none() {
+        let home = TempDir::new().unwrap();
+        let output = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ai::agent_sdk::driver::tests::deferred_skill_publication_uses_inventory_after_workspace_consumption",
+                "--nocapture",
+            ])
+            .env("WARP_TEST_DEFERRED_SKILL_PUBLICATION", "1")
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("CLAUDE_CONFIG_DIR", home.path().join(".claude"))
+            .env("CODEX_HOME", home.path().join(".codex"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let _factory_mcp = warp_core::features::FeatureFlag::FactoryMcp.override_enabled(false);
+    for transport in [HarnessTransport::Pty, HarnessTransport::Acp] {
+        for (use_factory_repositories, has_deferred_repositories) in
+            [(true, true), (false, true), (true, false)]
+        {
+            for (harness, skill_parent) in [
+                (Harness::Claude, ".claude"),
+                (Harness::Codex, ".agents"),
+                (Harness::Gemini, ".gemini"),
+            ] {
+                App::test((), |mut app| async move {
+                    let _capability = warp_core::features::FeatureFlag::FactoryDeferredRepositories
+                        .override_enabled(!use_factory_repositories);
+                    let should_activate = use_factory_repositories && has_deferred_repositories;
+                    initialize_workspace_test_app(&mut app);
+                    let root = TempDir::new().unwrap();
+                    let skill_parent = root.path().join(skill_parent);
+                    fs::write(&skill_parent, "existing file").unwrap();
+                    let mut options = crate::ai::agent_sdk::tests::agent_driver_options();
+                    options.use_factory_repositories = use_factory_repositories;
+                    options.working_dir = root.path().to_path_buf();
+                    options.selected_harness = harness;
+                    options.harness_transport = transport;
+                    options.workspace = super::environment::WorkspaceConfiguration::from_resolved(
+                        Vec::new(),
+                        if has_deferred_repositories {
+                            vec![SourceRepo::new(
+                                CodeForge::GitLab,
+                                "platform/backend".into(),
+                                "api".into(),
+                            )]
+                        } else {
+                            Vec::new()
+                        },
+                        Vec::new(),
+                    )
+                    .unwrap();
+                    options.workspace.factory_skill_dirs = Some(Vec::new());
+                    if !should_activate {
+                        options.secrets.insert(
+                            "WARP_FACTORY_DEFERRED_REPOSITORIES_SKILL".into(),
+                            ManagedSecretValue::raw_value("1"),
+                        );
+                    }
+                    let driver = app.add_model(|ctx| AgentDriver::new(options, ctx).unwrap());
+                    let foreground = driver.update(&mut app, |driver, ctx| {
+                        assert!(driver.workspace.take().unwrap().source_repos.is_empty());
+                        assert_eq!(driver.has_deferred_repositories, should_activate);
+                        assert_eq!(
+                            driver.resolved_env_vars.contains_key(std::ffi::OsStr::new(
+                                "WARP_FACTORY_DEFERRED_REPOSITORIES_SKILL",
+                            )),
+                            !should_activate,
+                        );
+                        ctx.spawner()
+                    });
+                    let HarnessKind::ThirdParty(harness) =
+                        harness_kind(harness, transport).unwrap()
+                    else {
+                        panic!("expected a third-party harness");
+                    };
+                    let result = AgentDriver::prepare_harness(
+                        &AgentRunPrompt::Local("do the task".into()),
+                        &[],
+                        harness.as_ref(),
+                        &foreground,
+                    )
+                    .await;
+                    if should_activate {
+                        let Err(AgentDriverError::HarnessConfigSetupFailed { error, .. }) = result
+                        else {
+                            panic!("expected skill publication to fail");
+                        };
+                        assert!(format!("{error:#}").contains("skill"), "{error:#}");
+                    } else {
+                        assert!(result.is_ok(), "{:?}", result.err());
+                    }
+                    assert_eq!(fs::read_to_string(skill_parent).unwrap(), "existing file");
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn inject_deferred_repos_instruction_prepends_to_local_prompt() {
+    let mut prompt = AgentRunPrompt::Local("do the task".to_string());
+    inject_deferred_repos_instruction(&mut prompt, "clone acme/billing first".to_string());
+
+    let AgentRunPrompt::Local(text) = prompt else {
+        panic!("expected a Local prompt");
+    };
+    assert_eq!(text, "clone acme/billing first\n\ndo the task");
+}
+
+#[test]
+fn inject_deferred_repos_instruction_synthesizes_hidden_skill_when_none_requested() {
+    let mut prompt = AgentRunPrompt::ServerSide {
+        skill: None,
+        attachments_dir: None,
+    };
+    inject_deferred_repos_instruction(&mut prompt, "clone acme/billing first".to_string());
+
+    let AgentRunPrompt::ServerSide { skill, .. } = prompt else {
+        panic!("expected a ServerSide prompt");
+    };
+    let skill = skill.expect("a synthetic skill should carry the hidden instruction");
+    assert_eq!(skill.content, "clone acme/billing first");
+}
+
+#[test]
+fn inject_deferred_repos_instruction_prepends_to_requested_skill_content() {
+    let requested_skill = ai::skills::ParsedSkill {
+        path: warp_util::local_or_remote_path::LocalOrRemotePath::Local(std::path::PathBuf::from(
+            "/skills/reviewer/SKILL.md",
+        )),
+        name: "reviewer".to_string(),
+        description: "Reviews billing changes.".to_string(),
+        content: "Review the diff carefully.".to_string(),
+        line_range: None,
+        provider: ai::skills::SkillProvider::Agents,
+        scope: ai::skills::SkillScope::Project,
+    };
+    let mut prompt = AgentRunPrompt::ServerSide {
+        skill: Some(requested_skill),
+        attachments_dir: None,
+    };
+    inject_deferred_repos_instruction(&mut prompt, "clone acme/billing first".to_string());
+
+    let AgentRunPrompt::ServerSide { skill, .. } = prompt else {
+        panic!("expected a ServerSide prompt");
+    };
+    let skill = skill.expect("the requested skill must be preserved");
+    assert_eq!(skill.name, "reviewer");
+    assert_eq!(
+        skill.content,
+        "clone acme/billing first\n\nReview the diff carefully."
+    );
+}
+
+#[test]
 #[serial_test::serial]
 fn openai_api_key_exports_only_api_key_not_base_url() {
     // The OpenAI typed secret should only export OPENAI_API_KEY as an env var.
@@ -2398,7 +2676,7 @@ fn openai_api_key_exports_only_api_key_not_base_url() {
             Some("https://us.api.openai.com/v1".to_string()),
         ),
     )]);
-    let env_vars = build_secret_env_vars(&secrets);
+    let env_vars = build_secret_env_vars(&secrets).unwrap();
     assert_eq!(
         env_vars.get(&OsString::from("OPENAI_API_KEY")),
         Some(&OsString::from("sk-test-key")),
@@ -2407,5 +2685,32 @@ fn openai_api_key_exports_only_api_key_not_base_url() {
     assert!(
         !env_vars.contains_key(&OsString::from("OPENAI_BASE_URL")),
         "OPENAI_BASE_URL should NOT be exported as an env var"
+    );
+}
+
+#[test]
+fn plugin_failure_reason_appends_cli_log_when_present() {
+    let error = PluginInstallError {
+        message: "'claude plugin marketplace add x' failed".to_owned(),
+        log: "$ claude plugin marketplace add x\nno distributions installed\n".to_owned(),
+    };
+
+    assert_eq!(
+        AgentDriver::plugin_failure_reason("Install failed", &error),
+        "Install failed: 'claude plugin marketplace add x' failed\n\
+         $ claude plugin marketplace add x\nno distributions installed"
+    );
+}
+
+#[test]
+fn plugin_failure_reason_omits_empty_cli_log() {
+    let error = PluginInstallError {
+        message: "No plugin manager available".to_owned(),
+        log: "  \n".to_owned(),
+    };
+
+    assert_eq!(
+        AgentDriver::plugin_failure_reason("Install failed", &error),
+        "Install failed: No plugin manager available"
     );
 }

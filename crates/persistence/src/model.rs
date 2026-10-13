@@ -1240,6 +1240,10 @@ pub struct AgentConversationData {
     /// pill bar. Orchestrator conversations always serialize as `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// Whether the user chose Warp-funded inference for this conversation after a ChatGPT
+    /// token-sharing failure. Sent as `skip_chatgpt_subscription` on every request.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_warp_credits_instead_of_chatgpt: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1799,11 +1803,12 @@ pub struct ConversationUsageMetadata {
     pub credits_spent: f32,
     #[serde(default)]
     pub platform_credits_spent: f32,
-    /// Server-authoritative cumulative provider cost in US cents. `None`
-    /// means the server did not provide a historical cost (for example, a
-    /// legacy conversation); it must not be treated as numeric zero.
+    /// Server-authoritative cumulative cost billed to the customer in US cents (inference at
+    /// the customer's own price plus platform cost), for conversations whose charges arrived
+    /// via GraphQL rather than the stream. `None` when the server could not establish a
+    /// complete billed total; it must not be treated as numeric zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_provider_cost_in_cents: Option<f32>,
+    pub total_billed_cost_in_cents: Option<f32>,
     #[serde(default)]
     pub credits_spent_for_last_block: Option<f32>,
     /// Per-category charged-usage breakdown for the most recent block (all
@@ -1830,6 +1835,16 @@ pub struct ConversationUsageMetadata {
 impl ConversationUsageMetadata {
     pub fn total_tool_calls(&self) -> i32 {
         self.tool_usage_metadata.total_tool_calls()
+    }
+
+    /// Cumulative cost billed to the customer so far in the conversation, in US cents.
+    /// Prefers the summed per-turn charges, which carry billed cents on the wire, and falls
+    /// back to the GraphQL total for conversations restored without them. `None` when neither
+    /// is known.
+    pub fn billed_cost_in_cents(&self) -> Option<f32> {
+        self.total_charged_usage
+            .map(|charged| charged.total_cost_in_cents())
+            .or(self.total_billed_cost_in_cents)
     }
 }
 

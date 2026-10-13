@@ -30,9 +30,10 @@ pub use execute::{
     EditResolvedEvent, EditStats, NewConversationDecision, PromptSuggestionExecutor,
     ReadFileContextResult, RequestFileEditsExecutor, RequestFileEditsFormatKind,
     RequestFileEditsTelemetryEvent, RunAgentsExecutor, RunAgentsExecutorEvent,
-    RunAgentsSpawningSnapshot, ShellCommandExecutor, ShellCommandExecutorEvent, StartAgentExecutor,
-    StartAgentExecutorEvent, StartAgentOutcome, StartAgentRequest, StartAgentRequestId,
-    TEAM_CHANGED_DURING_CHILD_LAUNCH_ERROR, read_local_file_context,
+    RunAgentsSpawningSnapshot, ShellCommandExecutor, ShellCommandExecutorEvent,
+    ShellRecoveryResult, StartAgentExecutor, StartAgentExecutorEvent, StartAgentOutcome,
+    StartAgentRequest, StartAgentRequestId, TEAM_CHANGED_DURING_CHILD_LAUNCH_ERROR,
+    read_local_file_context,
 };
 pub(crate) use execute::{
     FileReadResult, MalformedFinalLineProxyEvent, apply_edits, coerce_integer_args,
@@ -745,7 +746,7 @@ impl BlocklistAIActionModel {
             );
             return;
         }
-        action.action = AIAgentActionType::RunAgents(request);
+        action.action = AIAgentActionType::RunAgents(Box::new(request));
         self.execute_action(action_id, conversation_id, ctx);
     }
 
@@ -964,7 +965,7 @@ impl BlocklistAIActionModel {
 
     /// Queues the `actions` in the given iterator for the given conversation,
     /// to be dispatched in the order in which they appear in the iterator.
-    pub(super) fn queue_actions(
+    pub(crate) fn queue_actions(
         &mut self,
         actions: Vec<AIAgentAction>,
         conversation_id: AIConversationId,

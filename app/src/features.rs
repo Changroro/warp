@@ -89,6 +89,8 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::CloudRunners,
         #[cfg(feature = "cloud_agent_runners")]
         FeatureFlag::CloudAgentRunners,
+        #[cfg(feature = "cloud_agent_execution_config")]
+        FeatureFlag::CloudAgentExecutionConfig,
         #[cfg(feature = "account_first_onboarding")]
         FeatureFlag::AccountFirstOnboarding,
         #[cfg(all(feature = "simulate_github_unauthed", debug_assertions))]
@@ -315,6 +317,8 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::WellKnownMcpIds,
         #[cfg(feature = "factory_mcp")]
         FeatureFlag::FactoryMcp,
+        #[cfg(feature = "preview_urls_mcp")]
+        FeatureFlag::PreviewUrlsMcp,
         #[cfg(feature = "web_search_ui")]
         FeatureFlag::WebSearchUI,
         #[cfg(feature = "web_fetch_ui")]
@@ -503,12 +507,16 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::HandoffCloudCloud,
         #[cfg(feature = "git_credential_refresh")]
         FeatureFlag::GitCredentialRefresh,
+        #[cfg(feature = "factory_deferred_repositories")]
+        FeatureFlag::FactoryDeferredRepositories,
         #[cfg(feature = "remote_code_review")]
         FeatureFlag::RemoteCodeReview,
         #[cfg(feature = "custom_model_routers")]
         FeatureFlag::CustomModelRouters,
         #[cfg(feature = "supergrok")]
         FeatureFlag::SuperGrok,
+        #[cfg(feature = "chatgpt_subscription")]
+        FeatureFlag::ChatGPTSubscription,
         #[cfg(feature = "gemini_enterprise")]
         FeatureFlag::GeminiEnterprise,
         #[cfg(feature = "nld_prompt_history_match")]
@@ -527,6 +535,8 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::HistorySearchRankingV2,
         #[cfg(feature = "stored_screenshots")]
         FeatureFlag::StoredScreenshots,
+        #[cfg(feature = "cloud_agent_shell_respawn")]
+        FeatureFlag::CloudAgentShellRespawn,
     ]);
 
     flags

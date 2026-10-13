@@ -522,6 +522,7 @@ fn ai_conversation_new_restored_preserves_last_event_sequence() {
         autoexecute_override: None,
         last_event_sequence: Some(42),
         pinned: false,
+        use_warp_credits_instead_of_chatgpt: false,
     };
     let conversation =
         AIConversation::new_restored(AIConversationId::new(), vec![task], Some(data))
@@ -600,7 +601,7 @@ fn make_server_metadata_with_harness(
             context_window_usage: 0.0,
             credits_spent: 0.0,
             platform_credits_spent: 0.0,
-            total_provider_cost_in_cents: None,
+            total_billed_cost_in_cents: None,
             credits_spent_for_last_block: None,
             charged_usage_for_last_block: None,
             total_charged_usage: None,

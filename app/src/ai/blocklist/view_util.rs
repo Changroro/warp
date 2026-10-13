@@ -3,8 +3,6 @@ use std::sync::LazyLock;
 
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
-use thousands::Separable;
-use warp_core::features::FeatureFlag;
 use warp_core::ui::appearance::Appearance;
 use warpui::elements::{
     ChildAnchor, ConstrainedBox, Container, CrossAxisAlignment, Flex, Hoverable, MainAxisAlignment,
@@ -18,11 +16,14 @@ use warpui::ui_components::text::Span;
 use warpui::{AppContext, Element, EntityId, EventContext, SingletonEntity};
 
 use crate::ai::AIRequestUsageModel;
-use crate::ai::agent::RenderableAIError;
-use crate::settings::UsageDisplayUnit;
+use crate::ai::agent::{
+    ChatGPTSubscriptionErrorAction, ChatGPTSubscriptionErrorActionKind, RenderableAIError,
+};
+use crate::settings::{AISettings, UsageDisplayUnit};
 use crate::themes::theme::{AnsiColorIdentifier, Fill, WarpTheme};
 use crate::ui_components::icons::Icon;
 use crate::workspaces::user_workspaces::UserWorkspaces;
+use crate::workspaces::workspace::ChargeUnit;
 
 const PROVIDER_BUTTON_ICON_SIZE: f32 = 14.;
 const PROVIDER_BUTTON_ICON_TEXT_GAP: f32 = 8.;
@@ -30,6 +31,10 @@ const ERROR_APOLOGY_TEXT: &str = "I'm sorry, I couldn't complete that request.";
 const INTERNAL_WARP_ERROR: &str = "Internal Warp error.";
 pub const FAILED_OUTPUT_USAGE_NOTICE_TEXT: &str = "This response won't count towards your usage.";
 pub const OUT_OF_CREDITS_SUBSCRIBE_LABEL: &str = "Subscribe";
+/// Disclosure shown in place of a ChatGPT subscription error once the user has switched the
+/// conversation to Warp-funded inference.
+pub const CHATGPT_CONTINUED_WITH_WARP_CREDITS_TEXT: &str = "Continued with Warp credits. Your \
+     ChatGPT subscription won't be used for the rest of this conversation.";
 /// Text to use as a label throughout the app for user interactions that will attach selected
 /// block(s) or text selections to a new AI query.
 pub static ATTACH_AS_AGENT_MODE_CONTEXT_TEXT: LazyLock<&'static str> =
@@ -83,14 +88,27 @@ pub enum FailedOutputPresentation {
     GeminiEnterpriseCredentialsExpiredOrInvalid {
         fallback_message: String,
     },
+    /// A ChatGPT token-sharing failure with server-authored copy and recovery actions.
+    ChatGPTSubscription {
+        title: String,
+        message: String,
+        actions: Vec<ChatGPTSubscriptionErrorAction>,
+    },
+    /// The conversation has since been switched to Warp-funded inference, so the failure is
+    /// shown as a disclosure line instead of an actionable error.
+    ChatGPTSubscriptionContinuedWithWarpCredits,
 }
 
 /// Returns the user-facing presentation for an Agent Mode request failure.
+///
+/// `conversation_uses_warp_credits_instead_of_chatgpt` is the owning conversation's
+/// per-conversation ChatGPT opt-out; it only affects ChatGPT subscription errors.
 ///
 /// Recovery-pending failures are intentionally suppressed so callers cannot accidentally render
 /// an alarming terminal error while an automatic resume is still in flight.
 pub fn failed_output_presentation(
     error: &RenderableAIError,
+    conversation_uses_warp_credits_instead_of_chatgpt: bool,
     app: &AppContext,
 ) -> Option<FailedOutputPresentation> {
     if error.should_suppress_during_recovery() {
@@ -173,7 +191,42 @@ pub fn failed_output_presentation(
         RenderableAIError::CloudStartupFailed(msg) => {
             FailedOutputPresentation::Message(msg.clone())
         }
+        RenderableAIError::ChatGPTSubscriptionError { .. }
+            if conversation_uses_warp_credits_instead_of_chatgpt =>
+        {
+            FailedOutputPresentation::ChatGPTSubscriptionContinuedWithWarpCredits
+        }
+        RenderableAIError::ChatGPTSubscriptionError {
+            title,
+            message,
+            actions,
+            ..
+        } => FailedOutputPresentation::ChatGPTSubscription {
+            title: title.clone(),
+            message: message.clone(),
+            actions: actions.clone(),
+        },
     })
+}
+
+/// Appends each `OpenUrl` recovery action of a ChatGPT subscription error to its message as a
+/// `label: url` line, for surfaces that cannot render the actions as buttons.
+pub fn chatgpt_subscription_message_with_links(
+    message: &str,
+    actions: &[ChatGPTSubscriptionErrorAction],
+) -> String {
+    actions
+        .iter()
+        .filter_map(|action| match &action.kind {
+            ChatGPTSubscriptionErrorActionKind::OpenUrl { url } => {
+                Some(format!("{}: {url}", action.label))
+            }
+            ChatGPTSubscriptionErrorActionKind::Retry
+            | ChatGPTSubscriptionErrorActionKind::ContinueWithWarpCredits => None,
+        })
+        .fold(message.to_string(), |text, link| {
+            format!("{text}\n\n{link}")
+        })
 }
 
 /// Whether a failed Agent Mode response should explain that it will not count towards usage.
@@ -188,6 +241,7 @@ pub fn should_show_failed_output_usage_notice(
         && !has_expanded_last_requested_command
         && !is_restored
         && !error.is_invalid_api_key()
+        && !error.is_chatgpt_subscription_error()
 }
 
 /// Whether to show the out-of-credits CTA: only for non-paid users. Paid users and the enterprise
@@ -320,46 +374,37 @@ pub fn format_dollars(cost_in_cents: f32) -> String {
     }
 }
 
-fn effective_usage_unit(unit: UsageDisplayUnit, cost_in_cents: Option<f32>) -> UsageDisplayUnit {
-    if !FeatureFlag::PricingTransparency.is_enabled() {
-        return UsageDisplayUnit::Credits;
-    }
-    match unit {
-        UsageDisplayUnit::Credits => UsageDisplayUnit::Credits,
-        UsageDisplayUnit::Dollars if cost_in_cents.is_some() => UsageDisplayUnit::Dollars,
-        UsageDisplayUnit::Dollars => UsageDisplayUnit::Credits,
-    }
-}
-
-fn format_usage_unit_value(
-    credits: f32,
-    cost_in_cents: Option<f32>,
-    unit: UsageDisplayUnit,
-) -> String {
-    match unit {
-        UsageDisplayUnit::Credits => format_credits(credits),
-        UsageDisplayUnit::Dollars => cost_in_cents
-            .map(format_dollars)
-            .unwrap_or_else(|| format_credits(credits)),
+/// The unit the viewer's usage, balances and purchases display in. A tier that charges usage in
+/// cents (`Tier.chargeUnit`, via [`UserWorkspaces::charge_unit`]) follows the `usage_display_unit`
+/// setting; a tier that charges in credits is always credits, whatever the setting says.
+pub fn usage_display_unit(app: &AppContext) -> UsageDisplayUnit {
+    match UserWorkspaces::as_ref(app).charge_unit() {
+        ChargeUnit::Cents => AISettings::as_ref(app).usage_display_unit,
+        ChargeUnit::Credits => UsageDisplayUnit::Credits,
     }
 }
 
-/// Formats tokens with the selected unit, falling back to credits when dollars are unavailable.
-pub fn format_usage(
-    credits: f32,
-    tokens: Option<u32>,
-    cost_in_cents: Option<f32>,
-    unit: UsageDisplayUnit,
-) -> String {
-    let resolved_unit = effective_usage_unit(unit, cost_in_cents);
-    if !FeatureFlag::PricingTransparency.is_enabled() || resolved_unit != unit {
-        return format_credits(credits);
+/// Resolves the unit one usage figure is displayed in: dollars only when [`usage_display_unit`]
+/// is dollars and the figure carries a cents value, so a figure without one still renders as
+/// credits rather than blank.
+pub fn effective_usage_unit(cost_in_cents: Option<f32>, app: &AppContext) -> UsageDisplayUnit {
+    match (usage_display_unit(app), cost_in_cents) {
+        (UsageDisplayUnit::Dollars, Some(_)) => UsageDisplayUnit::Dollars,
+        (UsageDisplayUnit::Dollars, None) | (UsageDisplayUnit::Credits, Some(_) | None) => {
+            UsageDisplayUnit::Credits
+        }
     }
-    let unit_text = format_usage_unit_value(credits, cost_in_cents, resolved_unit);
-    let Some(tokens) = tokens.filter(|&tokens| tokens > 0) else {
-        return unit_text;
-    };
-    format!("{} tokens / {unit_text}", tokens.separate_with_commas())
+}
+
+/// Formats a usage figure in `unit`. Dollars fall back to the plain credits string when no cents
+/// figure exists.
+pub fn format_usage(credits: f32, cost_in_cents: Option<f32>, unit: UsageDisplayUnit) -> String {
+    match (unit, cost_in_cents) {
+        (UsageDisplayUnit::Dollars, Some(cost_in_cents)) => format_dollars(cost_in_cents),
+        (UsageDisplayUnit::Dollars, None) | (UsageDisplayUnit::Credits, _) => {
+            format_credits(credits)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -376,7 +421,12 @@ pub fn usage_label(
     cost_in_cents: Option<f32>,
     unit: UsageDisplayUnit,
 ) -> String {
-    let unit = effective_usage_unit(unit, cost_in_cents);
+    let unit = match (unit, cost_in_cents) {
+        (UsageDisplayUnit::Dollars, Some(_)) => UsageDisplayUnit::Dollars,
+        (UsageDisplayUnit::Dollars, None) | (UsageDisplayUnit::Credits, _) => {
+            UsageDisplayUnit::Credits
+        }
+    };
     let base = match (kind, unit) {
         (UsageLabelKind::DetailsPanel, UsageDisplayUnit::Credits) => "Credits used",
         (UsageLabelKind::DetailsPanel, UsageDisplayUnit::Dollars) => "Usage",

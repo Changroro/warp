@@ -498,6 +498,10 @@ pub(super) struct AIBlockStateHandles {
     /// Mouse state handle for the Subscribe button shown on the out-of-credits error
     subscribe_button_handle: MouseStateHandle,
 
+    /// Per-action mouse state handles for the recovery buttons on a ChatGPT subscription
+    /// error, indexed in the server's action order.
+    chatgpt_subscription_action_handles: Vec<MouseStateHandle>,
+
     /// Mouse state handle for AI document created block
     ai_document_handle: MouseStateHandle,
 
@@ -1590,6 +1594,7 @@ impl AIBlock {
             AIBlockOutputStatus::Failed { error, .. } => {
                 me.maybe_create_aws_bedrock_credentials_error_view(&error, ctx);
                 me.maybe_create_gemini_enterprise_credentials_error_view(&error, ctx);
+                me.maybe_create_chatgpt_subscription_action_handles(&error);
                 me.finish(FinishReason::Error, ctx);
             }
             AIBlockOutputStatus::Cancelled { .. } => {
@@ -1986,6 +1991,7 @@ impl AIBlock {
                 );
                 self.maybe_create_aws_bedrock_credentials_error_view(&error, ctx);
                 self.maybe_create_gemini_enterprise_credentials_error_view(&error, ctx);
+                self.maybe_create_chatgpt_subscription_action_handles(&error);
                 self.notify_run_agents_card_views(ctx);
                 // There are no actions to be taken in this block, it is finished.
                 self.finish(FinishReason::Error, ctx);
@@ -4227,6 +4233,19 @@ impl AIBlock {
         self.gemini_enterprise_credentials_error_view = Some(view);
         ctx.notify();
     }
+
+    fn maybe_create_chatgpt_subscription_action_handles(&mut self, error: &RenderableAIError) {
+        let RenderableAIError::ChatGPTSubscriptionError { actions, .. } = error else {
+            return;
+        };
+        if self.state_handles.chatgpt_subscription_action_handles.len() != actions.len() {
+            self.state_handles.chatgpt_subscription_action_handles = actions
+                .iter()
+                .map(|_| MouseStateHandle::default())
+                .collect();
+        }
+    }
+
     pub fn accept_pending_unit_test_suggestion(
         &mut self,
         interaction_source: InteractionSource,
@@ -6277,6 +6296,10 @@ pub enum AIBlockEvent {
     ResumeConversation {
         conversation_id: AIConversationId,
     },
+    /// Emitted when the user chooses Warp-funded inference after a ChatGPT subscription error.
+    ContinueWithWarpCredits {
+        conversation_id: AIConversationId,
+    },
     InsertForkSlashCommand,
     ToggleCodeReviewPane {
         entrypoint: CodeReviewPaneEntrypoint,
@@ -6331,6 +6354,10 @@ pub enum AIBlockAction {
 
     /// Resume the stopped conversation
     ResumeConversation,
+
+    /// Switch the conversation to Warp-funded inference after a ChatGPT subscription error, then
+    /// resume it.
+    ContinueWithWarpCredits,
 
     /// Fork the conversation
     ForkConversation,
@@ -6546,6 +6573,11 @@ impl TypedActionView for AIBlock {
             }
             AIBlockAction::ResumeConversation => {
                 ctx.emit(AIBlockEvent::ResumeConversation {
+                    conversation_id: self.client_ids.conversation_id,
+                });
+            }
+            AIBlockAction::ContinueWithWarpCredits => {
+                ctx.emit(AIBlockEvent::ContinueWithWarpCredits {
                     conversation_id: self.client_ids.conversation_id,
                 });
             }
