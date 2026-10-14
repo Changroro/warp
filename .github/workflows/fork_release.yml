@@ -1,0 +1,127 @@
+# Fork-only: builds the OSS channel for Linux (deb, AppImage) and Apple Silicon macOS (dmg) from a
+# `fork-vYYYY.MM.DD[.N]` tag and attaches the packages to a GitHub release. See FORK.md.
+name: Fork Release
+
+on:
+  push:
+    tags: ["fork-v*"]
+
+permissions:
+  contents: write
+
+env:
+  # Line tables push hosted runners over their memory limit during LTO, and full debug info would
+  # embed the builder's paths in the shipped binary.
+  CARGO_PROFILE_RELEASE_DEBUG: "false"
+  CARGO_PROFILE_RELEASE_LTO_DEBUG: "false"
+
+jobs:
+  linux:
+    name: Linux x86_64 (deb, AppImage)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    env:
+      # FUSE isn't available on hosted runners.
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: ./.github/actions/prepare_environment
+        with:
+          target_os: linux
+          is_self_hosted: false
+          install_release_deps: true
+
+      - name: Install linuxdeploy
+        run: script/linux/install_linuxdeploy
+
+      # rpm is skipped: bundle_rpm signs with Warp's release key whenever it runs on GitHub.
+      - name: Bundle
+        run: |
+          # deb versions are derived from this, so it must look like an upstream release tag.
+          export GIT_RELEASE_TAG="v0.${GITHUB_REF_NAME#fork-v}.fork_01"
+          script/bundle --channel oss --packages appimage,deb
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux
+          path: |
+            target/release-lto/bundle/linux/*.deb
+            target/release-lto/bundle/linux/*.AppImage
+          if-no-files-found: error
+
+  macos:
+    name: macOS Apple Silicon (dmg)
+    runs-on: macos-26
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: ./.github/actions/prepare_environment
+        with:
+          target_os: macos
+          is_self_hosted: false
+          install_release_deps: true
+
+      - name: Ensure rust target is installed
+        run: rustup target add aarch64-apple-darwin
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Install cargo-bundle and create-dmg
+        run: |
+          script/install_cargo_bundle
+          brew install create-dmg
+
+      # Without an Apple Developer ID the app is ad-hoc signed, so Gatekeeper asks users to
+      # allow it once.
+      - name: Bundle
+        run: |
+          # deb versions are derived from this, so it must look like an upstream release tag.
+          export GIT_RELEASE_TAG="v0.${GITHUB_REF_NAME#fork-v}.fork_01"
+          script/bundle --channel oss --arch aarch64 --selfsign
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos
+          path: target/**/bundle/osx/**/*.dmg
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: packages
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat > notes.md <<'EOF'
+          Unofficial build of [Warp](https://github.com/warpdotdev/warp) with this fork's features (SSH host manager, session archive). It installs as **WarpOss**, separate from the official Warp app and its data.
+
+          **Linux (Ubuntu/Debian, x86_64):** download the `.deb`, then run `sudo apt install ./<file>.deb`. Other distributions can use the `.AppImage` (`chmod +x` it, then run it).
+
+          **macOS (Apple Silicon):** open the `.dmg` and drag WarpOss to Applications. The app isn't notarized, so the first launch is blocked: open System Settings → Privacy & Security and click **Open Anyway**, or run `xattr -dr com.apple.quarantine /Applications/WarpOss.app`.
+
+          Source for this build is the tagged commit in this repository (AGPL-3.0).
+          EOF
+          gh release create "$TAG" packages/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Warp fork $TAG" \
+            --notes-file notes.md \
+            --prerelease

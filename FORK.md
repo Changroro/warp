@@ -28,6 +28,16 @@ merges each feature branch into `dev`, then runs `cargo check -p warp --all-targ
 tests on `dev`. It stops at the first failure and never pushes. On a merge conflict, resolve it,
 `git commit`, and rerun the script. When it finishes, push the branches it prints.
 
+## Releases
+
+Push a `fork-vYYYY.MM.DD` tag (add `.N` for another release the same day) on `dev`.
+`.github/workflows/fork_release.yml` builds the OSS channel as a Linux `.deb` and `.AppImage`
+(x86_64) and an ad-hoc signed Apple Silicon `.dmg`, then publishes them as a GitHub prerelease.
+rpm is skipped because upstream's bundle script signs it with Warp's key on CI. Upstream's own
+workflows are disabled in this fork's Actions settings so syncing `master` doesn't run Warp's CI.
+
+Fork tooling (`FORK.md`, `script/fork-sync`, the release workflow) lives on `feat/ssh-manager`.
+
 ## Layout rule
 
 Fork features live in fork-owned files. Upstream files only get hooks: a field, a constructor
