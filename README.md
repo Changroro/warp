@@ -1,3 +1,49 @@
+# Warp, personal fork
+
+**English** · [한국어](README.ko.md)
+
+A personal fork of [warpdotdev/warp](https://github.com/warpdotdev/warp) that brings the SSH workflow up to Termius level. Everything upstream still works; the features below are added on top. Upstream's README follows [further down](#about).
+
+## SSH manager
+
+**→ Hosts live in your real `~/.ssh/config`.** Hosts you add or rename in Warp work with `ssh <alias>` from any terminal, and hand-written hosts show up in the panel. Unknown directives, comments, and `Include`/`Match` blocks are kept as-is, and every write leaves the previous file at `~/.ssh/config.warp.bak`.
+
+**→ Hosts panel.** Pinned hosts, tag groups, filter chips, last-connected time, and open connection counts. Select several hosts to open them at once.
+
+**→ Launcher (`Cmd/Ctrl+Shift+H`).** Search saved hosts or type `user@host:port` to quick-connect, optionally saving it. The new-tab menu has an SSH section too.
+
+**→ Mirror a host's Warp tabs.** Hover a host and press the layout button to reopen the tabs of the WarpOss running on that server, with the same titles, colors, splits, and working directories. Each pane SSHes into the host and `cd`s to its directory. The remote session DB is only read (`sqlite3 -readonly`), and closing these tabs leaves the server's own sessions untouched.
+
+**→ Remote file browsing.** Open the remote host's files in Warp's file tree from an SSH session.
+
+**→ Image paste over SSH.** Pasting a clipboard image in an SSH tab uploads it to a random `/tmp` path on the host (mode `0600`) and types that path, so Claude Code or Codex running remotely can attach it.
+
+**→ Auto-reconnect.** When the connection drops, the session bar shows why and reconnects after a countdown, up to 5 attempts, never into a non-empty command line.
+
+**→ Saved passwords without typing them into the terminal.** Passwords sit in the macOS Keychain or Linux secure storage. On connect, `ssh` runs WarpOss as its `SSH_ASKPASS` helper, which answers **only the first** password prompt for the host's own `user@host`. Host key checks, jump hosts, one-time codes, and retries are asked on the terminal as usual. Needs OpenSSH 8.4+.
+
+## Session archive
+
+Closing a tab in the vertical tabs panel keeps a record of where it was working: title, directory, git branch, the CLI agent that drove it, and when it was last used. Click an entry to reopen it in that directory. Entries can be dragged into order and are covered by tab search.
+
+## Install
+
+Grab a `fork-v*` build from [Releases](https://github.com/Changroro/warp/releases).
+
+- Linux x86_64: `.deb` or `.AppImage`
+- macOS Apple Silicon: `.dmg` (ad-hoc signed; if the first launch is blocked, run `xattr -dr com.apple.quarantine /Applications/WarpOss.app`)
+
+> [!IMPORTANT]
+> Remote file browsing and tab mirroring need **Settings → Warpify → Warpify SSH Sessions** turned on. Tab mirroring also needs `sqlite3` and WarpOss on the remote host.
+
+## Branches
+
+`master` mirrors upstream, features are built on `feat/*` and merged into `dev`, and `dev` is the build we run. Syncing and releases are described in [FORK.md](FORK.md).
+
+<!-- Screenshots: hosts panel, launcher, tab mirroring -->
+
+---
+
 <a href="https://www.warp.dev">
     <img width="1024" alt="Warp Agentic Development Environment product preview" src="https://github.com/user-attachments/assets/9976b2da-2edd-4604-a36c-8fd53719c6d4" />
 </a>
