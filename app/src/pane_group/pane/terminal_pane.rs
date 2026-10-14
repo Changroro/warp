@@ -264,6 +264,8 @@ impl PaneContent for TerminalPane {
 
         // Attach the initial terminal view in the stack.
         attach_terminal_view(&self.terminal_view(ctx), terminal_pane_id, ctx);
+        self.terminal_view(ctx)
+            .update(ctx, |view, ctx| view.set_ssh_manager_attached(true, ctx));
 
         // Subscribe to the pane stack to handle views being pushed/popped.
         let pane_stack = self.view.as_ref(ctx).pane_stack().clone();
@@ -428,6 +430,8 @@ impl PaneContent for TerminalPane {
             CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
                 sessions.remove_session(terminal_view_id, ctx);
             });
+            self.terminal_view(ctx)
+                .update(ctx, |view, ctx| view.set_ssh_manager_attached(false, ctx));
         }
 
         ctx.unsubscribe_to_model(&pane_stack);
