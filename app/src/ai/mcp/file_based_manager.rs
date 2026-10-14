@@ -9,8 +9,8 @@ use warp_core::features::FeatureFlag;
 use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 
-use super::file_mcp_watcher::FileMCPConfigDiagnostic;
-use super::{FileMCPWatcher, FileMCPWatcherEvent, MCPProvider};
+use super::file_mcp_watcher::{FileMCPConfigDiagnostic, PendingScan};
+use super::{FileMCPWatcher, FileMCPWatcherEvent, MCPProvider, home_dir};
 use crate::ai::mcp::ParsedTemplatableMCPServerResult;
 use crate::ai::mcp::templatable_installation::TemplatableMCPServerInstallation;
 use crate::settings::AISettingsChangedEvent;
@@ -43,6 +43,23 @@ pub struct FileBasedMCPManager {
     defer_global_warp_autostart: bool,
     /// Whether deferred global Warp servers may now be started.
     global_warp_servers_activated: bool,
+    /// Readiness latch exposed through [`Self::initial_global_scan_result`].
+    initial_global_scan_state: InitialGlobalMcpScanState,
+}
+
+/// State of the one-time initial global home-config MCP scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InitialGlobalMcpScanState {
+    /// The scan is still settling; accumulates the global servers auto-start requested so far.
+    Pending(Vec<Uuid>),
+    /// The scan settled; carries the UUIDs actually auto-start requested while it ran.
+    Complete(Vec<Uuid>),
+}
+
+impl Default for InitialGlobalMcpScanState {
+    fn default() -> Self {
+        Self::Pending(Vec::new())
+    }
 }
 
 impl FileBasedMCPManager {
@@ -67,6 +84,7 @@ impl FileBasedMCPManager {
             config_diagnostics_by_path: Default::default(),
             defer_global_warp_autostart,
             global_warp_servers_activated: !defer_global_warp_autostart,
+            initial_global_scan_state: Default::default(),
         }
     }
 
@@ -107,9 +125,40 @@ impl FileBasedMCPManager {
                     .insert(diagnostic.config_path.clone(), diagnostic.clone());
                 ctx.emit(FileBasedMCPManagerEvent::ConfigDiagnosticChanged);
             }
-            FileMCPWatcherEvent::CloudEnvMcpScanComplete { repo_path } => {
+            FileMCPWatcherEvent::ScanComplete(PendingScan::CloudEnvRepo(repo_path)) => {
                 self.handle_cloud_environment_scan_complete(repo_path, ctx);
             }
+            FileMCPWatcherEvent::ScanComplete(PendingScan::InitialGlobal) => {
+                self.complete_initial_global_scan(ctx);
+            }
+        }
+    }
+
+    /// Freezes the first-turn wait set accumulated while the scan was pending. Idempotent: a
+    /// second call is a no-op rather than clobbering the frozen set.
+    fn complete_initial_global_scan(&mut self, ctx: &mut ModelContext<Self>) {
+        let InitialGlobalMcpScanState::Pending(auto_started) = &mut self.initial_global_scan_state
+        else {
+            return;
+        };
+        let wait_server_uuids = std::mem::take(auto_started);
+        log::info!(
+            "Initial global file-based MCP scan complete: {} auto-started server(s) to await before the first turn",
+            wait_server_uuids.len()
+        );
+        self.initial_global_scan_state =
+            InitialGlobalMcpScanState::Complete(wait_server_uuids.clone());
+        ctx.emit(FileBasedMCPManagerEvent::InitialGlobalMcpScanComplete { wait_server_uuids });
+    }
+
+    /// Returns the frozen initial-global-scan wait set, or `None` while the scan is pending.
+    ///
+    /// The watcher runs during application initialization, so a driver created later can miss
+    /// the transient completion event. This cached result preserves the settled snapshot.
+    pub fn initial_global_scan_result(&self) -> Option<Vec<Uuid>> {
+        match &self.initial_global_scan_state {
+            InitialGlobalMcpScanState::Complete(uuids) => Some(uuids.clone()),
+            InitialGlobalMcpScanState::Pending(_) => None,
         }
     }
 
@@ -122,7 +171,7 @@ impl FileBasedMCPManager {
         let repo_root = DetectedRepositories::as_ref(app)
             .get_root_for_path(&LocalOrRemotePath::Local(cwd.to_path_buf()))
             .and_then(|r| PathBuf::try_from(r).ok());
-        let candidate_roots = [dirs::home_dir(), repo_root];
+        let candidate_roots = [home_dir(), repo_root];
 
         let mut servers = Vec::new();
         for root in candidate_roots.into_iter().flatten() {
@@ -202,8 +251,8 @@ impl FileBasedMCPManager {
         }
     }
 
-    /// Applies a parsed list of MCP servers
-    /// spawning new servers and removing servers that are no longer present.
+    /// Applies a parsed list of MCP servers, spawning new servers and removing servers that
+    /// are no longer present.
     fn apply_parsed_servers(
         &mut self,
         root_path: PathBuf,
@@ -298,20 +347,13 @@ impl FileBasedMCPManager {
     /// global, even if they also happen to be referenced from a global location (in which
     /// case this returns `true` due to the global reference).
     fn is_global_server(&self, hash: u64) -> bool {
-        let home_dir = dirs::home_dir();
         self.file_based_servers_by_root
             .iter()
             .any(|(root_path, provider_map)| {
                 provider_map.iter().any(|(provider, hashes)| {
-                    if !hashes.contains(&hash) {
-                        return false;
-                    }
-                    match provider {
-                        MCPProvider::Warp => Self::is_global_warp_root(root_path),
-                        MCPProvider::Claude | MCPProvider::Codex | MCPProvider::Agents => {
-                            home_dir.as_ref().is_some_and(|home| root_path == home)
-                        }
-                    }
+                    hashes.contains(&hash)
+                        && Self::scope_for_source(root_path, *provider)
+                            == FileBasedMCPServerScope::Global
                 })
             })
     }
@@ -332,6 +374,25 @@ impl FileBasedMCPManager {
     fn is_global_warp_root(root_path: &Path) -> bool {
         warp_managed_mcp_config_path().is_some_and(|path| root_path == path.root_path.as_path())
     }
+
+    fn scope_for_source(root_path: &Path, provider: MCPProvider) -> FileBasedMCPServerScope {
+        match provider {
+            MCPProvider::Warp => {
+                if Self::is_global_warp_root(root_path) {
+                    FileBasedMCPServerScope::Global
+                } else {
+                    FileBasedMCPServerScope::Project
+                }
+            }
+            MCPProvider::Claude | MCPProvider::Codex | MCPProvider::Agents => {
+                if home_dir().as_ref().is_some_and(|home| root_path == home) {
+                    FileBasedMCPServerScope::Global
+                } else {
+                    FileBasedMCPServerScope::Project
+                }
+            }
+        }
+    }
     fn auto_start_decision(&self, hash: u64, file_based_mcp_enabled: bool) -> AutoStartDecision {
         let server_type = if self.is_global_warp_server(hash) {
             FileBasedMCPServerType::GlobalWarp
@@ -342,7 +403,9 @@ impl FileBasedMCPManager {
         };
         let should_autostart = match server_type {
             FileBasedMCPServerType::GlobalWarp => true,
-            FileBasedMCPServerType::GlobalThirdParty => file_based_mcp_enabled,
+            FileBasedMCPServerType::GlobalThirdParty => {
+                !self.defer_global_warp_autostart && file_based_mcp_enabled
+            }
             FileBasedMCPServerType::ProjectScoped => false,
         };
 
@@ -390,6 +453,17 @@ impl FileBasedMCPManager {
                 log::info!(
                     "Auto-spawning file-based MCP server '{server_name}' ({installation_uuid})"
                 );
+                if let InitialGlobalMcpScanState::Pending(awaited) =
+                    &mut self.initial_global_scan_state
+                    && matches!(
+                        server_type,
+                        FileBasedMCPServerType::GlobalWarp
+                            | FileBasedMCPServerType::GlobalThirdParty
+                    )
+                    && !awaited.contains(&installation_uuid)
+                {
+                    awaited.push(installation_uuid);
+                }
                 auto_started_uuids.push(installation_uuid);
                 to_spawn.push(installation);
             }
@@ -409,8 +483,8 @@ impl FileBasedMCPManager {
         ctx: &mut ModelContext<Self>,
     ) {
         let mcp_enabled = AISettings::as_ref(ctx).is_file_based_mcp_enabled(ctx);
-        // FileMCPWatcher emits CloudEnvMcpScanComplete only after emitting ConfigParsed
-        // for every provider config in this repo scan. Each ConfigParsed call records
+        // FileMCPWatcher emits ScanComplete for a cloud-environment repo only after emitting
+        // ConfigParsed for every provider config in this repo scan. Each ConfigParsed call records
         // the UUIDs actually emitted through SpawnServers in
         // pending_scan_auto_started_servers_by_root, so this remove() returns the wait set
         // for this completed scan.
@@ -460,6 +534,12 @@ impl FileBasedMCPManager {
     }
 
     fn handle_file_based_mcp_enabled_change(&mut self, ctx: &mut ModelContext<Self>) {
+        // The setting is GUI-only. TUI-discovered third-party servers always
+        // require an explicit start action, even if a value is loaded into the
+        // shared model by tests or future settings migrations.
+        if self.defer_global_warp_autostart {
+            return;
+        }
         // Only global third-party servers are affected by the toggle:
         // - Global Warp servers always spawn regardless of the toggle.
         // - Project-scoped servers (any provider) are never auto-spawned and their
@@ -497,12 +577,21 @@ impl FileBasedMCPManager {
             .find(|(_, server)| server.uuid() == installation_uuid)
             .map(|(hash, _)| *hash)
     }
+    /// Returns owned snapshots of every current file-config diagnostic.
     #[cfg(any(feature = "tui", test))]
-    pub fn config_diagnostic(&self, config_path: &Path) -> Option<&FileMCPConfigDiagnostic> {
-        self.config_diagnostics_by_path.get(config_path)
+    pub fn config_diagnostics(&self) -> Vec<FileMCPConfigDiagnostic> {
+        self.config_diagnostics_by_path
+            .values()
+            .cloned()
+            .sorted_by(|left, right| {
+                left.config_path.cmp(&right.config_path).then_with(|| {
+                    provider_sort_key(left.provider).cmp(&provider_sort_key(right.provider))
+                })
+            })
+            .collect()
     }
 
-    #[cfg(feature = "tui")]
+    #[cfg(any(feature = "tui", test))]
     pub fn global_warp_servers(&self) -> Vec<&TemplatableMCPServerInstallation> {
         self.file_based_servers
             .iter()
@@ -511,17 +600,7 @@ impl FileBasedMCPManager {
             .collect()
     }
 
-    #[cfg(feature = "tui")]
-    pub fn global_warp_installation_by_hash(
-        &self,
-        hash: u64,
-    ) -> Option<&TemplatableMCPServerInstallation> {
-        self.is_global_warp_server(hash)
-            .then(|| self.file_based_servers.get(&hash))
-            .flatten()
-    }
-
-    #[cfg(feature = "tui")]
+    #[cfg(any(feature = "tui", test))]
     pub fn activate_global_warp_servers(&mut self, ctx: &mut ModelContext<Self>) {
         if self.global_warp_servers_activated {
             return;
@@ -540,6 +619,46 @@ impl FileBasedMCPManager {
     /// Returns all detected file-based MCP server installations.
     pub fn file_based_servers(&self) -> Vec<&TemplatableMCPServerInstallation> {
         self.file_based_servers.values().collect()
+    }
+    /// Returns owned file-based installations with every config source that
+    /// currently references each installation.
+    #[cfg(any(feature = "tui", test))]
+    pub fn file_based_servers_with_sources(&self) -> Vec<FileBasedMCPServerWithSources> {
+        self.file_based_servers
+            .iter()
+            .sorted_by_key(|(hash, _)| **hash)
+            .map(|(hash, installation)| {
+                let mut sources = self
+                    .file_based_servers_by_root
+                    .iter()
+                    .flat_map(|(root_path, provider_map)| {
+                        provider_map
+                            .iter()
+                            .filter(|(_, hashes)| hashes.contains(hash))
+                            .map(|(provider, _)| FileBasedMCPServerSource {
+                                provider: *provider,
+                                root_path: root_path.clone(),
+                                scope: Self::scope_for_source(root_path, *provider),
+                            })
+                    })
+                    .collect_vec();
+                sources.sort_by(|left, right| {
+                    left.root_path.cmp(&right.root_path).then_with(|| {
+                        provider_sort_key(left.provider).cmp(&provider_sort_key(right.provider))
+                    })
+                });
+                FileBasedMCPServerWithSources {
+                    installation: installation.clone(),
+                    sources,
+                }
+            })
+            .collect()
+    }
+
+    /// Returns a file-based installation by its stable content hash.
+    #[cfg(any(feature = "tui", test))]
+    pub fn installation_by_hash(&self, hash: u64) -> Option<&TemplatableMCPServerInstallation> {
+        self.file_based_servers.get(&hash)
     }
 
     /// Returns the installation with the given UUID, if any.
@@ -602,12 +721,42 @@ impl FileBasedMCPManager {
         // home dir so all global installs (Warp and third-party) share a
         // consistent cwd.
         if self.is_global_warp_server(hash) {
-            return dirs::home_dir().or(Some(discovery_root));
+            return home_dir().or(Some(discovery_root));
         }
         Some(discovery_root)
     }
 }
 
+#[cfg(any(feature = "tui", test))]
+fn provider_sort_key(provider: MCPProvider) -> u8 {
+    match provider {
+        MCPProvider::Warp => 0,
+        MCPProvider::Claude => 1,
+        MCPProvider::Codex => 2,
+        MCPProvider::Agents => 3,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileBasedMCPServerScope {
+    Global,
+    Project,
+}
+
+#[cfg(any(feature = "tui", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileBasedMCPServerSource {
+    pub provider: MCPProvider,
+    pub root_path: PathBuf,
+    pub scope: FileBasedMCPServerScope,
+}
+
+#[cfg(any(feature = "tui", test))]
+#[derive(Clone, Debug)]
+pub struct FileBasedMCPServerWithSources {
+    pub installation: TemplatableMCPServerInstallation,
+    pub sources: Vec<FileBasedMCPServerSource>,
+}
 struct AutoStartDecision {
     should_autostart: bool,
     server_type: FileBasedMCPServerType,
@@ -648,6 +797,12 @@ pub enum FileBasedMCPManagerEvent {
         repo_path: PathBuf,
         #[allow(dead_code)]
         detected_servers: Vec<CloudEnvMcpScanServer>,
+        wait_server_uuids: Vec<Uuid>,
+    },
+    /// The one-time initial global home-config scan settled. `AgentDriver` awaits
+    /// [`FileBasedMCPManager::initial_global_scan_result`] instead of only listening for
+    /// this event, since it can fire long before a given run's driver ever subscribes.
+    InitialGlobalMcpScanComplete {
         wait_server_uuids: Vec<Uuid>,
     },
 }

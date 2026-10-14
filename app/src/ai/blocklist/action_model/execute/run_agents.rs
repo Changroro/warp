@@ -16,6 +16,8 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use warp_cli::agent::Harness;
 use warp_core::execution_mode::AppExecutionMode;
+use warp_core::telemetry::TelemetryEvent as _;
+use warp_core::{send_telemetry_from_app_ctx, send_telemetry_from_ctx};
 use warpui::{Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
 
 use super::start_agent::{StartAgentExecutor, StartAgentOutcome};
@@ -25,6 +27,9 @@ use crate::ai::agent::{
     AIAgentAction, AIAgentActionId, AIAgentActionResultType, AIAgentActionType, AIAgentInput,
     StartAgentExecutionMode,
 };
+use crate::ai::blocklist::telemetry::{
+    BlocklistOrchestrationTelemetryEvent, run_agents_completed_event,
+};
 use crate::ai::blocklist::{BlocklistAIHistoryModel, BlocklistAIPermissions};
 use crate::ai::document::plan_publication::{
     prepare_plan_publications, wait_for_plan_publications,
@@ -33,6 +38,12 @@ use crate::ai::local_harness_setup::local_harness_product_disabled_message;
 use crate::ai::orchestration::{
     OrchestrationConfigState, can_execute_with_auth_secret,
     populate_default_auth_secret_for_execution,
+};
+use crate::features::FeatureFlag;
+use crate::server::team_scope::RequestTeamScope;
+use crate::workspaces::user_workspaces::{
+    TeamContextForOperation, TeamContextForOperationResolver, TeamContextResolver, TeamScope,
+    UserWorkspaces,
 };
 
 /// Per-child spawn timeout. If a child agent doesn't report back within
@@ -64,6 +75,7 @@ pub struct RunAgentsExecutor {
     launched_agents: HashMap<AIConversationId, HashMap<String, ExistingLaunchedAgent>>,
     start_agent_executor: ModelHandle<StartAgentExecutor>,
     terminal_view_id: EntityId,
+    team_context_resolver: TeamContextForOperationResolver,
 }
 
 /// Lifecycle events for in-flight dispatches.
@@ -85,13 +97,21 @@ impl RunAgentsExecutor {
     pub fn new(
         start_agent_executor: ModelHandle<StartAgentExecutor>,
         terminal_view_id: EntityId,
+        team_context_resolver: TeamContextResolver,
     ) -> Self {
         Self {
             pending: HashMap::new(),
             launched_agents: HashMap::new(),
             start_agent_executor,
             terminal_view_id,
+            team_context_resolver: UserWorkspaces::team_context_for_operation_resolver(
+                team_context_resolver,
+            ),
         }
+    }
+
+    fn team_scope(&self, ctx: &ModelContext<Self>) -> TeamContextForOperation {
+        (self.team_context_resolver)(ctx)
     }
 
     pub fn is_pending(&self, action_id: &AIAgentActionId) -> bool {
@@ -160,6 +180,7 @@ impl RunAgentsExecutor {
         action_id: AIAgentActionId,
         request: RunAgentsRequest,
         parent_conversation_id: AIConversationId,
+        team_scope: RequestTeamScope,
         ctx: &mut ModelContext<Self>,
     ) -> async_channel::Receiver<RunAgentsResult> {
         let (sender, receiver) = async_channel::bounded(1);
@@ -204,6 +225,7 @@ impl RunAgentsExecutor {
                     action_id_for_wait.clone(),
                     request,
                     parent_conversation_id,
+                    team_scope,
                     sender,
                     ctx,
                 )
@@ -218,6 +240,7 @@ impl RunAgentsExecutor {
         action_id: AIAgentActionId,
         request: RunAgentsRequest,
         parent_conversation_id: AIConversationId,
+        team_scope: RequestTeamScope,
         sender: async_channel::Sender<RunAgentsResult>,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -228,6 +251,7 @@ impl RunAgentsExecutor {
             .and_then(|c| c.run_id());
 
         let RunAgentsRequest {
+            metadata,
             execution_mode: run_execution_mode,
             harness_type,
             model_id,
@@ -264,13 +288,17 @@ impl RunAgentsExecutor {
                 continue;
             }
             let recv = self.start_agent_executor.update(ctx, |executor, exec_ctx| {
+                let mut child_metadata = metadata.clone();
+                child_metadata.extend(cfg.metadata.clone());
                 executor.dispatch(
                     cfg.name.clone(),
                     prompt,
                     mode,
+                    child_metadata,
                     None, /* lifecycle_subscription */
                     parent_conversation_id,
                     parent_run_id.clone(),
+                    team_scope,
                     exec_ctx,
                 )
             });
@@ -380,31 +408,51 @@ impl RunAgentsExecutor {
         let AIAgentActionType::RunAgents(request) = action else {
             return ActionExecution::InvalidAction;
         };
-        let mut request = request.clone();
+        let mut request = request.as_ref().clone();
         let action_id = id.clone();
         let parent_conversation_id = input.conversation_id;
+        let team_scope = self.team_scope(ctx);
         if let Some(reason) = prepare_request_for_execution(
             &mut request,
             parent_conversation_id,
             self.terminal_view_id,
             &self.launched_agents,
+            &team_scope,
             ctx,
         ) {
-            return ActionExecution::Sync(AIAgentActionResultType::RunAgents(
-                RunAgentsResult::Denied { reason },
-            ));
+            let result = RunAgentsResult::Denied { reason };
+            send_telemetry_from_ctx!(
+                BlocklistOrchestrationTelemetryEvent::RunAgentsCompleted(
+                    run_agents_completed_event(parent_conversation_id, &request, &result)
+                ),
+                ctx
+            );
+            return ActionExecution::Sync(AIAgentActionResultType::RunAgents(result));
         }
+        let telemetry_request = request.clone();
 
-        let receiver =
-            self.dispatch_prepared_run_agents(action_id, request, parent_conversation_id, ctx);
+        let request_team_scope = RequestTeamScope::from_scope(&team_scope);
+        let receiver = self.dispatch_prepared_run_agents(
+            action_id,
+            request,
+            parent_conversation_id,
+            request_team_scope,
+            ctx,
+        );
 
-        ActionExecution::new_async(
-            async move { receiver.recv().await },
-            |result, _| match result {
-                Ok(r) => AIAgentActionResultType::RunAgents(r),
-                Err(_) => AIAgentActionResultType::RunAgents(RunAgentsResult::Cancelled),
-            },
-        )
+        ActionExecution::new_async(async move { receiver.recv().await }, move |result, ctx| {
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => RunAgentsResult::Cancelled,
+            };
+            send_telemetry_from_app_ctx!(
+                BlocklistOrchestrationTelemetryEvent::RunAgentsCompleted(
+                    run_agents_completed_event(parent_conversation_id, &telemetry_request, &result,)
+                ),
+                ctx
+            );
+            AIAgentActionResultType::RunAgents(result)
+        })
     }
 
     pub(super) fn should_autoexecute(
@@ -418,19 +466,37 @@ impl RunAgentsExecutor {
         if AppExecutionMode::as_ref(ctx).is_autonomous() {
             return true;
         }
-        let mut resolved_request = request.clone();
+        // Child conversations live in hidden panes where a confirmation card
+        // would be invisible and hang the run. Always auto-execute — even
+        // with `MultiLevelOrchestration` disabled — so the policy checks in
+        // `prepare_request_for_execution` (including the multi-level gate)
+        // fail the call gracefully with a Denied result instead of a card.
+        // Children inherit the parent surface's execution profile via
+        // `inherit_child_agent_settings`, so run-wide permissions carry over.
+        if BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&input.conversation_id)
+            .is_some_and(|c| c.is_child_agent_conversation())
+        {
+            return true;
+        }
+        let mut resolved_request = request.as_ref().clone();
+        let team_scope = self.team_scope(ctx);
         resolve_request_from_approved_config(&mut resolved_request, input.conversation_id, ctx);
-        populate_default_auth_secret_for_execution(&mut resolved_request, ctx);
+        populate_default_auth_secret_for_execution(&mut resolved_request, &team_scope, ctx);
         if self
             .duplicate_launched_agents_reason(&resolved_request, input.conversation_id, ctx)
             .is_some()
         {
             return true;
         }
-        approved_orchestration_config_can_autoexecute(request, input.conversation_id, ctx)
-            || BlocklistAIPermissions::as_ref(ctx)
-                .get_run_agents_setting(ctx, Some(self.terminal_view_id))
-                .is_always_allow()
+        approved_orchestration_config_can_autoexecute(
+            request,
+            input.conversation_id,
+            &team_scope,
+            ctx,
+        ) || BlocklistAIPermissions::as_ref(ctx)
+            .get_run_agents_setting(ctx, Some(self.terminal_view_id))
+            .is_always_allow()
     }
 
     pub(super) fn preprocess_action(
@@ -454,12 +520,13 @@ enum ChildSlot {
 fn approved_orchestration_config_can_autoexecute(
     request: &RunAgentsRequest,
     parent_conversation_id: AIConversationId,
+    team_scope: &(impl TeamScope + ?Sized),
     ctx: &ModelContext<RunAgentsExecutor>,
 ) -> bool {
     let mut resolved_request = request.clone();
     resolve_request_from_approved_config(&mut resolved_request, parent_conversation_id, ctx)
         .is_some_and(|status| status.is_approved())
-        && can_execute_with_auth_secret(&resolved_request, ctx)
+        && can_execute_with_auth_secret(&resolved_request, team_scope, ctx)
 }
 
 fn resolve_request_from_approved_config(
@@ -486,10 +553,11 @@ fn prepare_request_for_execution(
     parent_conversation_id: AIConversationId,
     terminal_view_id: EntityId,
     launched_agents: &HashMap<AIConversationId, HashMap<String, ExistingLaunchedAgent>>,
+    team_scope: &(impl TeamScope + ?Sized),
     ctx: &ModelContext<RunAgentsExecutor>,
 ) -> Option<String> {
     let status = resolve_request_from_approved_config(request, parent_conversation_id, ctx);
-    populate_default_auth_secret_for_execution(request, ctx);
+    populate_default_auth_secret_for_execution(request, team_scope, ctx);
     if let Some(reason) =
         duplicate_launched_agents_reason(request, parent_conversation_id, launched_agents, ctx)
     {
@@ -498,6 +566,18 @@ fn prepare_request_for_execution(
 
     if AppExecutionMode::as_ref(ctx).is_autonomous() {
         return None;
+    }
+
+    // A child conversation cannot present a confirmation card (hidden pane),
+    // so when the multi-level surfaces are disabled its `run_agents` call
+    // must be denied outright rather than falling through to the
+    // interactive path.
+    if !FeatureFlag::MultiLevelOrchestration.is_enabled()
+        && BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&parent_conversation_id)
+            .is_some_and(|c| c.is_child_agent_conversation())
+    {
+        return Some("Multi-level orchestration is not enabled on this client.".to_string());
     }
 
     if status.is_some_and(|status| status.is_disapproved()) {
@@ -513,7 +593,7 @@ fn prepare_request_for_execution(
         );
     }
 
-    if !can_execute_with_auth_secret(request, ctx) {
+    if !can_execute_with_auth_secret(request, team_scope, ctx) {
         return Some(
             "Cloud child agents using this harness require an API key before they can run."
                 .to_string(),

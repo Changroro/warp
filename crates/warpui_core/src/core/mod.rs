@@ -160,7 +160,7 @@ struct GlobalShortcut {
 #[derivative(Debug)]
 pub struct AddWindowOptions {
     pub background_blur_radius_pixels: Option<u8>,
-    pub background_blur_texture: bool,
+    pub background_backdrop: platform::WindowBackdrop,
     pub window_style: WindowStyle,
     pub window_bounds: WindowBounds,
     pub title: Option<String>,
@@ -566,7 +566,6 @@ enum TaskCallback {
         callback: Box<ViewFromFutureCallback>,
     },
     ViewFromStream {
-        window_id: WindowId,
         view_id: EntityId,
         on_item: Box<ViewFromStreamItemCallback>,
         on_done: Box<ViewFromStreamDoneCallback>,

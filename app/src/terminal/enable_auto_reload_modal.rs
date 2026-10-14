@@ -14,12 +14,15 @@ use warpui::ui_components::button::ButtonVariant;
 use warpui::ui_components::components::{Coords, UiComponent as _, UiComponentStyles};
 use warpui::{AppContext, Element, Entity, SingletonEntity as _, View, ViewContext, ViewHandle};
 
+use crate::ai::blocklist::view_util::usage_display_unit;
 use crate::features::FeatureFlag;
 use crate::menu::MenuItemFields;
 use crate::modal::{MODAL_PADDING, MODAL_WIDTH, Modal, ModalEvent};
+use crate::pricing::addon_pack::pack_menu_label;
 use crate::pricing::{PricingInfoModel, PricingInfoModelEvent};
 use crate::send_telemetry_from_ctx;
 use crate::server::telemetry::{AutoReloadModalAction, TelemetryEvent};
+use crate::settings::{AISettings, AISettingsChangedEvent};
 use crate::settings_view::create_discount_badge;
 use crate::ui_components::blended_colors;
 use crate::view_components::{Dropdown, DropdownAction, ToastFlavor};
@@ -77,6 +80,13 @@ impl EnableAutoReloadModalBody {
             &UserWorkspaces::handle(ctx),
             |me, _handle, event, ctx| {
                 match event {
+                    UserWorkspacesEvent::TeamsChanged => {
+                        // Pricing labels depend on the current team's purchase
+                        // policy (premium surcharge), so rebuild them when
+                        // teams change.
+                        me.update_addon_credits_options(ctx);
+                        ctx.notify();
+                    }
                     UserWorkspacesEvent::UpdateWorkspaceSettingsSuccess => {
                         if me.update_workspace_settings_loading {
                             me.update_workspace_settings_loading = false;
@@ -120,6 +130,13 @@ impl EnableAutoReloadModalBody {
             },
         );
 
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |me, _, event, ctx| {
+            if matches!(event, AISettingsChangedEvent::UsageDisplayUnit { .. }) {
+                me.update_addon_credits_options(ctx);
+                ctx.notify();
+            }
+        });
+
         let denomination_dropdown = ctx.add_typed_action_view(|ctx| {
             let mut dropdown = Dropdown::new(ctx);
             dropdown.set_top_bar_max_width(DENOMINATION_DROPDOWN_WIDTH);
@@ -144,6 +161,10 @@ impl EnableAutoReloadModalBody {
             .map(|opts| opts.to_vec())
             .unwrap_or_default();
 
+        let premium_bps = UserWorkspaces::as_ref(ctx)
+            .purchase_policy()
+            .map_or(0, |policy| policy.effective_premium_bps());
+        let unit = usage_display_unit(ctx);
         let base_rate = self
             .addon_credits_options
             .first()
@@ -153,17 +174,8 @@ impl EnableAutoReloadModalBody {
             .iter()
             .enumerate()
             .map(|(index, option)| {
-                let primary_text = format!(
-                    "${:.0} / {} credits",
-                    option.price_usd_cents as f32 / 100.,
-                    option.credits
-                );
-                let discount_percent = if base_rate > 0.0 {
-                    let actual_rate = option.rate();
-                    ((base_rate - actual_rate) / base_rate * 100.0).round() as u32
-                } else {
-                    0
-                };
+                let primary_text = pack_menu_label(option, premium_bps, unit);
+                let discount_percent = option.discount_percent(base_rate);
                 if discount_percent > 0 {
                     MenuItemFields::new_with_custom_label(
                         Arc::new(enclose!((primary_text) move |is_selected, is_hovered, appearance, _| {

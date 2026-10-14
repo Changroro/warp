@@ -13,6 +13,27 @@ fn binding() -> GeapMintBinding {
 }
 
 #[test]
+fn geap_is_expired_semantics() {
+    assert!(
+        GeapCredentials::new(
+            "expired".into(),
+            Some(SystemTime::now() - Duration::from_secs(1)),
+        )
+        .is_expired()
+    );
+    // The proactive lead window does not count as hard expiry.
+    assert!(
+        !GeapCredentials::new(
+            "near".into(),
+            Some(SystemTime::now() + Duration::from_secs(60)),
+        )
+        .is_expired()
+    );
+    // An unknown expiry cannot prove that the token is dead.
+    assert!(!GeapCredentials::new("unknown".into(), None).is_expired());
+}
+
+#[test]
 fn admin_config_status_flags_only_non_429_4xx() {
     assert!(is_admin_config_status(Some(400)));
     assert!(is_admin_config_status(Some(401)));
@@ -186,6 +207,57 @@ fn unconfigured_state_points_user_to_admin_setup() {
         description.to_lowercase().contains("admin"),
         "description should point at the admin: {description}"
     );
+}
+
+#[test]
+fn conflicting_across_teams_requires_admin_action() {
+    let state = GeapCredentialsState::ConflictingAcrossTeams {
+        team_names: vec!["Acme Corp".to_string(), "Acme Labs".to_string()],
+    };
+    assert_eq!(
+        state.recovery_action(),
+        Some(GeapRecoveryAction::ContactAdmin)
+    );
+    assert!(state.requires_admin_action());
+}
+
+#[test]
+fn conflicting_across_teams_names_two_teams_in_prose() {
+    let state = GeapCredentialsState::ConflictingAcrossTeams {
+        team_names: vec!["Acme Corp".to_string(), "Acme Labs".to_string()],
+    };
+    let (title, description, icon) = state.user_facing_components();
+    assert!(title.to_lowercase().contains("conflict"));
+    assert!(description.contains("Acme Corp and Acme Labs"));
+    assert!(description.to_lowercase().contains("admin"));
+    assert!(matches!(icon, Icon::AlertTriangle));
+}
+
+#[test]
+fn conflicting_across_teams_lists_exactly_three_teams_by_name() {
+    let state = GeapCredentialsState::ConflictingAcrossTeams {
+        team_names: vec![
+            "Acme Corp".to_string(),
+            "Acme Labs".to_string(),
+            "Acme EU".to_string(),
+        ],
+    };
+    let (_, description, _) = state.user_facing_components();
+    assert!(description.contains("Acme Corp, Acme Labs, and Acme EU"));
+}
+
+#[test]
+fn conflicting_across_teams_summarizes_more_than_three_teams() {
+    let state = GeapCredentialsState::ConflictingAcrossTeams {
+        team_names: vec![
+            "Acme Corp".to_string(),
+            "Acme Labs".to_string(),
+            "Acme EU".to_string(),
+            "Acme APAC".to_string(),
+        ],
+    };
+    let (_, description, _) = state.user_facing_components();
+    assert!(description.contains("Acme Corp, Acme Labs, and 2 other teams"));
 }
 
 #[test]

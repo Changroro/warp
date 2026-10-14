@@ -1,9 +1,16 @@
 //! Searchable TUI model picker state.
 
 use warp::editor::{CodeEditorModel, CodeEditorModelEvent};
-use warp::tui_export::{LLMId, LLMPreferences, LLMPreferencesEvent, query_model_picker_choices};
+use warp::settings::AISettings;
+#[cfg(test)]
+use warp::tui_export::UserWorkspaces;
+use warp::tui_export::{
+    AISettingsChangedEvent, LLMId, LLMPreferences, LLMPreferencesEvent, ModelPickerChoice,
+    TeamContextResolver, TeamScope, query_model_picker_choices, should_show_bedrock_icon_for_model,
+    should_show_gemini_enterprise_agent_platform_icon_for_model, should_show_key_icon_for_model,
+};
 use warp_editor::model::CoreEditorModel;
-use warpui_core::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
+use warpui_core::{AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
 
 use crate::inline_menu::{
     MAX_INLINE_MENU_ROWS, TuiInlineMenuHeader, TuiInlineMenuListState, TuiInlineMenuRow,
@@ -18,6 +25,9 @@ struct TuiModelMenuRow {
     id: LLMId,
     title: String,
     is_selectable: bool,
+    is_key_connected: bool,
+    is_profile_default: bool,
+    discount_percentage: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -35,6 +45,8 @@ pub(crate) struct TuiModelMenuEvent;
 pub(crate) struct TuiModelMenuModel {
     input_editor: ModelHandle<CodeEditorModel>,
     suggestions_mode: ModelHandle<TuiInputSuggestionsModeModel>,
+    terminal_view_id: EntityId,
+    team_context: TeamContextResolver,
     state: TuiModelMenuState,
 }
 
@@ -42,6 +54,8 @@ impl TuiModelMenuModel {
     pub(crate) fn new(
         input_editor: ModelHandle<CodeEditorModel>,
         suggestions_mode: ModelHandle<TuiInputSuggestionsModeModel>,
+        terminal_view_id: EntityId,
+        team_context: TeamContextResolver,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         ctx.subscribe_to_model(&input_editor, |model, _, event, ctx| {
@@ -60,9 +74,18 @@ impl TuiModelMenuModel {
                 model.refresh_rows(ctx);
             }
         });
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |model, _, event, ctx| {
+            if model.is_open(ctx)
+                && matches!(event, AISettingsChangedEvent::ExecutionProfiles { .. })
+            {
+                model.refresh_rows(ctx);
+            }
+        });
         Self {
             input_editor,
             suggestions_mode,
+            terminal_view_id,
+            team_context,
             state: TuiModelMenuState::Closed,
         }
     }
@@ -81,6 +104,9 @@ impl TuiModelMenuModel {
                     title: id.to_string(),
                     id,
                     is_selectable,
+                    is_key_connected: false,
+                    is_profile_default: false,
+                    discount_percentage: None,
                 })
                 .collect(),
             false,
@@ -91,6 +117,8 @@ impl TuiModelMenuModel {
         Self {
             input_editor,
             suggestions_mode,
+            terminal_view_id: EntityId::new(),
+            team_context: UserWorkspaces::teamless_context_resolver_for_test(),
             state: TuiModelMenuState::Open { list },
         }
     }
@@ -199,18 +227,7 @@ impl TuiModelMenuModel {
                 title: Some("Models".to_owned()),
                 tabs: Vec::new(),
             }),
-            rows: list
-                .rows()
-                .iter()
-                .map(|row| TuiInlineMenuRow {
-                    title: row.title.clone(),
-                    prefix: None,
-                    description: (!row.is_selectable).then(|| "disabled".to_owned()),
-                    state_suffix: None,
-                    is_selectable: row.is_selectable,
-                    style: TuiInlineMenuRowStyle::Default,
-                })
-                .collect(),
+            rows: list.rows().iter().map(snapshot_row).collect(),
             selected_index: list.selected_index(),
             scroll_offset: list.scroll_offset(),
             scroll_anchor: list.scroll_anchor(),
@@ -227,24 +244,27 @@ impl TuiModelMenuModel {
             return;
         }
         let query = input_text(&self.input_editor, ctx);
+        let scope = (self.team_context)(ctx);
         let preferences = LLMPreferences::as_ref(ctx);
-        let active_id = preferences.get_active_base_model(ctx, None).id.clone();
+        let active_id = preferences
+            .get_active_base_model(&scope, ctx, Some(self.terminal_view_id))
+            .id
+            .clone();
+        let profile_default_id = preferences
+            .get_active_profile_base_model(&scope, ctx, Some(self.terminal_view_id))
+            .id
+            .clone();
         let choices = query_model_picker_choices(
             preferences,
-            preferences.get_base_llm_choices_for_agent_mode(ctx),
+            preferences.get_base_llm_choices_for_agent_mode(&scope, ctx),
             &query,
+            None,
+            &scope,
             ctx,
         );
         let rows = choices
             .into_iter()
-            .map(|choice| {
-                let is_selectable = choice.is_selectable();
-                TuiModelMenuRow {
-                    id: choice.llm.id,
-                    title: choice.llm.display_name,
-                    is_selectable,
-                }
-            })
+            .map(|choice| model_menu_row(choice, &profile_default_id, &scope, ctx))
             .collect::<Vec<_>>();
         let preferred_index = preferred_selection_index(&rows, &active_id, query.trim().is_empty());
         let TuiModelMenuState::Open { list } = &mut self.state else {
@@ -255,6 +275,53 @@ impl TuiModelMenuModel {
         });
         ctx.emit(TuiModelMenuEvent);
     }
+}
+
+fn model_menu_row(
+    choice: ModelPickerChoice,
+    profile_default_id: &LLMId,
+    scope: &dyn TeamScope,
+    app: &AppContext,
+) -> TuiModelMenuRow {
+    let is_key_connected = should_show_key_icon_for_model(&choice.llm, None, scope, app);
+    let uses_external_inference = is_key_connected
+        || should_show_bedrock_icon_for_model(&choice.llm, scope, app)
+        || should_show_gemini_enterprise_agent_platform_icon_for_model(&choice.llm, scope, app);
+    TuiModelMenuRow {
+        is_selectable: choice.is_selectable(),
+        is_key_connected,
+        discount_percentage: choice
+            .llm
+            .discount_percentage
+            .filter(|_| !uses_external_inference),
+        is_profile_default: choice.llm.id == *profile_default_id,
+        id: choice.llm.id,
+        title: choice.llm.display_name,
+    }
+}
+
+fn snapshot_row(row: &TuiModelMenuRow) -> TuiInlineMenuRow {
+    let state_suffix = match (row.is_profile_default, row.is_key_connected) {
+        (true, true) => Some("(default) (key connected)".to_owned()),
+        (true, false) => Some("(default)".to_owned()),
+        (false, true) => Some("(key connected)".to_owned()),
+        (false, false) => None,
+    };
+    TuiInlineMenuRow {
+        title: row.title.clone(),
+        prefix: None,
+        description: (!row.is_selectable).then(|| "disabled".to_owned()),
+        state_suffix,
+        promotional_suffix: discount_label(row.discount_percentage),
+        is_selectable: row.is_selectable,
+        style: TuiInlineMenuRowStyle::Default,
+    }
+}
+
+fn discount_label(discount_percentage: Option<f32>) -> Option<String> {
+    discount_percentage
+        .filter(|percentage| *percentage > 0.)
+        .map(|percentage| format!("{}% off", percentage.round() as u32))
 }
 
 fn preferred_selection_index(

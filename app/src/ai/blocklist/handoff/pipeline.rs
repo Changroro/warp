@@ -48,14 +48,16 @@ use crate::ai::cloud_environments::CloudAmbientAgentEnvironment;
 use crate::ai::execution_profiles::resolve_cloud_agent_computer_use_state;
 use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::ai::orchestration::{
-    CloudAgentStartupIssue, classify_cloud_agent_startup_error, oz_run_url,
-    resolve_default_environment_id, resolve_default_host_slug, should_disable_snapshot,
+    CloudAgentStartupBlocker, CloudAgentStartupFailure, CloudAgentStartupIssue,
+    classify_cloud_agent_startup_error, oz_run_url, resolve_default_environment_id,
+    resolve_default_host_slug, should_disable_snapshot,
 };
 use crate::cloud_object::CloudObjectLookup as _;
 use crate::server::ids::{ServerId, SyncId};
 use crate::server::server_api::ai::{
     AIClient, AgentConfigSnapshot, AttachmentInput, InitialSnapshotToken, SpawnAgentRequest,
 };
+use crate::server::team_scope::RequestTeamScope;
 use crate::settings::AISettings;
 
 const HANDOFF_CONTINUE_PROMPT: &str = "Continue";
@@ -247,6 +249,7 @@ pub struct HandoffTargetMaterialization {
     pub title: Option<String>,
     /// Pre-snapshot request used to present the queued prompt immediately.
     pub request: SpawnAgentRequest,
+    pub team_scope: RequestTeamScope,
     /// One-shot signal the frontend consumes when the user cancels the handoff.
     pub cancel: oneshot::Sender<()>,
 }
@@ -289,6 +292,7 @@ pub struct PendingHandoff {
     snapshot_target: SnapshotUploadTarget,
     snapshot_disabled: bool,
     orchestration_handoff: Option<bool>,
+    team_scope: RequestTeamScope,
 }
 
 impl PendingHandoff {
@@ -539,18 +543,21 @@ pub fn prepare_handoff(
         .into_iter()
         .map(|environment| environment.id)
         .collect();
+    let scope = controller.as_ref(ctx).team_context(ctx);
+    let team_scope = RequestTeamScope::from_scope(&scope);
     let preferences = LLMPreferences::as_ref(ctx);
     let active_model_id = &preferences
-        .get_active_base_model(ctx, Some(terminal_surface_id))
+        .get_active_base_model(&scope, ctx, Some(terminal_surface_id))
         .id;
     let model_id = preferences.cloud_runnable_oz_model_id_or_fallback(active_model_id);
     let model_is_cloud_runnable =
         preferences.is_cloud_runnable_oz_model_id(&LLMId::from(model_id.as_str()));
+    let computer_use_enabled = resolve_cloud_agent_computer_use_state(&scope, ctx).enabled;
     let config = AgentConfigSnapshot {
         environment_id: environment_id.map(|id| id.to_string()),
         model_id: Some(model_id.clone()),
-        computer_use_enabled: Some(resolve_cloud_agent_computer_use_state(ctx).enabled),
-        worker_host: resolve_default_host_slug(ctx),
+        computer_use_enabled: Some(computer_use_enabled),
+        worker_host: resolve_default_host_slug(&scope, ctx),
         ..Default::default()
     };
     let snapshot_disabled = should_disable_snapshot(ctx);
@@ -593,6 +600,7 @@ pub fn prepare_handoff(
         snapshot_target,
         snapshot_disabled,
         orchestration_handoff,
+        team_scope,
     })
 }
 
@@ -639,6 +647,21 @@ pub enum HandoffCommitOutcome {
     Created(HandoffCreated),
 }
 
+pub fn handoff_dispatch_error(issue: &CloudAgentStartupIssue) -> String {
+    match issue {
+        CloudAgentStartupIssue::Blocked(CloudAgentStartupBlocker::GitHubAuthRequired {
+            message,
+            ..
+        })
+        | CloudAgentStartupIssue::Failed(
+            CloudAgentStartupFailure::Capacity { message }
+            | CloudAgentStartupFailure::OutOfCredits { message }
+            | CloudAgentStartupFailure::ServerOverloaded { message }
+            | CloudAgentStartupFailure::Other { message },
+        ) => message.clone(),
+    }
+}
+
 /// State after selecting or creating the server-side conversation fork.
 struct ForkedHandoff {
     pending: PendingHandoff,
@@ -653,15 +676,21 @@ struct SnapshotSettledHandoff {
     restoration: Option<HandoffRestoration>,
     derived_workspace_had_content: bool,
     snapshot_failed: bool,
+    team_scope: RequestTeamScope,
 }
 
 /// Consumes a prepared handoff and begins its execution lifecycle.
 ///
 /// Mutable feature, environment, model, and snapshot settings are re-read
-/// synchronously before the returned future can perform external work.
+/// synchronously before the returned future can perform external work. A
+/// headless frontend may supply `caller_cancellation`; a materialized frontend
+/// instead receives its cancellation sender through
+/// [`HandoffTargetMaterialization`]. These cancellation paths are mutually
+/// exclusive.
 pub fn execute_handoff(
     mut pending: PendingHandoff,
     ai_client: Arc<dyn AIClient>,
+    caller_cancellation: Option<oneshot::Receiver<()>>,
     materialize_handoff_target: Option<MaterializeHandoffTarget>,
     ctx: &AppContext,
 ) -> Pin<Box<dyn Future<Output = HandoffCommitOutcome> + Send>> {
@@ -691,6 +720,7 @@ pub fn execute_handoff(
     Box::pin(execute_validated_handoff(
         pending,
         ai_client,
+        caller_cancellation,
         materialize_handoff_target,
     ))
 }
@@ -698,14 +728,19 @@ pub fn execute_handoff(
 async fn execute_validated_handoff(
     pending: PendingHandoff,
     ai_client: Arc<dyn AIClient>,
+    caller_cancellation: Option<oneshot::Receiver<()>>,
     materialize_handoff_target: Option<MaterializeHandoffTarget>,
 ) -> HandoffCommitOutcome {
     let mut forked = match fork_source_conversation(pending, &ai_client).await {
         Ok(forked) => forked,
         Err(failure) => return HandoffCommitOutcome::Failed(failure),
     };
-    let mut cancellation = None;
+    let mut cancellation = caller_cancellation;
     if let Some(materialize_handoff_target) = materialize_handoff_target {
+        debug_assert!(
+            cancellation.is_none(),
+            "caller cancellation and target materialization cancellation are mutually exclusive"
+        );
         let (cancel, receiver) = oneshot::channel();
         let materialization = HandoffTargetMaterialization {
             source_conversation: forked.pending.source_conversation.clone(),
@@ -723,7 +758,9 @@ async fn execute_validated_handoff(
                 },
                 forked.forked_conversation_id.clone(),
                 None,
+                forked.pending.team_scope,
             ),
+            team_scope: forked.pending.team_scope,
             cancel,
         };
         if let Err(error) = materialize_handoff_target(materialization)
@@ -767,8 +804,11 @@ async fn execute_validated_handoff(
         settled.spawn_ready,
         settled.forked_conversation_id,
         settled.initial_snapshot_token,
+        settled.team_scope,
     );
-    let response = ai_client.spawn_agent(request.clone()).await;
+    let response = ai_client
+        .spawn_agent(request.clone(), settled.team_scope)
+        .await;
     if cancellation
         .as_mut()
         .is_some_and(handoff_cancellation_requested)
@@ -872,6 +912,7 @@ async fn prepare_snapshot_for_spawn(forked: ForkedHandoff) -> SnapshotSettledHan
         snapshot_target,
         snapshot_disabled,
         orchestration_handoff,
+        team_scope,
     } = forked.pending;
     let (workspace, snapshot_result) = upload_handoff_snapshot(source_paths, snapshot_target).await;
     let derived_workspace_had_content =
@@ -900,6 +941,7 @@ async fn prepare_snapshot_for_spawn(forked: ForkedHandoff) -> SnapshotSettledHan
         restoration,
         derived_workspace_had_content,
         snapshot_failed,
+        team_scope,
     }
 }
 
@@ -918,6 +960,7 @@ fn build_spawn_request(
     handoff: SpawnReadyHandoff,
     forked_conversation_id: Option<String>,
     initial_snapshot_token: Option<InitialSnapshotToken>,
+    team_scope: RequestTeamScope,
 ) -> SpawnAgentRequest {
     let SpawnReadyHandoff {
         prompt,
@@ -950,11 +993,12 @@ fn build_spawn_request(
     };
 
     SpawnAgentRequest {
+        metadata: Default::default(),
         prompt,
         mode,
         config: Some(config),
         title,
-        team: None,
+        team: Some(team_scope.team_uid().is_some()),
         skill: None,
         attachments,
         interactive: Some(true),

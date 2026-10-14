@@ -3,9 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::FairMutex;
-#[cfg(feature = "voice_input")]
-use warpui::SingletonEntity as _;
-use warpui::{AppContext, Entity, EntityId, ModelContext, ModelHandle};
+use warpui::{AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity as _};
 
 use super::core::subscribe_to_shared_dependencies;
 use super::{
@@ -14,25 +12,28 @@ use super::{
 use crate::ai::blocklist::block::cli_controller::CLISubagentController;
 #[cfg(feature = "voice_input")]
 use crate::ai::{AIRequestUsageModel, AIRequestUsageModelEvent};
+use crate::auth::AuthStateProvider;
 use crate::search::SyncDataSource;
 use crate::search::data_source::{Query, QueryResult};
 use crate::search::mixer::DataSourceRunErrorWrapper;
-use crate::search::slash_command_menu::static_commands::Availability;
 use crate::search::slash_command_menu::static_commands::commands::{COMMAND_REGISTRY, VOICE};
+use crate::search::slash_command_menu::static_commands::{Availability, SlashCommandKind};
 #[cfg(feature = "voice_input")]
 use crate::settings::{AISettings, AISettingsChangedEvent};
 use crate::terminal::TerminalModel;
 use crate::terminal::input::slash_commands::AcceptSlashCommandOrSavedPrompt;
 use crate::terminal::model::session::active_session::ActiveSession;
 use crate::terminal::view::resolve_ai_query_routing;
-#[cfg(feature = "voice_input")]
-use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
+use crate::workspaces::user_workspaces::{TeamContextResolver, UserWorkspaces};
 
 pub struct TuiDataSourceArgs {
     pub active_session: ModelHandle<ActiveSession>,
     pub cli_subagent_controller: ModelHandle<CLISubagentController>,
     pub terminal_view_id: EntityId,
     pub terminal_model: Arc<FairMutex<TerminalModel>>,
+    /// Resolves this data source's terminal surface's window's team context. Minted by the
+    /// owning view at construction via `UserWorkspaces::team_context_resolver`.
+    pub team_context_resolver: TeamContextResolver,
 }
 
 pub struct TuiSlashCommandDataSource {
@@ -47,6 +48,7 @@ impl TuiSlashCommandDataSource {
             cli_subagent_controller,
             terminal_view_id,
             terminal_model,
+            team_context_resolver,
         } = args;
 
         subscribe_to_shared_dependencies(
@@ -64,11 +66,6 @@ impl TuiSlashCommandDataSource {
                     me.recompute_active_commands(ctx);
                 }
             });
-            ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |me, _, event, ctx| {
-                if matches!(event, UserWorkspacesEvent::TeamsChanged) {
-                    me.recompute_active_commands(ctx);
-                }
-            });
             ctx.subscribe_to_model(&AIRequestUsageModel::handle(ctx), |me, _, event, ctx| {
                 if matches!(event, AIRequestUsageModelEvent::RequestUsageUpdated) {
                     me.recompute_active_commands(ctx);
@@ -81,6 +78,7 @@ impl TuiSlashCommandDataSource {
                 active_session,
                 cli_subagent_controller,
                 terminal_view_id,
+                team_context_resolver,
             ),
             terminal_model,
         };
@@ -95,6 +93,11 @@ impl TuiSlashCommandDataSource {
     pub fn local_skills_available(&self, app: &AppContext) -> bool {
         let terminal_model = self.terminal_model.lock();
         resolve_ai_query_routing(self.terminal_view_id(), None, &terminal_model, app).is_local()
+    }
+
+    pub fn manage_billing_url(&self, app: &AppContext) -> Option<String> {
+        let user_email = AuthStateProvider::as_ref(app).get().user_email()?;
+        UserWorkspaces::as_ref(app).admin_billing_link_for_default_team(&user_email)
     }
     pub fn set_active_repo_root(
         &mut self,
@@ -120,7 +123,10 @@ impl TuiSlashCommandDataSource {
             COMMAND_REGISTRY
                 .all_commands_by_id()
                 .filter(|(_, command)| {
-                    (command.name != VOICE.name || voice_command_is_available)
+                    command.supports_tui()
+                        && (command.name != VOICE.name || voice_command_is_available)
+                        && (command.kind != SlashCommandKind::ManageBilling
+                            || self.manage_billing_url(ctx).is_some())
                         && self.command_passes_common_gates(command, availability, &gates)
                 })
                 .map(|(id, command)| (id, command.clone())),

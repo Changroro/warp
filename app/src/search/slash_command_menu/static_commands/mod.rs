@@ -54,10 +54,13 @@ pub enum SlashCommandKind {
     Agent,
     CloudAgent,
     AddMcp,
-    AddApiKey,
-    ClearApiKey,
+    ApiKeys,
+    ConnectGrok,
+    Upgrade,
+    ManageBilling,
     AutoApprove,
     Statusline,
+    ResetStatusline,
     Mcp,
     ViewLogs,
     Voice,
@@ -91,6 +94,7 @@ pub enum SlashCommandKind {
     New,
     Clear,
     Model,
+    Team,
     Host,
     Harness,
     Environment,
@@ -111,7 +115,9 @@ pub enum SlashCommandKind {
     Rewind,
     ExportToClipboard,
     ExportToFile,
+    VimMode,
     Status,
+    CopyDebuggingId,
 }
 
 /// The application surfaces on which a static slash command is implemented.

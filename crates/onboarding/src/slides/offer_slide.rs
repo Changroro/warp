@@ -40,12 +40,22 @@ impl OfferVariant {
         }
     }
 
+    pub(crate) fn primary_badge_label(self, pricing_promotion_message: Option<&str>) -> &str {
+        match self {
+            OfferVariant::HeadStart | OfferVariant::ChooseHowToStart => {
+                pricing_promotion_message.unwrap_or("Recommended")
+            }
+        }
+    }
+
     pub(crate) fn subtitle(self) -> Option<&'static str> {
         match self {
             OfferVariant::HeadStart => {
                 Some("Your account includes AI usage to help you get started.")
             }
-            OfferVariant::ChooseHowToStart => None,
+            OfferVariant::ChooseHowToStart => {
+                Some("To use AI, start with a plan or one-time credit packs.")
+            }
         }
     }
 
@@ -85,6 +95,13 @@ impl OfferVariant {
         }
     }
 
+    /// Whether this offer exists to sell the user AI usage. Only the
+    /// free-standard offer does: the head-start offer already ships with AI
+    /// usage, so a purchase isn't the decision being made.
+    pub(crate) fn sells_ai_usage(self) -> bool {
+        matches!(self, OfferVariant::ChooseHowToStart)
+    }
+
     pub(crate) fn included_features(self) -> &'static [&'static str] {
         match self {
             OfferVariant::HeadStart => &[
@@ -113,6 +130,8 @@ impl OfferVariant {
     fn primary_action(self) -> &'static str {
         match self {
             OfferVariant::HeadStart => "get_more_ai",
+            // Telemetry identifier, not user-facing copy: kept stable across the
+            // card's copy changes so existing dashboards don't lose continuity.
             OfferVariant::ChooseHowToStart => "use_warp_with_ai",
         }
     }
@@ -178,13 +197,31 @@ impl OfferSlide {
         self.onboarding_state.as_ref(app).offer_variant()
     }
 
-    fn render_content(&self, appearance: &Appearance, variant: OfferVariant) -> Box<dyn Element> {
+    fn primary_badge_label(&self, variant: OfferVariant, app: &AppContext) -> String {
+        let state = self.onboarding_state.as_ref(app);
+        variant
+            .primary_badge_label(state.pricing_promotion_message())
+            .to_owned()
+    }
+
+    /// The selectable options, top to bottom. Also the order the arrow keys
+    /// move through.
+    fn choices(&self) -> [OfferChoice; 2] {
+        [OfferChoice::Primary, OfferChoice::SetUpLater]
+    }
+
+    fn render_content(
+        &self,
+        appearance: &Appearance,
+        variant: OfferVariant,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
         slide_content::onboarding_slide_content(
             vec![
                 Align::new(Self::render_header(appearance, variant))
                     .left()
                     .finish(),
-                self.render_options(appearance, variant),
+                self.render_options(appearance, variant, app),
             ],
             self.render_bottom_nav(appearance),
             self.scroll_state.clone(),
@@ -261,13 +298,18 @@ impl OfferSlide {
         header.finish()
     }
 
-    fn render_options(&self, appearance: &Appearance, variant: OfferVariant) -> Box<dyn Element> {
+    fn render_options(
+        &self,
+        appearance: &Appearance,
+        variant: OfferVariant,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
         let primary = Self::render_option_card(
             appearance,
             variant.primary_label(),
             variant.primary_description(),
             self.selected_choice == OfferChoice::Primary,
-            true,
+            Some(self.primary_badge_label(variant, app)),
             self.primary_mouse_state.clone(),
             OfferSlideAction::SelectPrimary,
         );
@@ -276,20 +318,19 @@ impl OfferSlide {
             variant.secondary_label(),
             variant.secondary_description(),
             self.selected_choice == OfferChoice::SetUpLater,
-            false,
+            None,
             self.secondary_mouse_state.clone(),
             OfferSlideAction::SelectSetUpLater,
         );
-        Container::new(
-            Flex::column()
-                .with_main_axis_size(MainAxisSize::Min)
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(Container::new(primary).with_margin_bottom(12.).finish())
-                .with_child(secondary)
-                .finish(),
-        )
-        .with_margin_top(38.)
-        .finish()
+
+        let options = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(Container::new(primary).with_margin_bottom(12.).finish())
+            .with_child(secondary)
+            .finish();
+
+        Container::new(options).with_margin_top(38.).finish()
     }
 
     fn render_bottom_nav(&self, appearance: &Appearance) -> Box<dyn Element> {
@@ -331,13 +372,12 @@ impl OfferSlide {
             .finish()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_option_card(
         appearance: &Appearance,
         label: &'static str,
         description: &'static str,
         selected: bool,
-        recommended: bool,
+        badge_label: Option<String>,
         mouse_state: MouseStateHandle,
         action: OfferSlideAction,
     ) -> Box<dyn Element> {
@@ -363,12 +403,12 @@ impl OfferSlide {
             .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(label);
-        if recommended {
+        if let Some(badge_label) = badge_label {
             let green = theme.ansi_fg_green();
             let badge = Container::new(
                 appearance
                     .ui_builder()
-                    .paragraph("Recommended")
+                    .paragraph(badge_label)
                     .with_style(UiComponentStyles {
                         font_size: Some(12.),
                         font_color: Some(green),
@@ -467,6 +507,18 @@ impl OfferSlide {
         ctx.notify();
     }
 
+    /// Moves the selection `delta` positions through the options, clamped at
+    /// both ends.
+    fn move_selection(&mut self, delta: isize, ctx: &mut ViewContext<Self>) {
+        let choices = self.choices();
+        let current_index = choices
+            .iter()
+            .position(|choice| *choice == self.selected_choice)
+            .unwrap_or(0) as isize;
+        let next_index = (current_index + delta).clamp(0, choices.len() as isize - 1) as usize;
+        self.select_choice(choices[next_index], ctx);
+    }
+
     fn get_warping(&mut self, ctx: &mut ViewContext<Self>) {
         match self.selected_choice {
             OfferChoice::Primary => self.request_upgrade(ctx),
@@ -496,7 +548,7 @@ impl View for OfferSlide {
         };
         let appearance = Appearance::as_ref(app);
         let slide = layout::static_left(
-            || self.render_content(appearance, variant),
+            || self.render_content(appearance, variant, app),
             || self.render_visual(),
         );
         if !self.show_auth_prompt_bar {
@@ -524,11 +576,11 @@ impl View for OfferSlide {
 
 impl OnboardingSlide for OfferSlide {
     fn on_up(&mut self, ctx: &mut ViewContext<Self>) {
-        self.select_choice(OfferChoice::Primary, ctx);
+        self.move_selection(-1, ctx);
     }
 
     fn on_down(&mut self, ctx: &mut ViewContext<Self>) {
-        self.select_choice(OfferChoice::SetUpLater, ctx);
+        self.move_selection(1, ctx);
     }
     fn on_enter(&mut self, ctx: &mut ViewContext<Self>) {
         self.get_warping(ctx);

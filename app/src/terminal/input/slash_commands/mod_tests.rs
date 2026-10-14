@@ -98,7 +98,8 @@ fn tui_commands_have_typed_identities_and_explicit_surface_support() {
 
     let command = &*commands::ORCHESTRATE;
     assert_eq!(command.kind, SlashCommandKind::Orchestrate);
-    assert!(!command.supports_surface(settings::SettingsMode::Tui));
+    assert!(command.supports_surface(settings::SettingsMode::Tui));
+    assert!(command.supports_surface(settings::SettingsMode::Gui));
 }
 
 #[test]
@@ -186,7 +187,9 @@ mod windows {
 
     fn wsl_session() -> Session {
         Session::new(
-            SessionInfo::new_for_test().with_shell_type(ShellType::Bash),
+            SessionInfo::new_for_test()
+                .with_shell_type(ShellType::Bash)
+                .with_home_dir("/home/ubuntu".to_owned()),
             Arc::new(TestCommandExecutor::default()),
         )
         .with_shell_launch_data(ShellLaunchData::WSL {
@@ -220,6 +223,15 @@ mod windows {
                 "/home/ubuntu",
                 "subdir/test.txt:4:2",
                 r"\\WSL$\Ubuntu\home\ubuntu\subdir\test.txt",
+                Some(LineAndColumnArg {
+                    line_num: 4,
+                    column_num: Some(2),
+                }),
+            ),
+            (
+                "/tmp",
+                "~/subdir/file\\ name.txt:4:2",
+                r"\\WSL$\Ubuntu\home\ubuntu\subdir\file name.txt",
                 Some(LineAndColumnArg {
                     line_num: 4,
                     column_num: Some(2),

@@ -20,8 +20,11 @@ pub use auth_manager::AuthManager;
 pub use auth_state::AuthStateProvider;
 use itertools::Itertools;
 pub use login_failure_notification::LoginFailureReason;
+#[cfg(feature = "tui")]
+use url::Url;
 pub use user_uid::UserUid;
 use warp_core::channel::ChannelState;
+use warp_core::features::FeatureFlag;
 use warp_core::user_preferences::GetUserPreferences as _;
 use warp_errors::{report_error, report_if_error};
 use warpui::modals::{AlertDialogWithCallbacks, ModalButton};
@@ -30,15 +33,19 @@ use warpui::{AppContext, SingletonEntity};
 use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::ai::blocklist::BlocklistAIHistoryModel;
 use crate::ai::blocklist::agent_view::orchestration_pill_bar_model::OrchestrationPillBarModel;
+use crate::ai::chatgpt_subscription::ChatGPTSubscriptionModel;
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
+use crate::ai::llms::LLMPreferences;
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::mcp::TemplatableMCPServerManager;
+use crate::ai::request_usage_model::AIRequestUsageModel;
 use crate::ai_assistant::requests::REQUEST_LIMIT_INFO_CACHE_KEY;
 use crate::cloud_object::model::persistence::CloudModel;
 use crate::code::editor_management::{CodeEditorStatus, CodeEditorSummary};
 use crate::env_vars::manager::EnvVarCollectionManager;
 use crate::notebooks::manager::NotebookManager;
 use crate::palette::PaletteMode;
+use crate::root_view::RootView;
 use crate::server::cloud_objects::update_manager::UpdateManager;
 use crate::server::sync_queue::SyncQueue;
 use crate::server::telemetry::{PaletteSource, TelemetryEvent};
@@ -50,7 +57,7 @@ use crate::settings::{
 use crate::terminal::general_settings::GeneralSettings;
 use crate::terminal::shared_session::manager::Manager as SharedSessionManager;
 use crate::workflows::manager::WorkflowManager;
-use crate::workspace::{Workspace, WorkspaceAction};
+use crate::workspace::{OneTimeModalModel, Workspace, WorkspaceAction};
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::{
     GlobalResourceHandlesProvider, focus_running_window_and_show_native_modal, persistence,
@@ -74,6 +81,37 @@ pub fn web_logout_url() -> String {
         "{}/logout",
         ChannelState::server_root_url().trim_end_matches('/')
     )
+}
+
+/// Returns the configured Warp web logout URL with a validated browser continuation.
+///
+/// TUI logout only continues to the same Warp web origin's device page. This
+/// keeps the logout endpoint from becoming an open redirect if an unexpected
+/// device-authorization response reaches the client.
+#[cfg(feature = "tui")]
+pub fn web_logout_url_with_continue(continue_url: &str) -> Option<String> {
+    let mut logout_url =
+        Url::parse(&web_logout_url()).expect("configured Warp web logout URL must be valid");
+    let continue_url = Url::parse(continue_url).ok()?;
+    let has_required_query = continue_url
+        .query_pairs()
+        .any(|(key, value)| key == "user_code" && !value.is_empty())
+        && continue_url
+            .query_pairs()
+            .any(|(key, value)| key == "source" && value == "warp-agent-cli");
+    if continue_url.origin() != logout_url.origin()
+        || continue_url.path() != "/device"
+        || !continue_url.username().is_empty()
+        || continue_url.password().is_some()
+        || continue_url.fragment().is_some()
+        || !has_required_query
+    {
+        return None;
+    }
+    logout_url
+        .query_pairs_mut()
+        .append_pair("continue", continue_url.as_str());
+    Some(logout_url.into())
 }
 
 /// If the app has running processes or dirty objects, we'll show a confirmation modal before logging out.
@@ -254,6 +292,13 @@ pub fn log_out(app: &mut AppContext) {
     TemplatableMCPServerManager::handle(app).update(app, |manager, ctx| {
         manager.sync_builtin_servers(false, ctx);
     });
+    AIRequestUsageModel::handle(app).update(app, |usage_model, ctx| {
+        usage_model.reset_server_availability(ctx);
+    });
+    if FeatureFlag::ChatGPTSubscription.is_enabled() {
+        ChatGPTSubscriptionModel::handle(app).update(app, |model, ctx| model.reset(ctx));
+    }
+    OneTimeModalModel::handle(app).update(app, |model, _| model.on_log_out());
     BlocklistAIHistoryModel::handle(app).update(app, |history_model, _| {
         history_model.reset();
     });
@@ -286,6 +331,9 @@ pub fn log_out(app: &mut AppContext) {
     AIExecutionProfilesModel::handle(app).update(app, |profiles, _| {
         profiles.reset(settings_profiles_are_explicit);
     });
+    LLMPreferences::handle(app).update(app, |preferences, _| {
+        preferences.reset_session_overrides();
+    });
 
     NotebookManager::handle(app).update(app, |manager, _| manager.reset());
     EnvVarCollectionManager::handle(app).update(app, |manager, _| manager.reset());
@@ -297,14 +345,17 @@ pub fn log_out(app: &mut AppContext) {
         manager.clear_joined();
     });
 
-    // Dispatch action on root view of every open window so the state can be updated
-    // correctly.
+    // Dispatch the GUI root-view action on every open GUI window so its state can be updated
+    // correctly. Other front-ends, such as the TUI, manage their logout transition separately.
     let window_ids = app.window_ids().collect_vec();
     for window_id in window_ids {
-        if let Some(root_view_id) = app.root_view_id(window_id) {
+        if let Some(root_views) = app.views_of_type::<RootView>(window_id) {
+            let Some(root_view) = root_views.first() else {
+                continue;
+            };
             app.dispatch_action(
                 window_id,
-                &[root_view_id],
+                &[root_view.id()],
                 "root_view:log_out",
                 &(),
                 log::Level::Info,

@@ -60,10 +60,11 @@ use vec1::Vec1;
 use vim::vim::{VimHandler, VimMode};
 use warp_cli::agent::Harness;
 use warp_completer::completer::{
-    self, CompleterOptions, CompletionContext, CompletionsFallbackStrategy, Description, Match,
-    MatchStrategy, MatchType, PathSeparators, SuggestionResults,
+    self, CompleterOptions, CompletionContext, CompletionsFallbackStrategy, Description,
+    ExplicitTabCompletion, MatchStrategy, MatchType, PathSeparators, PreparedSuggestion,
+    SuggestionResults,
 };
-use warp_completer::meta::{HasSpan, Spanned};
+use warp_completer::meta::{HasSpan, Span, Spanned};
 use warp_completer::parsers::LiteCommand;
 use warp_completer::parsers::simple::command_at_cursor_position;
 use warp_completer::signatures::CommandRegistry;
@@ -72,7 +73,6 @@ use warp_core::r#async::debounce;
 use warp_core::context_flag::ContextFlag;
 use warp_core::ui::theme::AnsiColorIdentifier;
 use warp_core::ui::theme::color::internal_colors;
-use warp_core::user_preferences::GetUserPreferences as _;
 use warp_editor::editor::NavigationKey;
 use warp_errors::{report_error, report_if_error};
 use warp_util::path::ShellFamily;
@@ -102,7 +102,8 @@ use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::units::IntoPixels;
 use warpui::{
     AppContext, Entity, EntityId, FocusContext, ModelAsRef, ModelHandle, SingletonEntity,
-    TypedActionView, View, ViewContext, ViewHandle, WeakViewHandle, end_trace, start_trace,
+    TypedActionView, View, ViewContext, ViewHandle, ViewUpdateError, WeakViewHandle, end_trace,
+    start_trace,
 };
 
 use self::decorations::InputBackgroundJobOptions;
@@ -114,6 +115,7 @@ use super::ligature_settings::LigatureSettings;
 use super::model::block::{
     AgentInteractionMetadata, BlockId, BlockMetadata, BlocklistEnvVarMetadata,
 };
+use super::model::completions::ShellCompletion;
 use super::model::session::{Session, SessionId, SessionType, Sessions};
 use super::prompt_render_helper::{
     PromptRenderHelper, SameLinePromptElements, should_render_prompt_on_same_line,
@@ -143,7 +145,10 @@ use super::view::{
     ExecuteCommandEvent, PADDING_LEFT as TERMINAL_VIEW_PADDING_LEFT, SyncInputType, TerminalAction,
 };
 use super::warpify::SubshellSource;
-use super::{History, HistoryEntry, SizeInfo, TerminalModel, UpArrowHistoryConfig, prompt};
+use super::{
+    History, HistoryEntry, SizeInfo, TerminalModel, UpArrowHistoryConfig, prompt,
+    should_right_click_paste,
+};
 #[allow(unused_imports)]
 use crate::ASSETS;
 use crate::ai::AIRequestUsageModel;
@@ -154,6 +159,7 @@ use crate::ai::agent::{
 use crate::ai::agent_conversations_model::{
     AgentConversationNavigationSubject, AgentConversationsModel,
 };
+use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::ambient_agents::telemetry::HandoffEntryPoint;
 use crate::ai::attachment_utils::MAX_ATTACHMENT_SIZE_BYTES;
 use crate::ai::block_context::BlockContext;
@@ -181,7 +187,7 @@ use crate::ai::blocklist::{
     QueuedQueryOrigin, SlashCommandRequest, ai_brand_color, ai_indicator_height,
     render_ai_agent_mode_icon, render_ai_follow_up_icon,
 };
-use crate::ai::cloud_agent_settings::CloudAgentSettings;
+use crate::ai::cloud_agent_settings::{AuthSecretPreference, CloudAgentSettings};
 use crate::ai::cloud_environments::CloudAmbientAgentEnvironment;
 use crate::ai::connected_self_hosted_workers::{
     ConnectedSelfHostedWorkersEvent, ConnectedSelfHostedWorkersModel,
@@ -190,7 +196,9 @@ use crate::ai::connected_self_hosted_workers::{
 use crate::ai::conversation_export::export_conversation_markdown;
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentVersion};
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
-use crate::ai::harness_availability::HarnessAvailabilityModel;
+use crate::ai::harness_availability::{
+    CloudAgentStartBlocker, HarnessAvailabilityModel, cloud_agent_start_blocker,
+};
 use crate::ai::llms::{LLMPreferences, LLMPreferencesEvent};
 use crate::ai::mcp::TemplatableMCPServerManager;
 use crate::ai::predict::next_command_model::{
@@ -203,7 +211,7 @@ use crate::ai::predict::prompt_suggestions::{
     is_accept_prompt_suggestion_bound_to_ctrl_enter,
 };
 use crate::ai::skills::{SkillOpenOrigin, SkillTelemetryEvent};
-use crate::ai_assistant::execution_context::WarpAiExecutionContext;
+use crate::ai_assistant::execution_context::execution_context_for_session;
 use crate::appearance::{Appearance, AppearanceEvent};
 use crate::channel::{Channel, ChannelState};
 use crate::cloud_object::model::actions::ObjectActionType;
@@ -253,9 +261,11 @@ use crate::search::slash_command_menu::static_commands::commands::{self, COMMAND
 use crate::server::cloud_objects::update_manager::UpdateManager;
 use crate::server::ids::SyncId;
 use crate::server::server_api::ServerApi;
-use crate::server::server_api::ai::AttachmentFileInfo;
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::server::server_api::ai::AttachmentInput;
+use crate::server::server_api::ai::{AIClient, AttachmentFileInfo};
+use crate::server::server_api::presigned_upload::upload_to_target;
+use crate::server::team_scope::RequestTeamScope;
 use crate::server::telemetry::{
     AICommandSearchEntrypoint, AgentModeAutoDetectionFalsePositivePayload,
     AgentModeAutoDetectionSettingOrigin, AnonymousUserSignupEntrypoint, CommandXRayTrigger,
@@ -316,9 +326,14 @@ use crate::terminal::universal_developer_input::AtContextMenuDisabledReason;
 use crate::terminal::view::ambient_agent::{
     AuthSecretFtuxView, AuthSecretFtuxViewEvent, AuthSecretSelector, AuthSecretSelectorEvent,
     HarnessSelector, HarnessSelectorEvent, HostSelector, HostSelectorEvent, NakedHeaderButtonTheme,
+    cloud_agent_team_required_toast_message,
 };
+use crate::terminal::view::init::{CAN_ATTACH_FILE_KEY, CLI_AGENT_SESSION_ACTIVE_KEY};
 use crate::terminal::view::inline_banner::{PromptSuggestionsEvent, PromptSuggestionsView};
-use crate::terminal::view::{AIQueryRouting, CodeDiffAction, resolve_ai_query_routing};
+use crate::terminal::view::{
+    AIQueryRouting, CodeDiffAction, file_attach_allowed_for_shared_session,
+    resolve_ai_query_routing, resolve_ambient_agent_task_id,
+};
 use crate::ui_components::blended_colors;
 use crate::ui_components::icons::Icon;
 use crate::user_config::WarpConfig;
@@ -349,7 +364,9 @@ use crate::workspace::{
     CommandSearchOptions, ForkFromExchange, ForkedConversationDestination, InitContent,
     RestoreConversationLayout, ToastStack, WorkspaceAction,
 };
-use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
+use crate::workspaces::user_workspaces::{
+    ResolvedTeamScope, TeamContext, UserWorkspaces, UserWorkspacesEvent,
+};
 #[allow(unused_imports)]
 use crate::{AgentModeEntrypoint, ServerApiProvider, cmd_or_ctrl_shift, send_telemetry_from_ctx};
 
@@ -402,8 +419,31 @@ pub fn get_input_box_top_border_width() -> f32 {
     }
 }
 
+/// The host the cloud-mode selector defaults to: the `WARP_CLOUD_MODE_DEFAULT_HOST` override when
+/// set, otherwise the window's team default.
+///
+/// Takes the selector's handle, not `Input`'s: this runs inside `Input::new` before `Input` is in
+/// `view_to_window`, so an `Input` handle would resolve no window here while the already-built
+/// selector's does.
+fn effective_default_host(
+    host_selector: &WeakViewHandle<HostSelector>,
+    app: &AppContext,
+) -> Option<String> {
+    if let Some(slug) = std::env::var("WARP_CLOUD_MODE_DEFAULT_HOST")
+        .ok()
+        .filter(|slug| !slug.is_empty())
+    {
+        return Some(slug);
+    }
+    let workspaces = UserWorkspaces::as_ref(app);
+    workspaces
+        .default_host_slug(&workspaces.team_context(host_selector, app))
+        .map(String::from)
+}
+
 pub const COMPLETIONS_MENU_WIDTH: f32 = 330.;
 pub const OPEN_COMPLETIONS_KEYBINDING_NAME: &str = "input:open_completion_suggestions";
+pub(crate) const EXTERNAL_ALT_C_BINDING_CONTEXT: &str = "ExternalAltCDirectorySearch";
 pub const INPUT_A11Y_LABEL: &str = "Command Input.";
 pub const INPUT_A11Y_HELPER: &str = "Input your shell command, press enter to execute. Press cmd-up to navigate to output of previously executed commands. Press cmd-l to re-focus command input.";
 pub const AI_COMMAND_SEARCH_HINT_TEXT: &str = "Type '#' for AI command suggestions";
@@ -1042,6 +1082,13 @@ pub enum Event {
     SubmitCloudFollowup {
         prompt: String,
     },
+    /// A retained environment-setup-failure pane, or an already attached live viewer of one,
+    /// is requesting a debug follow-up through the authenticated run follow-up service
+    /// (REMOTE-2661).
+    SubmitSetupFailureDebugFollowup {
+        task_id: crate::ai::ambient_agents::AmbientAgentTaskId,
+        prompt: String,
+    },
     /// A viewer in a shared session is requesting to cancel the active agent conversation.
     CancelSharedSessionConversation {
         server_conversation_token: ServerConversationToken,
@@ -1137,6 +1184,10 @@ pub enum InputAction {
     CtrlR,
     CtrlD,
     Up,
+    /// Deferred so Up does not update InlineHistoryMenuView while it is already checked out.
+    SelectPreviousInlineHistoryItem,
+    /// Deferred so Down does not update InlineHistoryMenuView while it is already checked out.
+    SelectNextInlineHistoryItem,
     PageUp,
     PageDown,
     ClearScreen,
@@ -1519,6 +1570,102 @@ fn should_show_completions_in_ai_input(buffer_text: &str) -> bool {
     }
 }
 
+fn strip_control_characters(text: &str) -> Cow<'_, str> {
+    if text.chars().any(|c| c.is_control()) {
+        text.chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .into()
+    } else {
+        text.into()
+    }
+}
+
+/// Which completion sources a request draws on, once the two user toggles and native-completions
+/// eligibility have been resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionSources {
+    None,
+    WarpOnly,
+    NativeOnly,
+    /// Bundled specs first, asking the shell only if they come back empty.
+    WarpThenNative,
+}
+
+impl CompletionSources {
+    fn resolve(warp_completions_enabled: bool, native_shell_completions_eligible: bool) -> Self {
+        match (warp_completions_enabled, native_shell_completions_eligible) {
+            (true, true) => Self::WarpThenNative,
+            (true, false) => Self::WarpOnly,
+            (false, true) => Self::NativeOnly,
+            (false, false) => Self::None,
+        }
+    }
+
+    /// Whether the shell's native completions are consulted for this request.
+    fn uses_native(self) -> bool {
+        matches!(self, Self::NativeOnly | Self::WarpThenNative)
+    }
+}
+
+/// Resolves which [`CompletionSources`] a request draws on from the `NativeShellCompletions`
+/// feature flag, the input type, the trigger, and the two user toggles -- the outer policy that
+/// sits above [`CompletionSources::resolve`].
+fn resolve_completion_sources(
+    feature_flag_enabled: bool,
+    is_ai_input: bool,
+    buffer_text_is_multiline: bool,
+    completions_trigger: CompletionsTrigger,
+    warp_completions_enabled: bool,
+    native_shell_completions_enabled: bool,
+) -> CompletionSources {
+    let (warp_completions_enabled, native_shell_completions_enabled) = if feature_flag_enabled {
+        (warp_completions_enabled, native_shell_completions_enabled)
+    } else {
+        (true, false)
+    };
+
+    if is_ai_input {
+        return CompletionSources::WarpOnly;
+    }
+
+    let native_shell_completions_eligible = completions_trigger != CompletionsTrigger::AsYouType
+        && native_shell_completions_enabled
+        && !buffer_text_is_multiline // For now, don't use native shell completions for multi-line commands.
+        && !is_ai_input;
+
+    CompletionSources::resolve(warp_completions_enabled, native_shell_completions_eligible)
+}
+
+/// Builds [`SuggestionResults`] from a shell's native-completions reply.
+fn native_shell_suggestion_results(
+    shell_results: Vec<ShellCompletion>,
+    shell_replacement_span: Option<Span>,
+    buffer_text: &str,
+    cursor_position: usize,
+) -> SuggestionResults {
+    let suggestions = shell_results.into_iter().map(Into::into).collect_vec();
+    let buffer_text_before_cursor = &buffer_text[0..cursor_position];
+    let replacement_span = match shell_replacement_span {
+        Some(span) => span.clamped_to(buffer_text_before_cursor),
+        None => {
+            // Within the section of the buffer from the start to the end of this token, find the
+            // last whitespace char before the token end; the token starts just after it (or at the
+            // start of the buffer if there's none).
+            let token_start = buffer_text_before_cursor
+                .rfind(char::is_whitespace)
+                .map(|pos| pos + 1)
+                .unwrap_or_default();
+            (token_start, cursor_position).into()
+        }
+    };
+    SuggestionResults {
+        replacement_span,
+        suggestions,
+        match_strategy: MatchStrategy::Fuzzy,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DenyExecutionReason {
     /// Can't execute command because shell bootstrapping is still underway; shell isn't ready to
@@ -1750,6 +1897,46 @@ pub struct Input {
     /// we snapshot the current input contents here so we can restore them after the command
     /// completes and the buffer would normally be cleared.
     input_contents_before_prompt_chip_command: Option<String>,
+
+    pending_shell_widget_handoff: Option<PendingShellWidgetHandoff>,
+}
+
+/// How a completed shell-widget handoff lands its selection. Fish's ctrl-t widget already performs
+/// token-aware replacement and reports the whole line; bash/zsh ctrl-t report a path fragment to
+/// splice at the cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellWidgetApplyMode {
+    Splice,
+    Replace,
+}
+
+struct PendingShellWidgetHandoff {
+    session_id: SessionId,
+    original_buffer: String,
+    selection: Option<String>,
+    block_id: BlockId,
+    apply_mode: ShellWidgetApplyMode,
+    cursor_offset: Option<ByteOffset>,
+}
+
+impl PendingShellWidgetHandoff {
+    fn maybe_apply_selection(&mut self, session_id: SessionId, selection: &str) {
+        if self.session_id != session_id {
+            return;
+        }
+        if !selection.is_empty() {
+            self.selection = Some(selection.to_string());
+        }
+    }
+
+    fn restore_text(&self) -> &str {
+        match (self.apply_mode, &self.selection) {
+            (ShellWidgetApplyMode::Replace, Some(selection)) => selection,
+            (ShellWidgetApplyMode::Replace, None) | (ShellWidgetApplyMode::Splice, _) => {
+                &self.original_buffer
+            }
+        }
+    }
 }
 
 struct AmbientAgentViewState {
@@ -1816,6 +2003,116 @@ impl DeferredRemoteOperations {
     fn flush(&mut self) -> Option<Vec<CrdtOperation>> {
         self.deferred_ops.remove(&self.latest_block_id)
     }
+}
+
+/// Per-attachment outcome from [`upload_pending_attachments_to_task`].
+enum TaskAttachmentUploadOutcome {
+    /// Successfully uploaded to the task's storage bucket. `attachment_id` is the
+    /// server-assigned identifier the new VM downloads at startup.
+    Uploaded {
+        attachment_id: String,
+        file_name: String,
+    },
+    /// Could not be uploaded — decode error, size limit exceeded, or HTTP failure.
+    /// `error` is a human-readable message suitable for display.
+    Failed { file_name: String, error: String },
+}
+
+/// Decode, size-check, and upload `pending_attachments` to the given task's storage
+/// via presigned upload targets obtained from the server. Returns one
+/// [`TaskAttachmentUploadOutcome`] per input attachment in the same order.
+///
+/// The outer `Err` is returned only when [`AIClient::prepare_attachments_for_upload`] fails
+/// (meaning no individual uploads were attempted). Decode errors, size-limit violations,
+/// and individual HTTP failures are surfaced as [`TaskAttachmentUploadOutcome::Failed`]
+/// entries so each caller can choose its own error-handling policy (fail-fast vs. best-effort).
+async fn upload_pending_attachments_to_task(
+    ai_client: Arc<dyn AIClient>,
+    server_api: Arc<ServerApi>,
+    task_id: crate::ai::ambient_agents::AmbientAgentTaskId,
+    pending_attachments: Vec<PendingAttachment>,
+) -> anyhow::Result<Vec<TaskAttachmentUploadOutcome>> {
+    let n = pending_attachments.len();
+    // Reserve a slot for each input attachment; filled below in original order.
+    let mut outcomes: Vec<Option<TaskAttachmentUploadOutcome>> =
+        std::iter::repeat_with(|| None).take(n).collect();
+    // Collect successfully decoded files together with their original index so we can
+    // zip the prepare-upload response back to the correct outcome slot.
+    let mut files_to_upload: Vec<(usize, String, String, Vec<u8>)> = Vec::new();
+
+    for (i, attachment) in pending_attachments.into_iter().enumerate() {
+        let decoded = match attachment {
+            PendingAttachment::File(file) => std::fs::read(&file.file_path)
+                .map(|bytes| (file.file_name.clone(), file.mime_type.clone(), bytes))
+                .map_err(|e| (file.file_name, format!("Failed to read attachment: {e}"))),
+            PendingAttachment::Image(image) => base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .map(|bytes| (image.file_name.clone(), image.mime_type.clone(), bytes))
+                .map_err(|e| (image.file_name, format!("Failed to decode attachment: {e}"))),
+        };
+        match decoded {
+            Ok((file_name, mime_type, bytes)) => {
+                if bytes.len() > MAX_ATTACHMENT_SIZE_BYTES {
+                    outcomes[i] = Some(TaskAttachmentUploadOutcome::Failed {
+                        file_name: file_name.clone(),
+                        error: format!("{file_name} exceeds the 10 MB attachment limit"),
+                    });
+                } else {
+                    files_to_upload.push((i, file_name, mime_type, bytes));
+                }
+            }
+            Err((file_name, error)) => {
+                outcomes[i] = Some(TaskAttachmentUploadOutcome::Failed { file_name, error });
+            }
+        }
+    }
+
+    if !files_to_upload.is_empty() {
+        let file_infos: Vec<AttachmentFileInfo> = files_to_upload
+            .iter()
+            .map(|(_, name, mime, _)| AttachmentFileInfo {
+                filename: name.clone(),
+                mime_type: mime.clone(),
+            })
+            .collect();
+
+        let prepare_response = ai_client
+            .prepare_attachments_for_upload(&task_id, &file_infos)
+            .await?;
+
+        if prepare_response.attachments.len() != files_to_upload.len() {
+            anyhow::bail!(
+                "Attachment upload preparation returned {} targets for {} files",
+                prepare_response.attachments.len(),
+                files_to_upload.len()
+            );
+        }
+
+        for ((orig_idx, file_name, mime_type, file_bytes), upload_info) in files_to_upload
+            .iter()
+            .zip(prepare_response.attachments.iter())
+        {
+            let target = upload_info.resolve_upload_target(mime_type);
+            let result =
+                upload_to_target(server_api.http_client(), &target, file_bytes.clone()).await;
+
+            outcomes[*orig_idx] = Some(match result {
+                Ok(()) => TaskAttachmentUploadOutcome::Uploaded {
+                    attachment_id: upload_info.attachment_id.clone(),
+                    file_name: file_name.clone(),
+                },
+                Err(e) => TaskAttachmentUploadOutcome::Failed {
+                    file_name: file_name.clone(),
+                    error: format!("{e:#}"),
+                },
+            });
+        }
+    }
+
+    Ok(outcomes
+        .into_iter()
+        .map(|o| o.expect("all slots filled during upload_pending_attachments_to_task"))
+        .collect())
 }
 
 pub fn init(app: &mut AppContext) {
@@ -1949,6 +2246,22 @@ pub fn init(app: &mut AppContext) {
         )
         .with_context_predicate(id!("Input"))
         .with_key_binding("tab"),
+        EditableBinding::new(
+            "workspace:trigger_external_ctrl_t_file_search",
+            "External File Search",
+            WorkspaceAction::TriggerExternalCtrlTFileSearch,
+        )
+        .with_enabled(|| FeatureFlag::ShellWidgetHandoff.is_enabled())
+        .with_context_predicate(id!("Input") & !id!("VoltronActive") & !id!("LongRunningCommand"))
+        .with_key_binding("ctrl-t"),
+        EditableBinding::new(
+            "workspace:trigger_external_alt_c_directory_search",
+            "External Directory Search",
+            WorkspaceAction::TriggerExternalAltCDirectorySearch,
+        )
+        .with_enabled(|| FeatureFlag::ShellWidgetHandoff.is_enabled())
+        .with_context_predicate(id!(EXTERNAL_ALT_C_BINDING_CONTEXT))
+        .with_key_binding("alt-c"),
     ]);
 
     if let Some(custom_action) = workflows::CategoriesView::custom_action() {
@@ -2220,15 +2533,8 @@ impl Input {
     ) -> ViewHandle<HostSelector> {
         let view = ctx
             .add_typed_action_view(|ctx| HostSelector::new(menu_positioning_provider.clone(), ctx));
-        // Env var takes priority over workspace setting for developer testing.
-        let effective_host = std::env::var("WARP_CLOUD_MODE_DEFAULT_HOST")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                UserWorkspaces::as_ref(ctx)
-                    .default_host_slug()
-                    .map(String::from)
-            });
+        let weak_view = view.downgrade();
+        let effective_host = effective_default_host(&weak_view, ctx);
         if let Some(slug) = &effective_host {
             view.update(ctx, |selector, ctx| {
                 selector.set_default_host(slug.clone(), ctx);
@@ -2261,32 +2567,42 @@ impl Input {
                 });
             }
         });
-        // Keep the host selector and view model in sync when workspace metadata refreshes (e.g.
-        // admin changes default_host_slug).
+        // Keep the host selector and view model in sync when the host this window should
+        // default to changes: because the admin edited the team's `default_host_slug`, or
+        // because the window moved to a team that configures a different one.
         let view_for_ws = view.clone();
         let vm_for_ws = view_model.clone();
         ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), move |_me, _, event, ctx| {
-            if !matches!(event, UserWorkspacesEvent::TeamsChanged) {
+            // Windows are independent, so a sibling window switching team must not retarget
+            // this one.
+            let affects_this_window = matches!(event, UserWorkspacesEvent::TeamsChanged)
+                || matches!(
+                    event,
+                    UserWorkspacesEvent::WindowTeamChanged { window_id }
+                        if *window_id == ctx.window_id()
+                );
+            if !affects_this_window {
                 return;
             }
-            let effective_host = std::env::var("WARP_CLOUD_MODE_DEFAULT_HOST")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    UserWorkspaces::as_ref(ctx)
-                        .default_host_slug()
-                        .map(String::from)
-                });
-            if let Some(slug) = &effective_host {
-                view_for_ws.update(ctx, |selector, ctx| {
-                    selector.set_default_host(slug.clone(), ctx);
-                });
+            let scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+            ConnectedSelfHostedWorkersModel::handle(ctx).update(ctx, |model, ctx| {
+                model.refresh(&scope, ctx);
+            });
+            // `None` has to be applied, not skipped: it means the window's team configures no
+            // self-hosted default, and leaving the previous value in place would keep the
+            // selector and the run config pointed at another team's worker.
+            let effective_host = effective_default_host(&weak_view, ctx);
+            match effective_host.clone() {
+                Some(slug) => view_for_ws.update(ctx, |selector, ctx| {
+                    selector.set_default_host(slug, ctx);
+                }),
+                None => view_for_ws.update(ctx, |selector, ctx| {
+                    selector.clear_default_host(ctx);
+                }),
             }
-            if let Some(slug) = effective_host {
-                vm_for_ws.update(ctx, |model, _ctx| {
-                    model.set_worker_host(Some(slug));
-                });
-            }
+            vm_for_ws.update(ctx, |model, _ctx| {
+                model.set_worker_host(effective_host);
+            });
         });
         view
     }
@@ -2342,8 +2658,6 @@ impl Input {
             }
         });
 
-        // Cloud-mode side effects on FTUX events: update the pane's harness auth secret, persist
-        // `last_selected_auth_secret`, mark FTUX completed.
         let vm_for_events = view_model.clone();
         ctx.subscribe_to_view(&ftux_view, move |_me, _, event, ctx| match event {
             AuthSecretFtuxViewEvent::SecretSelected { harness, name }
@@ -2353,11 +2667,15 @@ impl Input {
                 vm_for_events.update(ctx, |model, ctx| {
                     model.set_harness_auth_secret_name(Some(name.clone()), ctx);
                 });
+                let team_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
                 CloudAgentSettings::handle(ctx).update(ctx, |settings, ctx| {
                     settings.mark_harness_auth_ftux_completed(harness, ctx);
-                    let mut map = settings.last_selected_auth_secret.value().clone();
-                    map.insert(harness.config_name().to_string(), name);
-                    let _ = settings.last_selected_auth_secret.set_value(map, ctx);
+                    settings.persist_auth_secret_preference(
+                        &team_scope,
+                        harness,
+                        Some(AuthSecretPreference::Named(name)),
+                        ctx,
+                    );
                 });
             }
             AuthSecretFtuxViewEvent::Cancelled => {
@@ -2367,8 +2685,15 @@ impl Input {
             }
             AuthSecretFtuxViewEvent::Skipped { harness } => {
                 let harness = *harness;
+                let team_scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
                 CloudAgentSettings::handle(ctx).update(ctx, |settings, ctx| {
                     settings.mark_harness_auth_ftux_completed(harness, ctx);
+                    settings.persist_auth_secret_preference(
+                        &team_scope,
+                        harness,
+                        Some(AuthSecretPreference::Inherit),
+                        ctx,
+                    );
                 });
             }
             AuthSecretFtuxViewEvent::Failed { .. } => {}
@@ -2829,7 +3154,12 @@ impl Input {
         );
 
         let next_command_model = ctx.add_model(|_| {
-            NextCommandModel::new(sessions.clone(), model.clone(), server_api.clone())
+            NextCommandModel::new(
+                sessions.clone(),
+                model.clone(),
+                server_api.clone(),
+                ai_controller.clone(),
+            )
         });
         ctx.subscribe_to_model(&next_command_model, |me, _, event, ctx| {
             me.handle_next_command_model_event(event, ctx);
@@ -2878,7 +3208,9 @@ impl Input {
                     render_decorator_elements: Some(Box::new(
                         move |app| -> EditorDecoratorElements {
                             let terminal_model = model_clone.lock();
-                            let active_block = terminal_model.block_list().active_block();
+                            let prompt_block = terminal_model
+                                .prompt_block()
+                                .unwrap_or_else(|| terminal_model.block_list().active_block());
 
                             let mut editor_decorator_elements = EditorDecoratorElements::default();
 
@@ -2908,7 +3240,7 @@ impl Input {
                                 editor_decorator_elements.left_notch = lprompt_bottom;
                                 editor_decorator_elements.right_notch = rprompt;
                                 editor_decorator_elements.right_notch_offset_px = Some(
-                                    active_block.rprompt_render_offset(
+                                    prompt_block.rprompt_render_offset(
                                         &input_render_state_model_handle_clone
                                             .as_ref(app)
                                             .size_info,
@@ -3104,7 +3436,7 @@ impl Input {
             None
         };
 
-        let terminal_input_message_bar = ctx.add_view(|ctx| {
+        let terminal_input_message_bar = ctx.add_typed_action_view(|ctx| {
             TerminalInputMessageBar::new(
                 model.clone(),
                 ai_input_model.clone(),
@@ -3126,7 +3458,12 @@ impl Input {
         current_prompt.update(ctx, |prompt_type, ctx| {
             if let PromptType::Dynamic { prompt } = prompt_type {
                 prompt.update(ctx, |current_prompt, ctx| {
-                    current_prompt.subscribe_to_input_editor(editor.clone(), ctx);
+                    current_prompt.subscribe_to_input_editor(
+                        editor.clone(),
+                        agent_view_controller.clone(),
+                        terminal_view_id,
+                        ctx,
+                    );
                 });
             }
         });
@@ -3431,8 +3768,11 @@ impl Input {
                     .attachment_chips
                     .iter()
                     .any(|c| matches!(c.attachment_type, AttachmentType::Image));
-                let vision_supported =
-                    LLMPreferences::as_ref(ctx).vision_supported(ctx, Some(me.terminal_view_id));
+                let scope = ResolvedTeamScope::from_scope(
+                    &UserWorkspaces::as_ref(ctx).team_context_for_view(ctx),
+                );
+                let vision_supported = LLMPreferences::as_ref(ctx)
+                    .vision_supported(&scope, ctx, Some(me.terminal_view_id));
                 if has_image_chips && !vision_supported {
                     let window_id = ctx.window_id();
                     ToastStack::handle(ctx).update(ctx, |ts, ctx| {
@@ -3467,6 +3807,8 @@ impl Input {
             me.handle_prompt_suggestions_event(event, ctx);
         });
 
+        let slash_command_team_context_resolver =
+            UserWorkspaces::team_context_resolver(ctx.handle());
         let slash_command_data_source = ctx.add_model(|ctx| {
             let args = slash_commands::GuiDataSourceArgs {
                 active_session: active_session.clone(),
@@ -3475,6 +3817,7 @@ impl Input {
                 terminal_view_id,
                 // Wired post-construction via `attach_ambient_agent_view_model`.
                 ambient_agent_view_model: None,
+                team_context_resolver: slash_command_team_context_resolver.clone(),
             };
             GuiSlashCommandDataSource::new(args, ctx)
         });
@@ -3495,6 +3838,7 @@ impl Input {
                     terminal_view_id,
                     // Wired post-construction via `attach_ambient_agent_view_model`.
                     ambient_agent_view_model: None,
+                    team_context_resolver: slash_command_team_context_resolver,
                 };
                 Some(ctx.add_model(|ctx| GuiSlashCommandDataSource::for_cloud_mode_v2(args, ctx)))
             } else {
@@ -3877,6 +4221,7 @@ impl Input {
             cloud_mode_composer_slash_command_data_source,
             ephemeral_message_model,
             input_contents_before_prompt_chip_command: None,
+            pending_shell_widget_handoff: None,
         };
 
         #[cfg(feature = "local_fs")]
@@ -3989,6 +4334,22 @@ impl Input {
         ctx: &mut ViewContext<Self>,
     ) {
         // Read the origin before dispatch; the row is removed once it fires.
+        if QueuedQueryModel::as_ref(ctx).is_dispatch_blocked(conversation_id) {
+            return;
+        }
+        if QueuedQueryModel::as_ref(ctx)
+            .queue(conversation_id)
+            .iter()
+            .any(|row| row.id() == query_id && row.shared_session_prompt().is_some())
+        {
+            // "Send now" targets the clicked row specifically, which may not be the queue head
+            // (e.g. after reordering) -- passing `query_id` through dispatches that exact row
+            // instead of whatever currently happens to be at the head.
+            self.ai_controller.update(ctx, |controller, ctx| {
+                controller.dispatch_queued_warp_agent_prompt(conversation_id, Some(query_id), ctx);
+            });
+            return;
+        }
         let origin = QueuedQueryModel::as_ref(ctx)
             .queue(conversation_id)
             .iter()
@@ -4052,6 +4413,38 @@ impl Input {
             .map(AmbientAgentViewState::view_model)
     }
 
+    /// The ambient agent run this pane belongs to, if any.
+    fn ambient_agent_task_id(&self, ctx: &AppContext) -> Option<AmbientAgentTaskId> {
+        resolve_ambient_agent_task_id(self.ambient_agent_view_model(), &self.model.lock(), ctx)
+    }
+
+    /// Blocks a submission for `task_id` while that task is not in [`AgentConversationsModel`]
+    /// yet, starting (or deduping) its fetch and telling the user to retry (REMOTE-2661).
+    /// `resolve_ai_query_routing` can't distinguish an absent task from an ineligible one, and
+    /// treating unknown as ineligible would wrongly fall back to a local conversation. Returns
+    /// `true` when the caller must stop.
+    fn block_submission_while_ambient_task_unresolved(
+        &self,
+        task_id: Option<AmbientAgentTaskId>,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let Some(task_id) = task_id.filter(|task_id| {
+            AgentConversationsModel::as_ref(ctx)
+                .get_task_data(task_id)
+                .is_none()
+        }) else {
+            return false;
+        };
+        AgentConversationsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.get_or_async_fetch_task_data(&task_id, ctx);
+        });
+        self.show_ephemeral_error_toast(
+            "Still checking this session's status — please try sending your message again in a moment.",
+            ctx,
+        );
+        true
+    }
+
     /// Shows a transient error toast for a follow-up submission that was blocked or redirected.
     fn show_ephemeral_error_toast(&self, message: &str, ctx: &mut ViewContext<Self>) {
         let window_id = ctx.window_id();
@@ -4079,6 +4472,25 @@ impl Input {
         // Nothing to route for an empty buffer; let the caller's normal (no-op) handling run.
         if self.editor.as_ref(ctx).buffer_text(ctx).trim().is_empty() {
             return false;
+        }
+
+        // Scoped to an attached ambient live viewer, the case where unresolved eligibility
+        // would otherwise fall through to the ordinary `LiveRemoteVm` path.
+        let is_attached_ambient_viewer = {
+            let model = self.model.lock();
+            model.shared_session_status().is_active_viewer()
+                && (model.is_shared_ambient_agent_session()
+                    || self
+                        .ambient_agent_view_model()
+                        .is_some_and(|m| m.as_ref(ctx).is_ambient_agent()))
+        };
+        if self.block_submission_while_ambient_task_unresolved(
+            is_attached_ambient_viewer
+                .then(|| self.ambient_agent_task_id(ctx))
+                .flatten(),
+            ctx,
+        ) {
+            return true;
         }
 
         // Route by the shared source of truth. A live shared-session viewer forwards to the sharer
@@ -4125,10 +4537,30 @@ impl Input {
                 }
                 true
             }
-            AIQueryRouting::NewCloudVm { .. } => {
+            AIQueryRouting::NewCloudVm { task_id } => {
                 if FeatureFlag::HandoffCloudCloud.is_enabled() {
                     let prompt = self.editor.as_ref(ctx).buffer_text(ctx).trim().to_owned();
-                    ctx.emit(Event::SubmitCloudFollowup { prompt });
+                    let pending_attachments = self
+                        .ai_context_model
+                        .as_ref(ctx)
+                        .pending_attachments()
+                        .to_vec();
+                    if Self::should_upload_cloud_followup_attachments(&pending_attachments) {
+                        self.freeze_input_in_loading_state(ctx);
+                        self.upload_files_then_submit_cloud_followup(
+                            task_id,
+                            prompt,
+                            pending_attachments,
+                            ctx,
+                        );
+                    } else {
+                        if !pending_attachments.is_empty() {
+                            log::warn!(
+                                "Cannot upload cloud follow-up attachments: CloudModeImageContext is disabled"
+                            );
+                        }
+                        ctx.emit(Event::SubmitCloudFollowup { prompt });
+                    }
                 } else {
                     // Cloud-to-cloud follow-up is unavailable; block rather than run locally.
                     self.show_ephemeral_error_toast(
@@ -4145,7 +4577,18 @@ impl Input {
                 );
                 true
             }
+            AIQueryRouting::RetainedSetupFailureDebug { task_id } => {
+                // Every authenticated origin converges on the same follow-up service call,
+                // never the direct viewer prompt path or the local agent (REMOTE-2661).
+                let prompt = self.editor.as_ref(ctx).buffer_text(ctx).trim().to_owned();
+                ctx.emit(Event::SubmitSetupFailureDebugFollowup { task_id, prompt });
+                true
+            }
         }
+    }
+
+    fn should_upload_cloud_followup_attachments(pending_attachments: &[PendingAttachment]) -> bool {
+        !pending_attachments.is_empty() && FeatureFlag::CloudModeImageContext.is_enabled()
     }
 
     /// Primary entry point for submitting the input buffer as an AI query. Routes to the correct
@@ -4525,9 +4968,13 @@ impl Input {
     /// front instead of failing at spawn time.
     #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
     fn block_cloud_handoff_if_model_unsupported(&self, ctx: &mut ViewContext<Self>) -> bool {
-        if LLMPreferences::as_ref(ctx)
-            .is_active_base_model_cloud_runnable(self.terminal_view_id, ctx)
-        {
+        let scope =
+            ResolvedTeamScope::from_scope(&UserWorkspaces::as_ref(ctx).team_context_for_view(ctx));
+        if LLMPreferences::as_ref(ctx).is_active_base_model_cloud_runnable(
+            &scope,
+            self.terminal_view_id,
+            ctx,
+        ) {
             return false;
         }
         let window_id = ctx.window_id();
@@ -5006,10 +5453,14 @@ impl Input {
                     .id()
                     .clone();
 
+                let scope = ResolvedTeamScope::from_scope(
+                    &UserWorkspaces::as_ref(ctx).team_context_for_view(ctx),
+                );
                 match selected_tab {
                     InlineModelSelectorTab::BaseAgent => {
                         LLMPreferences::handle(ctx).update(ctx, |preferences, ctx| {
                             preferences.update_preferred_agent_mode_llm(
+                                &scope,
                                 id,
                                 self.terminal_view_id,
                                 ctx,
@@ -5258,13 +5709,19 @@ impl Input {
         let has_input = !self.editor.as_ref(ctx).buffer_text(ctx).is_empty();
         let should_clear_prompt_for_search =
             has_input && FeatureFlag::RestorePromptOnInlineModelSelectorSearch.is_enabled();
-        self.inline_model_selector_view.update(ctx, |view, ctx| {
-            if has_input && !should_clear_prompt_for_search {
-                view.set_filter_results_by_input(false);
-            }
-            view.set_prompt_parked_for_search(should_clear_prompt_for_search);
-            view.set_active_tab(initial_tab, ctx);
-        });
+        match self
+            .inline_model_selector_view
+            .try_update(ctx, |view, ctx| {
+                if has_input && !should_clear_prompt_for_search {
+                    view.set_filter_results_by_input(false);
+                }
+                view.set_prompt_parked_for_search(should_clear_prompt_for_search);
+                view.set_active_tab(initial_tab, ctx);
+            }) {
+            Ok(()) => {}
+            Err(ViewUpdateError::WindowClosed) => return,
+            Err(ViewUpdateError::CircularUpdate) => panic!("Circular view update"),
+        }
         self.suggestions_mode_model.update(ctx, |model, ctx| {
             model.set_mode(InputSuggestionsMode::ModelSelector, ctx);
         });
@@ -6006,7 +6463,9 @@ impl Input {
 
         let llm_prefs = LLMPreferences::as_ref(ctx);
 
-        let vision_supported = llm_prefs.vision_supported(ctx, Some(self.terminal_view_id));
+        let scope =
+            ResolvedTeamScope::from_scope(&UserWorkspaces::as_ref(ctx).team_context_for_view(ctx));
+        let vision_supported = llm_prefs.vision_supported(&scope, ctx, Some(self.terminal_view_id));
 
         let num_images_attached = self.ai_context_model.as_ref(ctx).pending_images().len();
 
@@ -6109,7 +6568,12 @@ impl Input {
         triggered_from: ZeroStatePromptSuggestionTriggeredFrom,
         ctx: &mut ViewContext<Self>,
     ) {
-        if !AIRequestUsageModel::as_ref(ctx).has_any_ai_remaining(ctx) {
+        let has_any_ai = {
+            let user_workspaces = UserWorkspaces::as_ref(ctx);
+            let scope = user_workspaces.team_context_for_view(ctx);
+            AIRequestUsageModel::as_ref(ctx).has_any_ai_remaining(&scope, ctx)
+        };
+        if !has_any_ai {
             return;
         }
 
@@ -6217,8 +6681,12 @@ impl Input {
                 let command = render_prompt_chip_shell_command(command, shell_type);
                 // Snapshot the current input so we can restore it after the command completes.
                 let current_input = self.buffer_text(ctx);
-                if self.try_execute_command_from_source(&command, CommandExecutionSource::User, ctx)
-                {
+                if self.try_execute_command_from_source(
+                    &command,
+                    CommandExecutionSource::User,
+                    true,
+                    ctx,
+                ) {
                     self.cancel_active_conversation(ctx, CancellationReason::UserCommandExecuted);
                     if !current_input.is_empty() {
                         self.input_contents_before_prompt_chip_command = Some(current_input);
@@ -6330,6 +6798,10 @@ impl Input {
     fn is_pane_focused(&self, app: &AppContext) -> bool {
         // If the focus handle hasn't been set yet, assume we're not in a split pane and therefore focused.
         self.focus_handle.as_ref().is_none_or(|h| h.is_focused(app))
+    }
+
+    pub(super) fn team_scope<'a>(&self, app: &'a AppContext) -> TeamContext<'a> {
+        UserWorkspaces::as_ref(app).team_context(&self.weak_view_handle, app)
     }
 
     fn is_active_session(&self, app: &AppContext) -> bool {
@@ -6521,6 +6993,10 @@ impl Input {
                 self.check_and_update_ai_context_menu_disabled_state(ctx);
                 ctx.notify();
             }
+            InputSettingsChangedEvent::EnableAiCommandSearchHashTrigger { .. } => {
+                self.set_zero_state_hint_text(ctx);
+                ctx.notify();
+            }
             InputSettingsChangedEvent::CompletionsMenuWidth { .. } => {
                 let new_value = *input_settings.as_ref(ctx).completions_menu_width.value();
                 if let Ok(mut guard) = self.completions_menu_resizable_width.lock() {
@@ -6580,6 +7056,12 @@ impl Input {
         if did_start_listening {
             self.focus_input_box(ctx);
         }
+    }
+
+    pub(crate) fn attach_file(&mut self, ctx: &mut ViewContext<Self>) {
+        self.agent_input_footer.update(ctx, |footer, ctx| {
+            footer.select_file(ctx);
+        });
     }
 
     fn select_image(&mut self, ctx: &mut ViewContext<Self>) {
@@ -6853,7 +7335,15 @@ impl Input {
 
         // If the last block was empty, don't create any suggestions.
         // Also don't create suggestions for requested commands part of an agent mode conversation.
-        if block_completed.command.is_empty() || block_completed.was_part_of_agent_interaction {
+        if block_completed
+            .command
+            .get_with(|compute| {
+                let model = self.model.lock();
+                compute(model.block_list())
+            })
+            .is_empty()
+            || block_completed.was_part_of_agent_interaction
+        {
             return;
         }
 
@@ -6877,9 +7367,12 @@ impl Input {
         let Some(session) = self.active_session(ctx) else {
             return;
         };
-        let context = WarpAiExecutionContext::new(&session);
+        let context = execution_context_for_session(&session);
         let completer_data = self.completer_data();
-        let block_context = Some(BlockContext::from_completed_block(&block_completed));
+        let block_context = Some(BlockContext::from_completed_block(
+            &block_completed,
+            &self.model,
+        ));
         let previous_result = self.last_intelligent_autosuggestion_result.take();
         self.next_command_model.update(ctx, |model, ctx| {
             model.generate_next_command_suggestion(
@@ -7015,9 +7508,16 @@ impl Input {
                 self.editor.update(ctx, |editor, ctx| {
                     editor.set_placeholder_text(hint_text, ctx);
                 });
-            } else {
+            } else if *InputSettings::as_ref(ctx).enable_ai_command_search_hash_trigger {
                 self.editor.update(ctx, |editor, ctx| {
                     editor.set_placeholder_text(AI_COMMAND_SEARCH_HINT_TEXT, ctx);
+                });
+            } else {
+                // Don't advertise the '#' shorthand when the user has disabled it;
+                // AI Command Search remains reachable via its keybinding.
+                self.editor.update(ctx, |editor, ctx| {
+                    editor.clear_placeholder_text(ctx);
+                    ctx.notify();
                 });
             }
         } else {
@@ -7263,6 +7763,7 @@ impl Input {
                 ai_metadata: None,
                 preserve_input,
             },
+            true,
             ctx,
         )
     }
@@ -7302,6 +7803,61 @@ impl Input {
 
     pub fn try_execute_command(&mut self, command: &str, ctx: &mut ViewContext<Self>) -> bool {
         self.try_execute_command_with_options(command, false, ctx)
+    }
+
+    /// Applies `selection` only if `session_id` matches the in-flight handoff.
+    pub fn set_external_shell_widget_selection(&mut self, session_id: SessionId, selection: &str) {
+        let Some(handoff) = self.pending_shell_widget_handoff.as_mut() else {
+            return;
+        };
+        handoff.maybe_apply_selection(session_id, selection);
+    }
+
+    /// Runs `helper_command` (a bootstrap-installed shell function), snapshotting the current
+    /// buffer so it can be restored once the command's block completes. Returns `true` if the
+    /// command was started.
+    pub fn trigger_external_shell_widget_handoff(
+        &mut self,
+        helper_command: &str,
+        apply_mode: ShellWidgetApplyMode,
+        capture_cursor: bool,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let Some(session_id) = self.active_block_session_id() else {
+            return false;
+        };
+        let original_buffer = self.buffer_text(ctx);
+        let cursor_offset = capture_cursor.then(|| {
+            self.editor
+                .as_ref(ctx)
+                .end_byte_index_of_last_selection(ctx)
+        });
+        let block_id = self.model.lock().block_list().active_block_id().clone();
+        // Prefixed with a leading space, the "ignorespace" convention.
+        let mut command = format!(" {helper_command}");
+        if let Some(cursor_offset) = cursor_offset
+            && apply_mode == ShellWidgetApplyMode::Replace
+        {
+            let char_cursor = original_buffer[..cursor_offset.as_usize()].chars().count();
+            command.push_str(&format!(" {char_cursor}:{}", hex::encode(&original_buffer)));
+        }
+        let started = self.try_execute_command_from_source(
+            &command,
+            CommandExecutionSource::User,
+            false, /* should_add_command_to_history */
+            ctx,
+        );
+        if started {
+            self.pending_shell_widget_handoff = Some(PendingShellWidgetHandoff {
+                session_id,
+                original_buffer,
+                selection: None,
+                block_id,
+                apply_mode,
+                cursor_offset,
+            });
+        }
+        started
     }
 
     fn try_execute_command_with_options(
@@ -7347,10 +7903,11 @@ impl Input {
             self.try_execute_command_from_source(
                 command,
                 CommandExecutionSource::QueuedCommand,
+                true,
                 ctx,
             )
         } else {
-            self.try_execute_command_from_source(command, CommandExecutionSource::User, ctx)
+            self.try_execute_command_from_source(command, CommandExecutionSource::User, true, ctx)
         }
     }
 
@@ -7394,6 +7951,7 @@ impl Input {
         &mut self,
         command: &str,
         source: CommandExecutionSource,
+        should_add_command_to_history: bool,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
         if let CanExecuteCommand::No(reason) = self.can_execute_command(ctx) {
@@ -7551,7 +8109,12 @@ impl Input {
                 });
             }
 
-            self.start_block_and_write_command_to_pty(command, source, ctx);
+            self.start_block_and_write_command_to_pty(
+                command,
+                source,
+                should_add_command_to_history,
+                ctx,
+            );
             did_execute = true;
         } else {
             // We don't want to submit the command if precmd has not
@@ -7656,6 +8219,23 @@ impl Input {
                 editor.set_text_colors(TextColors::from_appearance(appearance), ctx);
             });
         }
+    }
+
+    /// Restores a VM-down cloud follow-up after an attachment upload fails. Unlike
+    /// [`Self::unfreeze_agent_input`], this path runs on a disconnected cloud pane rather than an
+    /// active shared-session viewer, so it must restore the visible prompt and editable state
+    /// directly.
+    fn restore_cloud_followup_input_after_upload_failure(
+        &mut self,
+        prompt: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.editor.update(ctx, |editor, ctx| {
+            editor.set_buffer_text(prompt, ctx);
+            editor.set_interaction_state(InteractionState::Editable, ctx);
+            let appearance: &Appearance = Appearance::as_ref(ctx);
+            editor.set_text_colors(TextColors::from_appearance(appearance), ctx);
+        });
     }
 
     pub fn reset_after_cloud_followup_submission(&mut self, ctx: &mut ViewContext<Self>) {
@@ -8984,6 +9564,44 @@ impl Input {
         ctx.notify();
     }
 
+    fn select_previous_inline_history_item(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self
+            .suggestions_mode_model
+            .as_ref(ctx)
+            .is_inline_history_menu()
+        {
+            return;
+        }
+
+        if self.is_cloud_mode_input_v2_composing(ctx) {
+            if let Some(view) = self.cloud_mode_v2_history_menu_view.clone() {
+                view.update(ctx, |view, ctx| view.select_up(ctx));
+            }
+        } else {
+            self.inline_history_menu_view
+                .update(ctx, |view, ctx| view.select_up(ctx));
+        }
+    }
+
+    fn select_next_inline_history_item(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self
+            .suggestions_mode_model
+            .as_ref(ctx)
+            .is_inline_history_menu()
+        {
+            return;
+        }
+
+        if self.is_cloud_mode_input_v2_composing(ctx) {
+            if let Some(view) = self.cloud_mode_v2_history_menu_view.clone() {
+                view.update(ctx, |view, ctx| view.select_down(ctx));
+            }
+        } else {
+            self.inline_history_menu_view
+                .update(ctx, |view, ctx| view.select_down(ctx));
+        }
+    }
+
     fn editor_up(&mut self, ctx: &mut ViewContext<Self>) {
         if self.should_show_auth_secret_ftux(ctx) {
             if let Some(ftux_view) = self.auth_secret_ftux_view().cloned() {
@@ -9089,17 +9707,7 @@ impl Input {
                 true
             }
             InputSuggestionsMode::InlineHistoryMenu { .. } => {
-                if self.is_cloud_mode_input_v2_composing(ctx) {
-                    if let Some(view) = self.cloud_mode_v2_history_menu_view.clone() {
-                        view.update(ctx, |view, ctx| {
-                            view.select_up(ctx);
-                        });
-                    }
-                } else {
-                    self.inline_history_menu_view.update(ctx, |view, ctx| {
-                        view.select_up(ctx);
-                    });
-                }
+                ctx.dispatch_typed_action_deferred(InputAction::SelectPreviousInlineHistoryItem);
                 true
             }
             InputSuggestionsMode::IndexedReposMenu => {
@@ -9483,17 +10091,7 @@ impl Input {
             .as_ref(ctx)
             .is_inline_history_menu()
         {
-            if self.is_cloud_mode_input_v2_composing(ctx) {
-                if let Some(view) = self.cloud_mode_v2_history_menu_view.clone() {
-                    view.update(ctx, |view, ctx| {
-                        view.select_down(ctx);
-                    });
-                }
-            } else {
-                self.inline_history_menu_view.update(ctx, |view, ctx| {
-                    view.select_down(ctx);
-                });
-            }
+            ctx.dispatch_typed_action_deferred(InputAction::SelectNextInlineHistoryItem);
             return;
         }
 
@@ -9572,7 +10170,7 @@ impl Input {
             let Some(session) = self.active_session(ctx) else {
                 return;
             };
-            let context = WarpAiExecutionContext::new(&session);
+            let context = execution_context_for_session(&session);
             if let Some(last_user_block_completed) =
                 completer_data.last_user_block_completed.clone()
             {
@@ -9611,6 +10209,31 @@ impl Input {
             .get_ignored_suggestions_for_type(SuggestionType::ShellCommand);
         #[cfg(feature = "local_fs")]
         let conn = self.conn.clone();
+        // Resolve the last completed block's lazily-computed fields now, synchronously, since the
+        // spawned future below doesn't have access to the terminal model to resolve them later.
+        #[cfg(feature = "local_fs")]
+        let last_user_block_completed_data =
+            completer_data
+                .last_user_block_completed
+                .as_ref()
+                .map(|block| {
+                    (
+                        block
+                            .command
+                            .get_with(|compute| {
+                                let model = self.model.lock();
+                                compute(model.block_list())
+                            })
+                            .to_owned(),
+                        block
+                            .serialized_block
+                            .get_with(|compute| {
+                                let model = self.model.lock();
+                                compute(model.block_list())
+                            })
+                            .clone(),
+                    )
+                });
         let abort_handle = ctx
             .spawn_abortable(
                 async move {
@@ -9618,14 +10241,17 @@ impl Input {
                     // First, use rich history to find commands with a matching prefix that were run
                     // in a similar context, taking into account the most recent block run.
                     if let Some(conn) = conn
-                        && let Some(last_user_block_completed) =
-                            &completer_data.last_user_block_completed
+                        && let Some((last_command, last_serialized_block)) =
+                            &last_user_block_completed_data
                     {
                         let similar_history_contexts = {
                             let mut conn = conn.lock();
                             NextCommandModel::get_similar_history_context(
                                 &mut conn,
-                                last_user_block_completed,
+                                last_command,
+                                &last_serialized_block.pwd,
+                                last_serialized_block.exit_code,
+                                last_serialized_block.shell_host.as_ref(),
                                 0,
                             )
                         };
@@ -10301,6 +10927,7 @@ impl Input {
                 }
 
                 if AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+                    && *InputSettings::as_ref(ctx).enable_ai_command_search_hash_trigger
                     && self.editor_starts_with_command_search_trigger(ctx)
                     && *edit_origin == EditOrigin::UserTyped
                     && !self.ai_input_model.as_ref(ctx).is_ai_input_enabled()
@@ -12086,33 +12713,30 @@ impl Input {
         ctx: &mut ViewContext<'_, Input>,
     ) {
         let buffer_text = self.buffer_text(ctx);
+        let input_type = self.ai_input_model.as_ref(ctx).input_type();
 
-        // The 'ForceNativeShellCompletions' user pref can be used to unconditionally
-        // generate and show native shell completion results (i.e. regardless of whether or
-        // not we have completion results via completion specs).
-        let force_native_shell_completions = ctx
-            .private_user_preferences()
-            .read_value("ForceNativeShellCompletions")
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(false);
+        let comp_sources = {
+            let input_settings = InputSettings::as_ref(ctx);
+            resolve_completion_sources(
+                FeatureFlag::NativeShellCompletions.is_enabled(),
+                input_type.is_ai(),
+                buffer_text.contains('\n'),
+                completions_trigger,
+                *input_settings.warp_completions_enabled,
+                *input_settings.native_shell_completions_enabled,
+            )
+        };
 
-        let use_native_shell_completions = (FeatureFlag::NativeShellCompletions.is_enabled() || force_native_shell_completions)
-            && completion_context
-                .session
-                .shell()
-                .supports_native_shell_completions()
-            // For now, don't use native shell completions for multi-line commands.
-            && !buffer_text.contains('\n');
-
-        let fallback_strategy = match completions_trigger {
-            CompletionsTrigger::Keybinding | CompletionsTrigger::SlashCommandAutoOpen
-                if !use_native_shell_completions =>
-            {
-                CompletionsFallbackStrategy::FilePaths
+        let fallback_strategy = {
+            let use_native_shell_completions = comp_sources.uses_native();
+            match completions_trigger {
+                CompletionsTrigger::Keybinding | CompletionsTrigger::SlashCommandAutoOpen
+                    if !use_native_shell_completions =>
+                {
+                    CompletionsFallbackStrategy::FilePaths
+                }
+                _ => CompletionsFallbackStrategy::None,
             }
-            _ => CompletionsFallbackStrategy::None,
         };
 
         if self.is_completions_while_typing_turned_on(ctx)
@@ -12120,8 +12744,6 @@ impl Input {
         {
             last_abort_handle.abort();
         }
-
-        let input_type = self.ai_input_model.as_ref(ctx).input_type();
 
         // Don't trigger completions if the last character typed is whitespace, in AI input mode.
         // The user is likely typing in a natural language word at this point, not a filepath.
@@ -12140,7 +12762,86 @@ impl Input {
         });
 
         let cursor_position = cursor_position.as_usize();
-        let native_results_fut = if use_native_shell_completions {
+
+        if comp_sources == CompletionSources::None {
+            if let Some(last_abort_handle) = self.completions_abort_handle.take() {
+                last_abort_handle.abort();
+            }
+            return;
+        }
+
+        if comp_sources == CompletionSources::WarpThenNative {
+            let completion_session = completion_context.session.clone();
+            let abort_handle = ctx
+                .spawn_abortable(
+                    async move {
+                        let spec_suggestions = completer::suggestions(
+                            before_cursor_text.as_str(),
+                            cursor_position,
+                            session_env_vars.as_ref(),
+                            CompleterOptions {
+                                match_strategy: matcher,
+                                fallback_strategy,
+                                suggest_file_path_completions_only: input_type.is_ai(),
+                                parse_quotes_as_literals: input_type.is_ai(),
+                            },
+                            &completion_context,
+                        )
+                        .await;
+                        (
+                            spec_suggestions,
+                            completions_trigger,
+                            editor_snapshot,
+                            completion_context,
+                            session_env_vars,
+                        )
+                    },
+                    move |input,
+                          (
+                        spec_suggestions,
+                        completions_trigger,
+                        editor_snapshot,
+                        completion_context,
+                        session_env_vars,
+                    ),
+                          ctx| {
+                        let bundled_specs_empty = match &spec_suggestions {
+                            Some(spec_suggestions) => spec_suggestions.suggestions.is_empty(),
+                            None => true,
+                        };
+                        if bundled_specs_empty {
+                            // Phase two: the bundled specs produced nothing, so ask the shell now.
+                            input.dispatch_native_shell_completions(
+                                buffer_text,
+                                cursor_position,
+                                matcher,
+                                completion_context,
+                                session_env_vars,
+                                completions_trigger,
+                                editor_snapshot,
+                                ctx,
+                            );
+                        } else {
+                            // A bundled spec won; the shell is never asked.
+                            input.handle_completion_suggestions_results(
+                                spec_suggestions,
+                                completions_trigger,
+                                editor_snapshot,
+                                ctx,
+                            );
+                        }
+                    },
+                    move |_, _| {
+                        completion_session.cancel_active_commands();
+                    },
+                )
+                .abort_handle();
+            self.completions_abort_handle = Some(abort_handle);
+            return;
+        }
+
+        let dispatch_native_up_front = comp_sources == CompletionSources::NativeOnly;
+        let native_results_fut = if dispatch_native_up_front {
             // If we're using native shell completions, construct a future that
             // will be resolved with any completions data provided by the shell.
             let (results_tx, results_rx) = async_channel::unbounded();
@@ -12160,6 +12861,38 @@ impl Input {
         let abort_handle = ctx
             .spawn_abortable(
                 async move {
+                    if comp_sources == CompletionSources::NativeOnly {
+                        let native_suggestions =
+                            native_results_fut
+                                .await
+                                .map(|(results, shell_replacement_span)| {
+                                    native_shell_suggestion_results(
+                                        results,
+                                        shell_replacement_span,
+                                        &buffer_text,
+                                        cursor_position,
+                                    )
+                                });
+                        let suggestions = match native_suggestions {
+                            Some(suggestions) if suggestions.suggestions.is_empty() => {
+                                completer::suggestions(
+                                    before_cursor_text.as_str(),
+                                    cursor_position,
+                                    session_env_vars.as_ref(),
+                                    CompleterOptions {
+                                        match_strategy: matcher,
+                                        fallback_strategy: CompletionsFallbackStrategy::FilePaths,
+                                        suggest_file_path_completions_only: true,
+                                        parse_quotes_as_literals: false,
+                                    },
+                                    &completion_context,
+                                )
+                                .await
+                            }
+                            suggestions => suggestions,
+                        };
+                        return (suggestions, completions_trigger, editor_snapshot);
+                    }
                     let suggestions = completer::suggestions(
                         before_cursor_text.as_str(),
                         cursor_position,
@@ -12175,29 +12908,17 @@ impl Input {
                     .await;
 
                     let suggestions = match suggestions {
-                        Some(s) if !s.suggestions.is_empty() && !force_native_shell_completions => {
-                            Some(s)
-                        }
-                        _ => native_results_fut.await.map(|results| {
-                            let suggestions = results.into_iter().map(Into::into).collect_vec();
-
-                            let token_end = cursor_position;
-                            // Within the section of the buffer from the start
-                            // to the end of this token...
-                            let token_start = buffer_text[0..token_end]
-                                // Find the last whitespace char before the token end.
-                                .rfind(char::is_whitespace)
-                                // If we find one, the token start is the next char.
-                                .map(|pos| pos + 1)
-                                // Otherwise, the start is the beginning of the buffer.
-                                .unwrap_or_default();
-
-                            SuggestionResults {
-                                replacement_span: (token_start, token_end).into(),
-                                suggestions,
-                                match_strategy: MatchStrategy::Fuzzy,
-                            }
-                        }),
+                        Some(s) if !s.suggestions.is_empty() => Some(s),
+                        _ => native_results_fut
+                            .await
+                            .map(|(results, shell_replacement_span)| {
+                                native_shell_suggestion_results(
+                                    results,
+                                    shell_replacement_span,
+                                    &buffer_text,
+                                    cursor_position,
+                                )
+                            }),
                     };
 
                     (suggestions, completions_trigger, editor_snapshot)
@@ -12216,6 +12937,83 @@ impl Input {
             )
             .abort_handle();
 
+        self.completions_abort_handle = Some(abort_handle);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_native_shell_completions(
+        &mut self,
+        buffer_text: String,
+        cursor_position: usize,
+        matcher: MatchStrategy,
+        completion_context: SessionContext,
+        session_env_vars: Option<HashMap<String, String>>,
+        completions_trigger: CompletionsTrigger,
+        editor_snapshot: EditorSnapshot,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // If the buffer moved on while the spec pass ran, this request is stale.
+        let current_editor_model = self
+            .editor
+            .read(ctx, |editor, ctx| editor.snapshot_model(ctx));
+        let buffer_text_now = self.editor.as_ref(ctx).buffer_text(ctx);
+        if buffer_text_now != editor_snapshot.text()
+            || current_editor_model.selections() != editor_snapshot.selections()
+        {
+            return;
+        }
+
+        let (results_tx, results_rx) = async_channel::unbounded();
+        ctx.dispatch_typed_action(&TerminalAction::RunNativeShellCompletions {
+            buffer_text: buffer_text[0..cursor_position].to_owned(),
+            results_tx,
+        });
+        let completion_session = completion_context.session.clone();
+
+        let abort_handle = ctx
+            .spawn_abortable(
+                async move {
+                    let native_suggestions = results_rx.recv().await.ok().map(|(results, span)| {
+                        native_shell_suggestion_results(
+                            results,
+                            span,
+                            &buffer_text,
+                            cursor_position,
+                        )
+                    });
+                    let suggestions = match native_suggestions {
+                        Some(suggestions) if suggestions.suggestions.is_empty() => {
+                            completer::suggestions(
+                                &buffer_text[..cursor_position],
+                                cursor_position,
+                                session_env_vars.as_ref(),
+                                CompleterOptions {
+                                    match_strategy: matcher,
+                                    fallback_strategy: CompletionsFallbackStrategy::FilePaths,
+                                    suggest_file_path_completions_only: true,
+                                    parse_quotes_as_literals: false,
+                                },
+                                &completion_context,
+                            )
+                            .await
+                        }
+                        suggestions => suggestions,
+                    };
+                    (suggestions, completions_trigger, editor_snapshot)
+                },
+                |input, (suggestions, completions_trigger, editor_model), ctx| {
+                    input.handle_completion_suggestions_results(
+                        suggestions,
+                        completions_trigger,
+                        editor_model,
+                        ctx,
+                    );
+                },
+                move |_, _| {
+                    completion_session.cancel_active_commands();
+                },
+            )
+            .abort_handle();
         self.completions_abort_handle = Some(abort_handle);
     }
 
@@ -12412,130 +13210,113 @@ impl Input {
                 });
             }
             Some(results) => {
-                match (results.single_prefix_suggestion(), completions_trigger) {
-                    (Some(only_prefix_suggestion), CompletionsTrigger::Keybinding) => {
-                        // If there is exactly one prefix suggestion, just insert into the buffer.
+                let query = results.replacement_span.slice(&buffer_text);
+                let buffer_text_original = buffer_text
+                    [0..self.start_byte_index_of_last_selection(ctx).as_usize()]
+                    .to_string();
+                let decision = if completions_trigger == CompletionsTrigger::Keybinding {
+                    results.explicit_tab_completion(query, self.path_separators(ctx).all)
+                } else {
+                    ExplicitTabCompletion::Open {
+                        suggestions: results
+                            .prepare_for_query(query, self.path_separators(ctx).all),
+                        replacement_span: results.replacement_span,
+                    }
+                };
+                let prepared_suggestions: Vec<PreparedSuggestion> = match decision {
+                    ExplicitTabCompletion::NoAction => {
+                        self.suggestions_mode_model.update(ctx, |model, ctx| {
+                            model.set_mode(InputSuggestionsMode::Closed, ctx);
+                        });
+                        ctx.notify();
+                        return;
+                    }
+                    ExplicitTabCompletion::InsertSingle {
+                        suggestion,
+                        replacement_span,
+                    } => {
                         self.insert_completion_result_into_editor(
-                            only_prefix_suggestion.replacement(),
-                            results.replacement_span.start(),
+                            &suggestion.suggestion.replacement,
+                            replacement_span.start(),
                             Executing::No,
                             ctx,
                         );
+                        ctx.notify();
+                        return;
                     }
-                    (_, completions_trigger) => {
-                        let buffer_text_original = buffer_text
-                            [0..self.start_byte_index_of_last_selection(ctx).as_usize()]
-                            .to_string();
+                    ExplicitTabCompletion::InsertCommonPrefixAndOpen {
+                        common_prefix,
+                        suggestions,
+                        replacement_span,
+                    } => {
+                        self.insert_completion_prefix_into_editor(
+                            ctx,
+                            &common_prefix,
+                            replacement_span.start(),
+                        );
+                        suggestions
+                    }
+                    ExplicitTabCompletion::Open { suggestions, .. } => suggestions,
+                };
 
-                        if completions_trigger == CompletionsTrigger::Keybinding
-                            && let Some(common_prefix) = longest_common_prefix(
-                                results
-                                    .suggestions
-                                    .iter()
-                                    .filter(|suggestion| {
-                                        // Ignore fuzzy matches and case-insensitive matches
-                                        // when calculating the longest common prefix, so we
-                                        // are able to insert a common prefix more often.
-                                        matches!(
-                                            suggestion.match_type,
-                                            Match::Prefix {
-                                                is_case_sensitive: true
-                                            } | Match::Exact {
-                                                is_case_sensitive: true
-                                            }
-                                        )
-                                    })
-                                    .map(|suggestion| suggestion.replacement()),
-                            )
-                        {
-                            // Insert the common prefix if it is longer than what the user has
-                            // already typed. This check is necessary because the suggestions
-                            // are case-insensitive, while the common prefix is necessarily
-                            // case-sensitive. That can lead to the common prefix being shorter
-                            // than the input, causing confusing behavior where the input is
-                            // truncated. Also, only fill in the common prefix if the
-                            // replacement itself is a prefix of the common prefix. If there
-                            // are only fuzzy completions, then it's possible this is not the
-                            // case, and we don't want to fill in the common prefix in that
-                            // case.
-                            let replacement_start = results.replacement_span.start();
-                            let current_word = &buffer_text_original[replacement_start
-                                ..self.start_byte_index_of_last_selection(ctx).as_usize()];
-                            if common_prefix.len() > results.replacement_span.distance()
-                                && common_prefix.starts_with(current_word)
-                            {
-                                self.insert_completion_prefix_into_editor(
-                                    ctx,
-                                    common_prefix,
-                                    results.replacement_span.start(),
-                                );
-                            }
-                        }
+                // If not using completions as you type, then
+                // clear any autosuggestions when tab completions are open.
+                // The autosuggestion will be repopulated when the menu is closed.
+                // We don't do this for completions as you type because the user would
+                // otherwise hardly see autosuggestons.
+                if FeatureFlag::RemoveAutosuggestionDuringTabCompletions.is_enabled()
+                    && !self.is_completions_while_typing_turned_on(ctx)
+                {
+                    self.editor.update(ctx, |view, ctx| {
+                        view.clear_autosuggestion(ctx);
+                    });
+                }
 
-                        // If not using completions as you type, then
-                        // clear any autosuggestions when tab completions are open.
-                        // The autosuggestion will be repopulated when the menu is closed.
-                        // We don't do this for completions as you type because the user would
-                        // otherwise hardly see autosuggestons.
-                        if FeatureFlag::RemoveAutosuggestionDuringTabCompletions.is_enabled()
-                            && !self.is_completions_while_typing_turned_on(ctx)
-                        {
-                            self.editor.update(ctx, |view, ctx| {
-                                view.clear_autosuggestion(ctx);
-                            });
-                        }
-
-                        // Decide where to render the tab completion menu.
-                        // If we're rendering it at a specific position, let's make sure
-                        // that position exists in the position cache.
-                        let position = self.tab_completions_menu_position(
-                            &results,
-                            &buffer_text_original,
+                // Decide where to render the tab completion menu.
+                // If we're rendering it at a specific position, let's make sure
+                // that position exists in the position cache.
+                let position =
+                    self.tab_completions_menu_position(&results, &buffer_text_original, ctx);
+                let menu_position = if let Some(position) = position {
+                    self.editor.update(ctx, |editor, ctx| {
+                        editor.cache_buffer_point(
+                            position,
+                            COMPLETIONS_START_OF_REPLACEMENT_SPAN_POSITION_ID,
                             ctx,
                         );
-                        let menu_position = if let Some(position) = position {
-                            self.editor.update(ctx, |editor, ctx| {
-                                editor.cache_buffer_point(
-                                    position,
-                                    COMPLETIONS_START_OF_REPLACEMENT_SPAN_POSITION_ID,
-                                    ctx,
-                                );
-                            });
-                            TabCompletionsMenuPosition::AtStartOfReplacementSpan
-                        } else {
-                            TabCompletionsMenuPosition::AtLastCursor
-                        };
+                    });
+                    TabCompletionsMenuPosition::AtStartOfReplacementSpan
+                } else {
+                    TabCompletionsMenuPosition::AtLastCursor
+                };
 
-                        self.suggestions_mode_model.update(ctx, |m, ctx| {
-                            m.set_mode(
-                                InputSuggestionsMode::CompletionSuggestions {
-                                    replacement_start: results.replacement_span.start(),
-                                    buffer_text_original,
-                                    completion_results: results.clone(),
-                                    trigger: completions_trigger,
-                                    menu_position,
-                                },
-                                ctx,
-                            );
-                        });
+                self.suggestions_mode_model.update(ctx, |model, ctx| {
+                    model.set_mode(
+                        InputSuggestionsMode::CompletionSuggestions {
+                            replacement_start: results.replacement_span.start(),
+                            buffer_text_original,
+                            completion_results: results.clone(),
+                            trigger: completions_trigger,
+                            menu_position,
+                        },
+                        ctx,
+                    );
+                });
 
-                        let preselect_option = if self.is_classic_completions_enabled(ctx) {
-                            TabCompletionsPreselectOption::Unselected
-                        } else {
-                            TabCompletionsPreselectOption::First
-                        };
+                let preselect_option = if self.is_classic_completions_enabled(ctx) {
+                    TabCompletionsPreselectOption::Unselected
+                } else {
+                    TabCompletionsPreselectOption::First
+                };
 
-                        self.input_suggestions
-                            .update(ctx, |input_suggestions, ctx| {
-                                input_suggestions.prefix_search_for_tab_completion(
-                                    results.replacement_span.slice(&buffer_text),
-                                    &results,
-                                    preselect_option,
-                                    ctx,
-                                );
-                            });
-                    }
-                }
+                self.input_suggestions
+                    .update(ctx, |input_suggestions, ctx| {
+                        input_suggestions.set_prepared_tab_completions(
+                            prepared_suggestions,
+                            preselect_option,
+                            ctx,
+                        );
+                    });
             }
         }
         ctx.notify();
@@ -12549,10 +13330,11 @@ impl Input {
         completion_prefix: &str,
         replacement_start: usize,
     ) {
+        let completion_prefix = strip_control_characters(completion_prefix);
         self.editor.update(ctx, |input, ctx| {
             let cursor_end_offset = input.end_byte_index_of_last_selection(ctx);
             input.select_and_replace(
-                completion_prefix,
+                &completion_prefix,
                 [ByteOffset::from(replacement_start)..cursor_end_offset],
                 PlainTextEditorViewAction::AcceptCompletionSuggestion,
                 ctx,
@@ -12568,12 +13350,15 @@ impl Input {
         executing: Executing,
         ctx: &mut ViewContext<Input>,
     ) {
+        let completion_result = strip_control_characters(completion_result);
         let is_completions_as_you_type_enabled = self.is_completions_while_typing_turned_on(ctx);
         self.editor.update(ctx, |input, ctx| {
             let cursor_end_offset = input.end_byte_index_of_last_selection(ctx);
 
-            // Add a space to the end if the end of the selection/replacement
-            // is at the end of the buffer and the completion result doesn't end with a slash.
+            // Add a space to the end if the end of the selection/replacement is at the end of the
+            // buffer and the completion result doesn't end with a slash or an equals sign. A
+            // trailing slash means more of a path follows; a trailing `=` (e.g. `--color=`) means a
+            // value follows directly, as shells' own `-S '='` completions do.
             // If completions as you type is turned on and classic completions is off, then
             // _don't_ add a space.
             let is_classic_completions_enabled = self.is_classic_completions_enabled(ctx);
@@ -12581,11 +13366,12 @@ impl Input {
                 || is_classic_completions_enabled)
                 && cursor_end_offset.as_usize() == input.buffer_text(ctx).len()
                 && !completion_result.ends_with(self.path_separators(ctx).main)
+                && !completion_result.ends_with('=')
                 && executing == Executing::No
             {
                 format!("{completion_result} ").into()
             } else {
-                completion_result.into()
+                completion_result.clone()
             };
 
             input.select_and_replace(
@@ -13387,22 +14173,26 @@ impl Input {
                         .is_configuring_ambient_agent()
                 })
             {
-                if FeatureFlag::AgentHarness.is_enabled() {
-                    let availability = HarnessAvailabilityModel::as_ref(ctx);
-                    if !availability.has_any_enabled_harness() {
-                        let window_id = ctx.window_id();
-                        ToastStack::handle(ctx).update(ctx, |ts, ctx| {
-                            ts.add_ephemeral_toast(
-                                DismissibleToast::error(
-                                    "No agent harnesses are available. Contact your team admin."
-                                        .to_string(),
-                                ),
-                                window_id,
-                                ctx,
-                            );
-                        });
-                        return;
-                    }
+                let team_required = UserWorkspaces::as_ref(ctx).cloud_agents_require_team();
+                let has_enabled_harness = !FeatureFlag::AgentHarness.is_enabled()
+                    || HarnessAvailabilityModel::as_ref(ctx).has_any_enabled_harness();
+                let blocker_message =
+                    match cloud_agent_start_blocker(team_required, has_enabled_harness) {
+                        Some(CloudAgentStartBlocker::TeamRequired) => {
+                            Some(cloud_agent_team_required_toast_message(ctx).to_string())
+                        }
+                        Some(CloudAgentStartBlocker::NoEnabledHarnesses) => Some(
+                            "No agent harnesses are available. Contact your team admin."
+                                .to_string(),
+                        ),
+                        None => None,
+                    };
+                if let Some(message) = blocker_message {
+                    let window_id = ctx.window_id();
+                    ToastStack::handle(ctx).update(ctx, |ts, ctx| {
+                        ts.add_ephemeral_toast(DismissibleToast::error(message), window_id, ctx);
+                    });
+                    return;
                 }
 
                 let prompt = command.trim().to_owned();
@@ -13441,8 +14231,9 @@ impl Input {
                 });
 
                 if let Some(ambient_agent_view_model) = self.ambient_agent_view_model() {
+                    let scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
                     ambient_agent_view_model.update(ctx, |state, ctx| {
-                        state.spawn_agent(prompt, attachments, ctx);
+                        state.spawn_agent(prompt, attachments, &scope, ctx);
                     });
                 }
                 return;
@@ -13678,10 +14469,11 @@ impl Input {
             return;
         }
         let block = block.as_ref().unwrap();
-        let (exit_code, working_dir) = (
-            block.serialized_block.exit_code,
-            block.serialized_block.pwd.as_ref(),
-        );
+        let serialized_block = block.serialized_block.get_with(|compute| {
+            let model = self.model.lock();
+            compute(model.block_list())
+        });
+        let (exit_code, working_dir) = (serialized_block.exit_code, serialized_block.pwd.as_ref());
         let number_of_top_lines_per_grid = 100;
         let number_of_bottom_lines_per_grid = 200;
 
@@ -13689,9 +14481,7 @@ impl Input {
             let model = self.model.lock();
             let terminal_width = model.block_list().size().columns;
 
-            if let Some(current_block) =
-                model.block_list().block_with_id(&block.serialized_block.id)
-            {
+            if let Some(current_block) = model.block_list().block_with_id(&serialized_block.id) {
                 current_block.get_block_content_summary(
                     terminal_width,
                     number_of_top_lines_per_grid,
@@ -13700,7 +14490,7 @@ impl Input {
             } else {
                 log::warn!(
                     "Failed to fetch predicted queries, could not find block with ID {:?}",
-                    block.serialized_block.id
+                    serialized_block.id
                 );
                 return;
             }
@@ -13717,7 +14507,7 @@ impl Input {
         let Some(session) = self.active_session(ctx) else {
             return;
         };
-        let context = WarpAiExecutionContext::new(&session);
+        let context = execution_context_for_session(&session);
 
         let request = PredictAMQueriesRequest {
             context_messages: vec![json_message.to_string()],
@@ -13726,10 +14516,13 @@ impl Input {
         };
 
         let server_api = self.server_api.clone();
+        let team_scope = RequestTeamScope::from_scope(
+            &UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx),
+        );
 
         self.predict_am_queries_future_handle = Some(ctx.spawn(
             async move {
-                match server_api.predict_am_queries(&request).await {
+                match server_api.predict_am_queries(&request, team_scope).await {
                     Ok(resp) => Some(resp.suggestion),
                     Err(err) => {
                         log::warn!("Failed to fetch predicted queries: {err}");
@@ -14234,14 +15027,23 @@ impl Input {
             return;
         }
 
-        let has_any_ai = AIRequestUsageModel::as_ref(ctx).has_any_ai_remaining(ctx);
+        let has_any_ai = {
+            let user_workspaces = UserWorkspaces::as_ref(ctx);
+            let scope = user_workspaces.team_context_for_view(ctx);
+            AIRequestUsageModel::as_ref(ctx).has_any_ai_remaining(&scope, ctx)
+        };
         if !has_any_ai {
             AIRequestUsageModel::handle(ctx).update(ctx, |model, ctx| {
                 model.enable_buy_credits_banner(ctx);
             });
         }
 
-        if PromptAlertView::does_alert_block_ai_requests(ctx) {
+        let alert_blocks_ai = {
+            let user_workspaces = UserWorkspaces::as_ref(ctx);
+            let scope = user_workspaces.team_context_for_view(ctx);
+            PromptAlertView::does_alert_block_ai_requests(&scope, ctx)
+        };
+        if alert_blocks_ai {
             AIRequestUsageModel::handle(ctx).update(ctx, |usage_model, ctx| {
                 // Rate limit requests to fetch the user's AI usage if triggered by enter
                 // keypress.
@@ -14427,6 +15229,62 @@ impl Input {
         true
     }
 
+    /// Upload pending attachments to the task definition before emitting the text-only cloud
+    /// follow-up event. `SubmitCloudFollowup` only carries the prompt text, so this helper owns
+    /// the prompt and attachment payloads until the async upload either succeeds and submits the
+    /// prompt or fails and restores the input. A new VM execution downloads these task attachments
+    /// during startup.
+    fn upload_files_then_submit_cloud_followup(
+        &mut self,
+        task_id: crate::ai::ambient_agents::AmbientAgentTaskId,
+        prompt: String,
+        pending_attachments: Vec<PendingAttachment>,
+        ctx: &mut ViewContext<Self>,
+    ) -> SpawnedFutureHandle {
+        let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
+        let server_api = ServerApiProvider::as_ref(ctx).get();
+
+        ctx.spawn(
+            async move {
+                // Fail fast: any per-attachment failure (decode, size-limit, or HTTP) is fatal
+                // on the VM-down follow-up path; the user can fix the attachment and retry.
+                let outcomes = upload_pending_attachments_to_task(
+                    ai_client,
+                    server_api,
+                    task_id,
+                    pending_attachments,
+                )
+                .await
+                .map_err(|e| format!("Failed to prepare attachment uploads: {e:#}"))?;
+                for outcome in &outcomes {
+                    if let TaskAttachmentUploadOutcome::Failed { error, .. } = outcome {
+                        return Err(error.clone());
+                    }
+                }
+                Ok::<(), String>(())
+            },
+            move |input, result, ctx| {
+                if let Err(error) = result {
+                    input.restore_cloud_followup_input_after_upload_failure(&prompt, ctx);
+                    let window_id = ctx.window_id();
+                    ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                        toast_stack.add_ephemeral_toast(
+                            DismissibleToast::error(format!("Couldn't upload attachment: {error}")),
+                            window_id,
+                            ctx,
+                        );
+                    });
+                    return;
+                }
+
+                input.ai_context_model.update(ctx, |context_model, ctx| {
+                    context_model.clear_pending_attachments(ctx);
+                });
+                ctx.emit(Event::SubmitCloudFollowup { prompt });
+            },
+        )
+    }
+
     fn emit_input_buffer_submitted_telemetry(&self, ctx: &mut ViewContext<Self>) {
         let input_model = self.ai_input_model.as_ref(ctx);
         let block_id = self.model.lock().active_block_id().clone();
@@ -14505,59 +15363,30 @@ impl Input {
         let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
         let server_api = ServerApiProvider::as_ref(ctx).get();
 
-        // Decode all images upfront; drop any that fail so that file_infos
-        // and files_to_upload stay in sync (they're zipped later).
-        let mut files_to_upload: Vec<(String, String, Vec<u8>)> = pending_images
+        // Combine images and files into a unified list so
+        // `upload_pending_attachments_to_task` can handle both kinds uniformly.
+        let pending_attachments: Vec<PendingAttachment> = pending_images
             .iter()
-            .filter_map(|img| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(&img.data)
-                    .map(|bytes| (img.file_name.clone(), img.mime_type.clone(), bytes))
-                    .map_err(|e| {
-                        report_error!(
-                            anyhow::Error::new(e).context("Failed to decode base64 image"),
-                            extra: { "file_name" => %img.file_name }
-                        )
-                    })
-                    .ok()
-            })
+            .cloned()
+            .map(PendingAttachment::Image)
+            .chain(pending_files.iter().cloned().map(PendingAttachment::File))
             .collect();
-
-        // Also read non-image files from disk and add them to the upload list.
-        for file in pending_files {
-            match std::fs::read(&file.file_path) {
-                Ok(bytes) => {
-                    if bytes.len() > MAX_ATTACHMENT_SIZE_BYTES {
-                        log::warn!(
-                            "Skipping file {} ({} bytes) — exceeds 10MB limit",
-                            file.file_name,
-                            bytes.len()
-                        );
-                        continue;
-                    }
-                    files_to_upload.push((file.file_name.clone(), file.mime_type.clone(), bytes));
-                }
-                Err(e) => {
-                    log::warn!("Failed to read file {}: {e}", file.file_path.display());
-                }
-            }
-        }
-
-        let file_infos: Vec<AttachmentFileInfo> = files_to_upload
-            .iter()
-            .map(|(name, mime, _)| AttachmentFileInfo {
-                filename: name.clone(),
-                mime_type: mime.clone(),
-            })
-            .collect();
+        let pending_count = pending_attachments.len();
 
         ctx.spawn(
             async move {
-                let response = match ai_client
-                    .prepare_attachments_for_upload(&task_id, &file_infos)
-                    .await
+                // Best-effort: continue with successful uploads even when individual
+                // attachments fail (decode / size-limit / HTTP). Return `None` only when
+                // the prepare call fails entirely (maps to the "too many attachments" toast).
+                let outcomes = match upload_pending_attachments_to_task(
+                    ai_client,
+                    server_api,
+                    task_id,
+                    pending_attachments,
+                )
+                .await
                 {
-                    Ok(resp) => resp,
+                    Ok(outcomes) => outcomes,
                     Err(e) => {
                         log::error!(
                             "Failed to prepare attachment uploads for task {task_id}: {e:#}"
@@ -14567,41 +15396,28 @@ impl Input {
                 };
 
                 let mut uploaded = Vec::new();
-                for ((file_name, mime_type, file_bytes), upload_info) in
-                    files_to_upload.iter().zip(response.attachments.iter())
-                {
-                    let result = server_api
-                        .http_client()
-                        .put(&upload_info.upload_url)
-                        .header("Content-Type", mime_type.as_str())
-                        .body(file_bytes.clone())
-                        .send()
-                        .await;
-
-                    match result {
-                        Ok(resp) if resp.status().is_success() => {
+                for outcome in outcomes {
+                    match outcome {
+                        TaskAttachmentUploadOutcome::Uploaded {
+                            attachment_id,
+                            file_name,
+                        } => {
                             uploaded.push(AgentAttachment::FileReference {
-                                attachment_id: upload_info.attachment_id.clone(),
-                                file_name: file_name.clone(),
+                                attachment_id,
+                                file_name,
                             });
                         }
-                        Ok(resp) => {
-                            log::warn!(
-                                "Failed to upload attachment {file_name}: unexpected HTTP status {}",
-                                resp.status()
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to upload attachment {file_name}: {e}");
+                        TaskAttachmentUploadOutcome::Failed { file_name, error } => {
+                            log::warn!("Failed to upload attachment {file_name}: {error}");
                         }
                     }
                 }
 
-                if uploaded.len() < files_to_upload.len() {
+                if uploaded.len() < pending_count {
                     log::warn!(
                         "Only {}/{} attachments uploaded successfully",
                         uploaded.len(),
-                        files_to_upload.len()
+                        pending_count
                     );
                 }
 
@@ -14997,8 +15813,24 @@ impl Input {
                 && !cloud_setup_pre_first_exchange
                 && !self.has_queued_command_in_flight(ctx);
             let latest_block_id = self.model.lock().block_list().active_block_id().clone();
-            let input_contents_before_prompt_chip_command =
-                self.input_contents_before_prompt_chip_command.take();
+            // Prefer a prompt-chip restore (e.g. `cd`) over a shell-widget handoff restore.
+            let completed_handoff = self
+                .pending_shell_widget_handoff
+                .take_if(|handoff| handoff.block_id == block_completed_event.block_id);
+            if let Some(handoff) = &completed_handoff {
+                self.model
+                    .lock()
+                    .block_list_mut()
+                    .hide_block(&handoff.block_id);
+            }
+            let pending_input_restore = self
+                .input_contents_before_prompt_chip_command
+                .take()
+                .or_else(|| {
+                    completed_handoff
+                        .as_ref()
+                        .map(|handoff| handoff.restore_text().to_string())
+                });
 
             if should_clear_buffer {
                 // We want to reinitialize the buffer whenever a command is completed so that
@@ -15009,11 +15841,38 @@ impl Input {
                         .update(ctx, |editor, ctx| editor.reinitialize_buffer(None, ctx));
                     self.latest_buffer_operations = Vec::new();
 
-                    // If we have a pending input restore (from a prompt chip command like cd),
-                    // restore the input contents instead of leaving the buffer empty.
-                    if let Some(restore_text) = input_contents_before_prompt_chip_command {
+                    // If we have a pending input restore (from a prompt chip command like cd, or
+                    // a ctrl-r/ctrl-t external handoff), restore the input contents instead of
+                    // leaving the buffer empty.
+                    if let Some(restore_text) = pending_input_restore {
                         self.editor.update(ctx, |editor, ctx| {
                             editor.set_buffer_text(&restore_text, ctx);
+                            if let Some(handoff) = &completed_handoff {
+                                match (
+                                    handoff.apply_mode,
+                                    &handoff.selection,
+                                    handoff.cursor_offset,
+                                ) {
+                                    (
+                                        ShellWidgetApplyMode::Splice,
+                                        Some(insertion),
+                                        Some(cursor_offset),
+                                    ) => editor.select_and_replace(
+                                        insertion,
+                                        [cursor_offset..cursor_offset],
+                                        PlainTextEditorViewAction::InsertSelectedText,
+                                        ctx,
+                                    ),
+                                    (_, None, Some(cursor_offset)) => editor
+                                        .select_ranges_by_byte_offset(
+                                            [cursor_offset..cursor_offset],
+                                            ctx,
+                                        ),
+                                    (ShellWidgetApplyMode::Replace, Some(_), _)
+                                    | (ShellWidgetApplyMode::Splice, Some(_), None)
+                                    | (_, None, None) => {}
+                                }
+                            }
                         });
                         self.is_editor_empty_on_last_edit = false;
                     } else {
@@ -15111,11 +15970,21 @@ impl Input {
                     .map(|state| state.history_model.clone())
                 {
                     Some(shared_session_history_model) => {
-                        shared_session_history_model.update(ctx, |history_model, _ctx| {
-                            history_model.push(HistoryEntry::for_completed_block(
-                                block_completed.command,
-                                &block_completed.serialized_block,
-                            ))
+                        let command = block_completed
+                            .command
+                            .get_with(|compute| {
+                                let model = self.model.lock();
+                                compute(model.block_list())
+                            })
+                            .to_owned();
+                        let serialized_block =
+                            block_completed.serialized_block.get_with(|compute| {
+                                let model = self.model.lock();
+                                compute(model.block_list())
+                            });
+                        shared_session_history_model.update(ctx, move |history_model, _ctx| {
+                            history_model
+                                .push(HistoryEntry::for_completed_block(command, serialized_block))
                         })
                     }
                     _ => {
@@ -15162,6 +16031,7 @@ impl Input {
         &mut self,
         command: &str,
         source: CommandExecutionSource,
+        should_add_command_to_history: bool,
         ctx: &mut ViewContext<Self>,
     ) {
         start_trace!("command_execution:start");
@@ -15237,7 +16107,7 @@ impl Input {
             workflow_id,
             session_id,
             workflow_command,
-            should_add_command_to_history: true,
+            should_add_command_to_history,
             source,
         })));
         end_trace!();
@@ -15650,7 +16520,14 @@ impl Input {
         let input_editor_save_position_id = self.editor_save_position_id();
         SavePosition::new(
             EventHandler::new(input_box)
-                .on_right_mouse_down(move |ctx, _, position| {
+                .on_right_mouse_down(move |ctx, app, position, modifiers| {
+                    if should_right_click_paste(modifiers.shift, app) {
+                        // Same path as the `terminal:paste` keybinding, so escaped-path
+                        // processing and CLI-agent image handling behave identically.
+                        ctx.dispatch_typed_action(TerminalAction::Paste);
+                        return DispatchEventResult::StopPropagation;
+                    }
+
                     let input_rect = ctx
                         .element_position_by_id(input_editor_save_position_id.clone())
                         .expect("input editor position id should be saved");
@@ -15801,6 +16678,10 @@ impl Input {
         InputSettings::as_ref(app).is_universal_developer_input_enabled(app)
     }
 
+    pub(crate) fn is_voltron_open(&self) -> bool {
+        self.is_voltron_open
+    }
+
     fn handle_prompt_suggestions_event(
         &mut self,
         event: &PromptSuggestionsEvent,
@@ -15860,6 +16741,10 @@ impl TypedActionView for Input {
         match action {
             InputAction::FocusInputBox => self.focus_input_box(ctx),
             InputAction::Up => self.editor_up(ctx),
+            InputAction::SelectPreviousInlineHistoryItem => {
+                self.select_previous_inline_history_item(ctx)
+            }
+            InputAction::SelectNextInlineHistoryItem => self.select_next_inline_history_item(ctx),
             InputAction::PageUp => self.editor_page_up(ctx),
             InputAction::PageDown => self.editor_page_down(ctx),
             InputAction::CtrlD => self.ctrl_d(ctx),
@@ -16128,6 +17013,13 @@ impl View for Input {
             }
         }
 
+        if CLIAgentSessionsModel::as_ref(app)
+            .session(self.terminal_view_id)
+            .is_some()
+        {
+            ctx.set.insert(CLI_AGENT_SESSION_ACTIVE_KEY);
+        }
+
         if self.buffer_text(app).is_empty() {
             ctx.set.insert(flags::EMPTY_INPUT_BUFFER);
         }
@@ -16238,6 +17130,13 @@ impl View for Input {
         let model_lock = self.model.lock();
         ctx.set
             .insert(model_lock.shared_session_status().as_keymap_context());
+        if file_attach_allowed_for_shared_session(
+            model_lock.shared_session_status(),
+            self.ambient_agent_view_model(),
+            app,
+        ) {
+            ctx.set.insert(CAN_ATTACH_FILE_KEY);
+        }
 
         if model_lock
             .block_list()
@@ -16262,8 +17161,7 @@ impl View for Input {
             .last_non_hidden_ai_block_handle(app)
             .is_some_and(|ai_block| {
                 let block = ai_block.as_ref(app);
-                block.is_passive_conversation(app)
-                    && block.find_undismissed_code_diff(app).is_some()
+                block.is_passive_conversation() && block.find_undismissed_code_diff(app).is_some()
             });
         if has_undismissed_passive_code_diff {
             ctx.set.insert(flags::PASSIVE_CODE_DIFF_KEYBINDINGS_ENABLED);

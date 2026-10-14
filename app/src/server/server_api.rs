@@ -12,6 +12,8 @@ pub mod object;
 pub(crate) mod presigned_upload;
 pub mod referral;
 pub mod team;
+#[cfg(feature = "tui")]
+pub mod tui_onboarding;
 pub mod workspace;
 
 use std::ops::Deref;
@@ -25,24 +27,28 @@ use anyhow::{Context, Result, anyhow};
 use auth::AuthClient;
 use block::BlockClient;
 use channel_versions::ChannelVersions;
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, Utc};
 use factory::FactoryClient;
 use instant::Instant;
 use managed_mcp::ManagedMcpClient;
+use managed_secrets::AppManagedSecretsClient;
 use object::ObjectClient;
 use parking_lot::Mutex;
 use referral::ReferralsClient;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use team::TeamClient;
+#[cfg(feature = "tui")]
+use tui_onboarding::TuiOnboardingClient;
 use url::Url;
 use warp_core::context_flag::ContextFlag;
 use warp_core::telemetry::TelemetryEvent;
 use warp_errors::{AnyhowErrorExt, ErrorExt, register_error, report_error};
-use warp_managed_secrets::client::ManagedSecretsClient;
+use warp_server_client::HttpStatusError;
 use warp_server_client::auth::{AuthClientImpl, AuthEvent, EXPERIMENT_ID_HEADER};
 use warp_server_client::base_client::{
     AmbientHeaderPolicy, AuthenticatedGraphqlConfig, BaseClient, GraphqlRoutingConfig,
+    HeaderOverride, TEAM_UID_HEADER,
 };
 use warp_server_client::iap::{IapManager, IapState};
 use warp_server_client::network_logging::NetworkLogModel;
@@ -60,6 +66,7 @@ use crate::ai::predict::{generate_ai_input_suggestions, generate_am_query_sugges
 use crate::ai::voice::transcribe::{TranscribeRequest, TranscribeResponse};
 use crate::auth::auth_manager::AuthManager;
 use crate::auth::auth_state::AuthState;
+use crate::server::team_scope::RequestTeamScope;
 use crate::server::telemetry::TelemetryApi;
 use crate::settings::PrivacySettingsSnapshot;
 use crate::{ChannelState, settings_view};
@@ -374,14 +381,55 @@ pub enum TranscribeError {
     ServerOverloaded,
 
     #[error("Internal error occurred at transport layer.")]
-    Transport,
+    Transport(#[source] reqwest::Error),
+
+    #[error("Failed with status code {0}")]
+    ErrorStatus(http::StatusCode),
 
     #[error("Failed to deserialize JSON.")]
-    Deserialization,
+    Deserialization(#[source] DeserializationError),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
+
+impl TranscribeError {
+    fn from_json_error(err: reqwest::Error) -> Self {
+        if err.is_decode() {
+            #[cfg(not(target_family = "wasm"))]
+            {
+                use std::error::Error as _;
+                let mut source = err.source();
+                while let Some(underlying) = source {
+                    if underlying.is::<hyper::Error>() {
+                        return TranscribeError::Transport(err);
+                    }
+                    source = underlying.source();
+                }
+            }
+            return TranscribeError::Deserialization(DeserializationError::Transport(err));
+        }
+        TranscribeError::Transport(err)
+    }
+}
+
+impl ErrorExt for TranscribeError {
+    fn is_actionable(&self) -> bool {
+        match self {
+            TranscribeError::Transport(error) => error.is_actionable(),
+            TranscribeError::ErrorStatus(status) => {
+                !status.is_server_error() && *status != http::StatusCode::TOO_MANY_REQUESTS
+            }
+            TranscribeError::Other(error) => error.is_actionable(),
+            TranscribeError::Deserialization(error) => match error {
+                DeserializationError::Json(_) => true,
+                DeserializationError::Transport(error) => error.is_actionable(),
+            },
+            TranscribeError::QuotaLimit | TranscribeError::ServerOverloaded => false,
+        }
+    }
+}
+register_error!(TranscribeError);
 
 /// An API wrapper struct with methods to requests to warp-server.
 ///
@@ -496,12 +544,42 @@ impl ServerApi {
             .await
     }
 
+    /// Returns ambient agent headers (workload token, cloud-agent ID) scoped to one task,
+    /// without disturbing the client's own inherited ambient-agent-task-ID state.
     async fn ambient_agent_headers_for_task(
         &self,
         task_id: &AmbientAgentTaskId,
     ) -> Result<Vec<(String, String)>> {
         self.ambient_headers(AmbientHeaderPolicy::for_task(task_id.to_string()))
             .await
+    }
+
+    /// Returns task-scoped ambient agent headers for a caller that pins them into a long-lived
+    /// transport instead of resolving them per request.
+    ///
+    /// `must_outlive` is the instant through which the pinned headers have to keep working,
+    /// typically the end of the run. The workload token is attached only when it stays valid
+    /// that long, since warp-server rejects an expired one but tolerates its absence. Pass
+    /// `None` when no such instant is known, which resolves the token the same way an ordinary
+    /// per-request caller would.
+    pub async fn pinned_ambient_agent_headers_for_task(
+        &self,
+        task_id: &AmbientAgentTaskId,
+        must_outlive: Option<DateTime<Utc>>,
+    ) -> Result<Vec<(String, String)>> {
+        let workload_token = match must_outlive {
+            Some(must_outlive) => self
+                .base_client
+                .get_ambient_workload_token_valid_until(must_outlive)
+                .await?
+                .map_or(HeaderOverride::Omit, HeaderOverride::Set),
+            None => HeaderOverride::Inherit,
+        };
+        self.ambient_headers(AmbientHeaderPolicy {
+            workload_token,
+            ..AmbientHeaderPolicy::for_task(task_id.to_string())
+        })
+        .await
     }
 
     pub fn send_graphql_request<'a, QF, O: warp_graphql::client::Operation<QF> + Send + 'a>(
@@ -517,6 +595,37 @@ impl ServerApi {
             operation,
             timeout,
         )
+    }
+
+    fn send_graphql_request_for_team<'a, QF, O: warp_graphql::client::Operation<QF> + Send + 'a>(
+        &'a self,
+        operation: O,
+        team_scope: RequestTeamScope,
+    ) -> BoxFuture<'a, Result<QF>>
+    where
+        QF: 'a,
+    {
+        match Self::team_uid_header_value(team_scope) {
+            Some(team_uid) => {
+                warp_server_client::graphql_helpers::send_team_scoped_graphql_request(
+                    &self.base_client,
+                    operation,
+                    None,
+                    team_uid,
+                )
+            }
+            None => warp_server_client::graphql_helpers::send_graphql_request(
+                &self.base_client,
+                operation,
+                None,
+            ),
+        }
+    }
+
+    fn team_uid_header_value(team_scope: RequestTeamScope) -> Option<String> {
+        team_scope
+            .team_uid()
+            .map(|team_uid| team_uid.uid().to_string())
     }
 
     /// Opens an SSE stream to the agent event-push endpoint.
@@ -643,6 +752,19 @@ impl ServerApi {
     where
         B: Serialize,
     {
+        self.post_public_api_response_for_team(path, body, None)
+            .await
+    }
+
+    async fn post_public_api_response_for_team<B>(
+        &self,
+        path: &str,
+        body: &B,
+        team_scope: Option<RequestTeamScope>,
+    ) -> Result<http_client::Response>
+    where
+        B: Serialize,
+    {
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -658,6 +780,9 @@ impl ServerApi {
         for (name, value) in self.ambient_agent_headers().await? {
             request = request.header(name, value);
         }
+        if let Some(team_uid) = team_scope.and_then(Self::team_uid_header_value) {
+            request = request.header(TEAM_UID_HEADER, team_uid);
+        }
 
         let response = request
             .send()
@@ -672,7 +797,50 @@ impl ServerApi {
         }
     }
 
-    /// Converts a non-success public API response into the most specific client error available.
+    async fn get_public_api_for_team<R>(
+        &self,
+        path: &str,
+        team_scope: RequestTeamScope,
+    ) -> Result<R>
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        let auth_token = self
+            .get_or_refresh_access_token()
+            .await
+            .context("Failed to get access token for API request")?;
+        let url = format!("{}/api/v1/{path}", ChannelState::server_root_url());
+        let mut request = self.base_client.http_client().get(&url);
+        if let Some(token) = auth_token.as_bearer_token() {
+            request = request.bearer_auth(token);
+        }
+        if let Some(team_uid) = Self::team_uid_header_value(team_scope) {
+            request = request.header(TEAM_UID_HEADER, team_uid);
+        }
+        for (name, value) in self.ambient_agent_headers().await? {
+            request = request.header(name, value);
+        }
+
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("Failed to send API request to {url}"))?;
+        if !response.status().is_success() {
+            self.observe_iap_challenge(&response);
+            return Err(Self::error_from_response(response).await);
+        }
+
+        response
+            .json::<R>()
+            .await
+            .with_context(|| format!("Failed to deserialize response from {url}"))
+    }
+
+    /// Converts a non-success public API response into the most specific client error
+    /// available. The returned error always carries an [`HttpStatusError`] in its chain
+    /// (via [`anyhow::Error::context`]) so callers retrying through
+    /// [`is_transient_http_error`](super::retry_strategies::is_transient_http_error) fail
+    /// fast on a deterministic 4xx instead of defaulting to a transient retry.
     async fn error_from_response(response: http_client::Response) -> anyhow::Error {
         let status = response.status();
         let is_at_capacity = response
@@ -688,28 +856,29 @@ impl ServerApi {
 
         // Get the response text first since we may need to try multiple deserializations.
         let response_text = response.text().await.unwrap_or_default();
+        let status_error = HttpStatusError::new(status.as_u16(), response_text.clone());
 
         // Check for AT_CAPACITY error code header.
         if is_at_capacity
             && let Ok(capacity_error) =
                 serde_json::from_str::<CloudAgentCapacityError>(&response_text)
         {
-            return capacity_error.into();
+            return anyhow::Error::new(status_error).context(capacity_error);
         }
         if status == StatusCode::TOO_MANY_REQUESTS && is_out_of_credits {
             let user_display_message = serde_json::from_str::<OutOfCreditsResponse>(&response_text)
                 .ok()
                 .and_then(|r| r.user_display_message);
-            return AIApiError::QuotaLimit {
+            return anyhow::Error::new(status_error).context(AIApiError::QuotaLimit {
                 user_display_message,
-            }
-            .into();
+            });
         }
 
         // Try to deserialize error response as { "error": "message" }
         match serde_json::from_str::<ClientError>(&response_text) {
-            Ok(error_response) => error_response.into(),
-            Err(_) => anyhow!("API request failed with status {status}"),
+            Ok(error_response) => anyhow::Error::new(status_error).context(error_response),
+            Err(_) => anyhow::Error::new(status_error)
+                .context(format!("API request failed with status {status}")),
         }
     }
 
@@ -724,6 +893,26 @@ impl ServerApi {
         R: serde::de::DeserializeOwned,
     {
         let response = self.post_public_api_response(path, body).await?;
+        let url = response.url().clone();
+        response
+            .json::<R>()
+            .await
+            .with_context(|| format!("Failed to deserialize response from {url}"))
+    }
+
+    async fn post_public_api_for_team<B, R>(
+        &self,
+        path: &str,
+        body: &B,
+        team_scope: RequestTeamScope,
+    ) -> Result<R>
+    where
+        B: Serialize,
+        R: serde::de::DeserializeOwned,
+    {
+        let response = self
+            .post_public_api_response_for_team(path, body, Some(team_scope))
+            .await?;
         let url = response.url().clone();
         response
             .json::<R>()
@@ -980,14 +1169,18 @@ impl ServerApi {
     pub async fn generate_ai_input_suggestions(
         &self,
         request: &GenerateAIInputSuggestionsRequest,
+        team_scope: RequestTeamScope,
     ) -> Result<generate_ai_input_suggestions::GenerateAIInputSuggestionsResponseV2, AIApiError>
     {
         let auth_token = self.get_or_refresh_access_token().await?;
 
-        let request_builder = self.base_client.http_client().post(format!(
+        let mut request_builder = self.base_client.http_client().post(format!(
             "{}/ai/generate_input_suggestions",
             ChannelState::server_root_url()
         ));
+        if let Some(team_uid) = team_scope.team_uid() {
+            request_builder = request_builder.header(TEAM_UID_HEADER, team_uid.uid());
+        }
         let response = if let Some(token) = auth_token.as_bearer_token() {
             request_builder.bearer_auth(token)
         } else {
@@ -1006,25 +1199,28 @@ impl ServerApi {
     pub async fn get_relevant_files(
         &self,
         request: &GetRelevantFiles,
+        team_scope: RequestTeamScope,
     ) -> Result<GetRelevantFilesResponse, AIApiError> {
         let auth_token = self.get_or_refresh_access_token().await?;
 
-        let request_builder = self.base_client.http_client().post(format!(
+        let mut request_builder = self.base_client.http_client().post(format!(
             "{}/ai/relevant_files",
             ChannelState::server_root_url()
         ));
-        let response = if let Some(token) = auth_token.as_bearer_token() {
-            request_builder.bearer_auth(token)
-        } else {
-            request_builder
+        if let Some(token) = auth_token.as_bearer_token() {
+            request_builder = request_builder.bearer_auth(token);
         }
-        .json(request)
-        .send()
-        .await?
-        .error_for_status_with_body()
-        .await?
-        .json()
-        .await?;
+        if let Some(team_uid) = team_scope.team_uid() {
+            request_builder = request_builder.header(TEAM_UID_HEADER, team_uid.uid());
+        }
+        let response = request_builder
+            .json(request)
+            .send()
+            .await?
+            .error_for_status_with_body()
+            .await?
+            .json()
+            .await?;
 
         Ok(response)
     }
@@ -1033,6 +1229,7 @@ impl ServerApi {
     pub async fn generate_am_query_suggestions(
         &self,
         request: &GenerateAMQuerySuggestionsRequest,
+        team_scope: RequestTeamScope,
     ) -> Result<generate_am_query_suggestions::GenerateAMQuerySuggestionsResponse, AIApiError> {
         let auth_token = self.get_or_refresh_access_token().await?;
 
@@ -1050,31 +1247,37 @@ impl ServerApi {
             }
         }
 
-        let request_builder = self.base_client.http_client().post(url);
-        let response = if let Some(token) = auth_token.as_bearer_token() {
-            request_builder.bearer_auth(token)
-        } else {
-            request_builder
+        let mut request_builder = self.base_client.http_client().post(url);
+        if let Some(token) = auth_token.as_bearer_token() {
+            request_builder = request_builder.bearer_auth(token);
         }
-        .json(request)
-        .send()
-        .await?
-        .error_for_status_with_body()
-        .await?
-        .json()
-        .await?;
+        if let Some(team_uid) = team_scope.team_uid() {
+            request_builder = request_builder.header(TEAM_UID_HEADER, team_uid.uid());
+        }
+        let response = request_builder
+            .json(request)
+            .send()
+            .await?
+            .error_for_status_with_body()
+            .await?
+            .json()
+            .await?;
         Ok(response)
     }
 
     pub async fn predict_am_queries(
         &self,
         request: &PredictAMQueriesRequest,
+        team_scope: RequestTeamScope,
     ) -> Result<PredictAMQueriesResponse, AIApiError> {
         let auth_token = self.get_or_refresh_access_token().await?;
-        let request_builder = self.base_client.http_client().post(format!(
+        let mut request_builder = self.base_client.http_client().post(format!(
             "{}/ai/predict_am_queries",
             ChannelState::server_root_url()
         ));
+        if let Some(team_uid) = team_scope.team_uid() {
+            request_builder = request_builder.header(TEAM_UID_HEADER, team_uid.uid());
+        }
         let response = if let Some(token) = auth_token.as_bearer_token() {
             request_builder.bearer_auth(token)
         } else {
@@ -1094,13 +1297,17 @@ impl ServerApi {
     pub async fn transcribe(
         &self,
         request: &TranscribeRequest,
+        team_scope: RequestTeamScope,
     ) -> Result<TranscribeResponse, TranscribeError> {
         let auth_token = self.get_or_refresh_access_token().await?;
 
-        let request_builder = self
+        let mut request_builder = self
             .base_client
             .http_client()
             .post(format!("{}/ai/transcribe", ChannelState::server_root_url()));
+        if let Some(team_uid) = team_scope.team_uid() {
+            request_builder = request_builder.header(TEAM_UID_HEADER, team_uid.uid());
+        }
         let response = if let Some(token) = auth_token.as_bearer_token() {
             request_builder.bearer_auth(token)
         } else {
@@ -1117,7 +1324,7 @@ impl ServerApi {
                         Ok(output_response) => Ok(output_response),
                         Err(e) => {
                             log::warn!("Failed to deserialize response: {e:?}");
-                            Err(TranscribeError::Deserialization)
+                            Err(TranscribeError::from_json_error(e))
                         }
                     }
                 } else if res.status() == http::StatusCode::TOO_MANY_REQUESTS {
@@ -1132,13 +1339,14 @@ impl ServerApi {
                         Err(TranscribeError::ServerOverloaded)
                     }
                 } else {
-                    log::warn!("Non-success status code received: {}", res.status());
-                    Err(TranscribeError::Transport)
+                    let status = res.status();
+                    log::warn!("Non-success status code received: {status}");
+                    Err(TranscribeError::ErrorStatus(status))
                 }
             }
             Err(e) => {
                 log::warn!("Error while sending request: {e:?}");
-                Err(TranscribeError::Transport)
+                Err(TranscribeError::Transport(e))
             }
         }
     }
@@ -1365,6 +1573,10 @@ impl ServerApiProvider {
     pub fn get_team_client(&self) -> Arc<dyn TeamClient> {
         self.server_api.clone()
     }
+    #[cfg(feature = "tui")]
+    pub fn get_tui_onboarding_client(&self) -> Arc<dyn TuiOnboardingClient> {
+        self.server_api.clone()
+    }
 
     pub fn get_ai_client(&self) -> Arc<dyn AIClient> {
         self.server_api.clone()
@@ -1378,7 +1590,7 @@ impl ServerApiProvider {
         self.server_api.clone()
     }
 
-    pub fn get_managed_secrets_client(&self) -> Arc<dyn ManagedSecretsClient> {
+    pub fn get_managed_secrets_client(&self) -> Arc<AppManagedSecretsClient> {
         self.server_api.clone()
     }
 
@@ -1408,3 +1620,7 @@ impl Entity for ServerApiProvider {
 }
 
 impl SingletonEntity for ServerApiProvider {}
+
+#[cfg(test)]
+#[path = "server_api_tests.rs"]
+mod tests;

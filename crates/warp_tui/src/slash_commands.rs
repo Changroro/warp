@@ -10,11 +10,11 @@ use string_offset::CharOffset;
 use warp::editor::{CodeEditorModel, CodeEditorModelEvent};
 use warp::search::data_source::QueryResult;
 use warp::search::mixer::SearchMixerEvent;
-use warp::settings::{AISettings, TuiTheme, TuiThemeSettings};
+use warp::settings::{AISettings, AppEditorSettings, TuiTheme, TuiThemeSettings};
 use warp::tui_export::{
     AcceptSlashCommandOrSavedPrompt, Appearance, ConversationSelectionHandle,
-    ParsedSlashCommandInput, SlashCommandDataSource as _, SlashCommandMixer,
-    TuiSlashCommandDataSource, UpdatedActiveCommands,
+    ParsedSlashCommandInput, SlashCommandDataSource as _, SlashCommandMixer, SlashMenuSource,
+    TelemetryEvent, TuiSlashCommandDataSource, UpdatedActiveCommands,
     should_close_slash_command_menu_for_exact_match, slash_command_query, slash_commands,
 };
 use warp_editor::model::CoreEditorModel;
@@ -88,6 +88,7 @@ pub(crate) struct TuiSlashCommandModel {
     mixer: ModelHandle<SlashCommandMixer>,
     state: TuiSlashCommandState,
     lifecycle: InputDrivenInlineMenuLifecycle,
+    opened_telemetry_emitted: bool,
     highlighted_prefix_len: Option<usize>,
     argument_hint_text: Option<&'static str>,
     conversation_selection: ConversationSelectionHandle,
@@ -126,6 +127,7 @@ impl TuiSlashCommandModel {
             mixer,
             state: TuiSlashCommandState::Closed,
             lifecycle: InputDrivenInlineMenuLifecycle::default(),
+            opened_telemetry_emitted: false,
             highlighted_prefix_len: None,
             argument_hint_text: None,
             conversation_selection,
@@ -157,6 +159,7 @@ impl TuiSlashCommandModel {
                 list,
             },
             lifecycle: InputDrivenInlineMenuLifecycle::default(),
+            opened_telemetry_emitted: false,
             highlighted_prefix_len: None,
             argument_hint_text: None,
             conversation_selection,
@@ -294,6 +297,7 @@ impl TuiSlashCommandModel {
                     prefix: None,
                     description: row.description.clone(),
                     state_suffix: self.state_suffix(&row.title, ctx),
+                    promotional_suffix: None,
                     is_selectable: true,
                     style: TuiInlineMenuRowStyle::InlineMenuItem,
                 })
@@ -330,6 +334,11 @@ impl TuiSlashCommandModel {
             self.auto_approve_enabled(ctx)
         } else if title == slash_commands::NATURAL_LANGUAGE_DETECTION.name {
             AISettings::as_ref(ctx).is_ai_autodetection_enabled(ctx)
+        } else if title == slash_commands::VIM_MODE.name {
+            // Guard against contexts where AppEditorSettings is not registered
+            // (e.g. lightweight test fixtures), matching TuiInputView::vim_mode_enabled.
+            ctx.has_singleton_model::<AppEditorSettings>()
+                && AppEditorSettings::as_ref(ctx).vim_mode_enabled()
         } else {
             return None;
         };
@@ -341,12 +350,17 @@ impl TuiSlashCommandModel {
 
     fn update_from_input(&mut self, force_query: bool, ctx: &mut ModelContext<Self>) {
         let input = input_text(&self.input_editor, ctx);
+        if input.is_empty() || !input.starts_with('/') {
+            self.opened_telemetry_emitted = false;
+        }
         if matches!(
             self.suggestions_mode.as_ref(ctx).mode(),
-            TuiInputSuggestionsMode::ConversationMenu
+            TuiInputSuggestionsMode::ApiKeys
+                | TuiInputSuggestionsMode::ConversationMenu
                 | TuiInputSuggestionsMode::ModelSelector
                 | TuiInputSuggestionsMode::SkillMenu
                 | TuiInputSuggestionsMode::Mcp
+                | TuiInputSuggestionsMode::McpInstall
         ) {
             self.set_highlighted_prefix_len(None, ctx);
             self.set_argument_hint_text(None, ctx);
@@ -412,6 +426,17 @@ impl TuiSlashCommandModel {
                     query: query.clone(),
                     list,
                 };
+                if !self.opened_telemetry_emitted {
+                    self.opened_telemetry_emitted = true;
+                    warp::send_telemetry_from_ctx!(
+                        TelemetryEvent::OpenSlashMenu {
+                            source: SlashMenuSource::UserTyped,
+                            is_inline_ui_enabled: true,
+                            is_in_agent_view: true,
+                        },
+                        ctx
+                    );
+                }
             }
             TuiSlashCommandState::Open {
                 query: current_query,

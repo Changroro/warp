@@ -1,7 +1,19 @@
+use std::io;
+
 use ai::LLMProvider;
 use clap::Parser;
+use warp::tui_export::register_tui_session_view_test_singletons;
+use warpui::platform::WindowStyle;
+use warpui::{AddWindowOptions, SingletonEntity};
+use warpui_core::App;
+use warpui_core::runtime::TuiDriverStartupError;
 
-use super::{TuiArgs, parse_resume_token};
+use super::{
+    TuiArgs, ensure_terminal_session, handle_tui_driver_startup_error, parse_resume_token,
+};
+use crate::root_view::RootTuiView;
+use crate::session_registry::TuiSessions;
+use crate::test_fixtures::{add_test_semantic_selection, add_test_terminal_session};
 
 #[test]
 fn parses_provider_api_key_setup_flag() {
@@ -51,6 +63,7 @@ fn provider_api_key_help_lists_supported_providers() {
         let expected = format!("{flag} <{}>", LLMProvider::API_KEY_PROVIDER_VALUE_NAME);
         assert!(help.contains(&expected));
     }
+    assert!(help.contains("--auto-approve"));
 }
 
 #[test]
@@ -60,12 +73,14 @@ fn parses_resume_server_token() {
         "warp",
         "--resume",
         token.as_str(),
+        "--auto-approve",
         "--api-key",
         "test-api-key",
     ])
     .expect("TUI launch arguments should parse together");
 
     assert_eq!(args.resume.as_deref(), Some(token.as_str()));
+    assert!(args.auto_approve);
     assert_eq!(args.api_key.as_deref(), Some("test-api-key"));
     assert_eq!(
         parse_resume_token(token.clone())
@@ -73,6 +88,49 @@ fn parses_resume_server_token() {
             .as_str(),
         token
     );
+}
+
+#[test]
+fn terminal_bootstrap_is_idempotent_after_background_terminal_exists() {
+    App::test((), |mut app| async move {
+        register_tui_session_view_test_singletons(&mut app);
+        add_test_semantic_selection(&mut app);
+        app.update(crate::autoupdate::TuiAutoupdater::register);
+        let (window_id, root) = app.update(|ctx| {
+            ctx.add_tui_window(
+                AddWindowOptions {
+                    window_style: WindowStyle::NotStealFocus,
+                    ..Default::default()
+                },
+                RootTuiView::new,
+            )
+        });
+        let sessions = app.add_singleton_model(|_| TuiSessions::new_for_test());
+        let (surface, manager) = add_test_terminal_session(&mut app, window_id);
+        app.update(|ctx| {
+            TuiSessions::register_session(&sessions, surface, manager, true, ctx);
+            ensure_terminal_session(&sessions, &root, ctx);
+            ensure_terminal_session(&sessions, &root, ctx);
+        });
+
+        app.read(|ctx| assert_eq!(TuiSessions::as_ref(ctx).len(), 1));
+    });
+}
+#[test]
+fn terminal_disconnect_during_driver_startup_exits_without_error() {
+    App::test((), |mut app| async move {
+        app.update(|ctx| {
+            handle_tui_driver_startup_error(
+                TuiDriverStartupError::TerminalDisconnected(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "terminal disconnected",
+                )),
+                ctx,
+            );
+        });
+
+        assert!(app.termination_result().is_none());
+    });
 }
 
 #[test]
@@ -92,6 +150,7 @@ fn accepts_startup_without_resume() {
     let args = TuiArgs::try_parse_from(["warp"]).expect("empty arguments should parse");
 
     assert_eq!(args.resume, None);
+    assert!(!args.auto_approve);
     assert_eq!(args.api_key, None);
     assert_eq!(args.set_provider_api_key, None);
     assert_eq!(args.clear_provider_api_key, None);

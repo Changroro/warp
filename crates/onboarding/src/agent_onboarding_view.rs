@@ -17,7 +17,7 @@ use crate::model::{
 use crate::slides::{
     AgentSlide, AiAccessSlide, AiAccessSlideEvent, AiSetupSlide, CustomizeUISlide, IntentionSlide,
     IntroSlide, IntroSlideEvent, OfferSlide, OfferSlideEvent, OfferVariant, OnboardingModelInfo,
-    OnboardingSlide, ProjectSlide, ThemePickerSlide, ThemePickerSlideEvent, ThirdPartySlide,
+    OnboardingSlide, ThemePickerSlide, ThemePickerSlideEvent, ThirdPartySlide,
 };
 use crate::telemetry::OnboardingEvent;
 
@@ -69,6 +69,10 @@ pub enum AgentOnboardingEvent {
     OfferSetUpLaterSelected {
         variant: OfferVariant,
     },
+    /// The user can now use AI, so onboarding is done for this user.
+    OfferAiSellSatisfied {
+        variant: OfferVariant,
+    },
     /// Emitted when the app regains focus (e.g. user returns from the browser).
     /// The parent should refresh any stale data: available models, workspace/billing metadata, etc.
     AppBecameActive,
@@ -85,7 +89,6 @@ pub struct AgentOnboardingView {
     ai_access_slide: Option<ViewHandle<AiAccessSlide>>,
     offer_slide: Option<ViewHandle<OfferSlide>>,
     third_party_slide: Option<ViewHandle<ThirdPartySlide>>,
-    project_slide: Option<ViewHandle<ProjectSlide>>,
     skippable: bool,
     close_button: button::Button,
     no_ai_confirm_button: button::Button,
@@ -144,7 +147,6 @@ impl AgentOnboardingView {
         models: Vec<OnboardingModelInfo>,
         default_model_id: LLMId,
         workspace_enforces_autonomy: bool,
-        agent_modality_enabled: bool,
         auth_state: OnboardingAuthState,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
@@ -154,7 +156,6 @@ impl AgentOnboardingView {
                 models,
                 default_model_id,
                 workspace_enforces_autonomy,
-                agent_modality_enabled,
                 auth_state,
             )
         });
@@ -174,6 +175,9 @@ impl AgentOnboardingView {
                 }
                 OnboardingStateEvent::AuthStateChanged => {
                     me.handle_auth_state_changed(ctx);
+                }
+                OnboardingStateEvent::AiSellOfferSatisfied => {
+                    me.handle_ai_sell_offer_satisfied(ctx);
                 }
                 OnboardingStateEvent::ModelsUpdated
                 | OnboardingStateEvent::SelectedSlideChanged
@@ -275,13 +279,6 @@ impl AgentOnboardingView {
             Some(ctx.add_typed_action_view(move |ctx| ThirdPartySlide::new(onboarding_state, ctx)))
         };
 
-        let project_slide = if account_first {
-            None
-        } else {
-            let onboarding_state = onboarding_state.clone();
-            Some(ctx.add_typed_action_view(move |_| ProjectSlide::new(onboarding_state)))
-        };
-
         // When the app regains focus (e.g. user returning from the upgrade page in the
         // browser), notify the parent to refresh models and workspace/billing metadata.
         // Debounced to avoid excessive API calls from rapid alt-tabbing.
@@ -312,7 +309,6 @@ impl AgentOnboardingView {
             ai_access_slide,
             offer_slide,
             third_party_slide,
-            project_slide,
             skippable,
             close_button: button::Button::default(),
             no_ai_confirm_button: button::Button::default(),
@@ -338,6 +334,17 @@ impl AgentOnboardingView {
         ctx.notify();
     }
 
+    pub fn set_pricing_promotion_message(
+        &mut self,
+        message: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.onboarding_state.update(ctx, |state, ctx| {
+            state.set_pricing_promotion_message(message, ctx);
+        });
+        ctx.notify();
+    }
+
     pub fn set_workspace_enforces_autonomy(&mut self, value: bool, ctx: &mut ViewContext<Self>) {
         self.onboarding_state.update(ctx, |state, ctx| {
             state.set_workspace_enforces_autonomy(value, ctx);
@@ -350,6 +357,31 @@ impl AgentOnboardingView {
             state.set_auth_state(auth_state, ctx);
         });
         ctx.notify();
+    }
+
+    /// Reports the server's AI credit availability decision, seen on a refresh.
+    /// Safe to call on every refresh: it only advances the AI-sell offer, and
+    /// only when the server says AI is available.
+    pub fn on_ai_credit_availability_observed(
+        &mut self,
+        available: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.onboarding_state.update(ctx, |state, ctx| {
+            state.on_credit_availability_observed(available, ctx);
+        });
+        ctx.notify();
+    }
+
+    /// A web checkout reported success through the desktop hand-off. Returns
+    /// whether an AI-sell onboarding screen consumed it, so the caller can tell
+    /// a post-checkout return apart from an unrelated deeplink.
+    pub fn on_checkout_succeeded(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        let advanced = self
+            .onboarding_state
+            .update(ctx, |state, ctx| state.on_checkout_succeeded(ctx));
+        ctx.notify();
+        advanced
     }
 
     pub fn show_post_auth_offer(&mut self, variant: OfferVariant, ctx: &mut ViewContext<Self>) {
@@ -380,11 +412,7 @@ impl AgentOnboardingView {
         ctx.focus_self();
 
         // Preload customize-slide images so they're ready when the user reaches that slide.
-        if FeatureFlag::AccountFirstOnboarding.is_enabled()
-            || FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
-        {
-            Self::preload_onboarding_images(ctx);
-        }
+        Self::preload_onboarding_images(ctx);
 
         send_telemetry_from_ctx!(OnboardingEvent::OnboardingStarted, ctx);
         send_telemetry_from_ctx!(
@@ -506,6 +534,13 @@ impl AgentOnboardingView {
     fn handle_onboarding_completed(&mut self, ctx: &mut ViewContext<Self>) {
         let settings = self.onboarding_state.as_ref(ctx).settings();
         ctx.emit(AgentOnboardingEvent::OnboardingCompleted(settings));
+    }
+
+    fn handle_ai_sell_offer_satisfied(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(variant) = self.onboarding_state.as_ref(ctx).offer_variant() else {
+            return;
+        };
+        ctx.emit(AgentOnboardingEvent::OfferAiSellSatisfied { variant });
     }
 
     /// Reacts to a billing/auth transition. When the user becomes a paying user
@@ -698,9 +733,6 @@ impl View for AgentOnboardingView {
                     .expect("fallback slide exists"),
             )
             .finish(),
-            OnboardingStep::Project => {
-                ChildView::new(self.project_slide.as_ref().expect("fallback slide exists")).finish()
-            }
             OnboardingStep::PostAuthOffer => {
                 ChildView::new(self.offer_slide.as_ref().expect("offer slide exists")).finish()
             }
@@ -852,13 +884,6 @@ impl TypedActionView for AgentOnboardingView {
                 }),
             OnboardingStep::ThirdParty => self
                 .third_party_slide
-                .as_ref()
-                .expect("fallback slide exists")
-                .update(ctx, |slide, ctx| {
-                    dispatch_onboarding_action_to_slide(slide, *action, ctx)
-                }),
-            OnboardingStep::Project => self
-                .project_slide
                 .as_ref()
                 .expect("fallback slide exists")
                 .update(ctx, |slide, ctx| {

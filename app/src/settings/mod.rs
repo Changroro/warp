@@ -28,6 +28,8 @@ mod onboarding;
 mod pane;
 mod privacy;
 mod same_line_prompt_block;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod schema_generation;
 mod scroll;
 mod select;
 mod session_archive;
@@ -36,6 +38,7 @@ mod ssh;
 mod theme;
 mod tui_autoupdate;
 mod tui_theme;
+mod tui_voice;
 mod tui_zero_state;
 mod vim_banner;
 
@@ -62,10 +65,12 @@ pub use input_mode::*;
 pub use linux::*;
 pub use local_control::*;
 pub use native_preference::*;
-pub use onboarding::*;
+pub(crate) use onboarding::*;
 pub use pane::*;
 pub use privacy::*;
 pub use same_line_prompt_block::*;
+#[cfg(not(target_family = "wasm"))]
+pub use schema_generation::dump_settings_schema;
 pub use scroll::*;
 pub use select::*;
 pub use session_archive::*;
@@ -74,6 +79,7 @@ pub use ssh::*;
 pub use theme::*;
 pub use tui_autoupdate::*;
 pub use tui_theme::*;
+pub use tui_voice::*;
 pub use tui_zero_state::*;
 pub use vim_banner::*;
 use warp_core::user_preferences::GetUserPreferences as _;

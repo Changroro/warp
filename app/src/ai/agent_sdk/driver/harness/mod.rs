@@ -3,16 +3,17 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tempfile::NamedTempFile;
-use warp_cli::agent::Harness;
+use warp_cli::agent::{Harness, HarnessTransport};
 use warp_cli::{
     OZ_CLI_ENV, OZ_HARNESS_ENV, OZ_PARENT_RUN_ID_ENV, OZ_RUN_ID_ENV, SERVER_ROOT_URL_OVERRIDE_ENV,
-    SESSION_SHARING_SERVER_URL_OVERRIDE_ENV, WS_SERVER_URL_OVERRIDE_ENV,
+    SESSION_SHARING_SERVER_URL_OVERRIDE_ENV, WARP_CLI_ENV, WARP_HARNESS_ENV,
+    WARP_PARENT_RUN_ID_ENV, WARP_RUN_ID_ENV, WS_SERVER_URL_OVERRIDE_ENV,
 };
 use warp_core::channel::ChannelState;
 use warp_managed_secrets::ManagedSecretValue;
@@ -22,9 +23,10 @@ use super::terminal::{CommandHandle, TerminalDriver};
 use super::{
     AgentDriver, AgentDriverError, LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
     LEGACY_OZ_PARENT_STATE_ROOT_ENV, OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
-    OZ_MESSAGE_LISTENER_STATE_ROOT_ENV,
+    OZ_MESSAGE_LISTENER_STATE_ROOT_ENV, WARP_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
+    WARP_MESSAGE_LISTENER_STATE_ROOT_ENV,
 };
-use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent_sdk::setup_observability::SetupClientEventReporter;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::ambient_agents::task::HarnessModelConfig;
@@ -36,19 +38,35 @@ use crate::terminal::cli_agent_sessions::{CLIAgentSessionStatus, CLIAgentSession
 use crate::terminal::model::block::{BlockId, SerializedBlock};
 use crate::util::path::resolve_executable;
 
+pub(crate) mod acp;
 pub(crate) mod claude_code;
 pub(crate) mod claude_transcript;
 mod codex;
 pub(crate) mod codex_transcript;
+pub(crate) mod exit_escalation;
 mod gemini;
+mod harness_persistence;
 mod json_utils;
+pub(crate) mod process_control;
+mod save_coordinator;
+mod skill_dirs_publish;
 mod telemetry;
+mod transcript_persistence;
+mod usage_reporting;
+pub(crate) use acp::{AcpHarness, AcpLaunchSpec};
 pub(crate) use claude_code::ClaudeHarness;
 use claude_transcript::ClaudeResumeInfo;
 use codex::CodexHarness;
 use codex_transcript::CodexResumeInfo;
 use gemini::GeminiHarness;
+use harness_persistence::{HarnessPersistence, PersistenceOutcome};
 pub(crate) use telemetry::ThirdPartyHarnessTelemetryEvent;
+
+const HARNESS_FAILURE_OUTPUT_TRUNCATION_MARKER: &str = "\n… harness output truncated …\n";
+
+pub(super) fn prepare_harness_failure_output(output: &str) -> String {
+    super::failure_output::prepare_failure_output(output, HARNESS_FAILURE_OUTPUT_TRUNCATION_MARKER)
+}
 
 /// Harness-agnostic payload describing how to resume an existing conversation.
 ///
@@ -94,7 +112,7 @@ impl TryFrom<ResumePayload> for CodexResumeInfo {
 /// Fetch the harness transcript for `conversation_id` and deserialize it into `E`.
 pub(super) async fn fetch_transcript_envelope<E: serde::de::DeserializeOwned>(
     harness_label: &str,
-    conversation_id: &AIConversationId,
+    conversation_id: &ServerConversationToken,
     client: Arc<dyn HarnessSupportClient>,
 ) -> Result<E, AgentDriverError> {
     let bytes = client.fetch_transcript().await.map_err(|err| {
@@ -164,6 +182,13 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
         false
     }
 
+    /// Whether the harness runs as an interactive CLI agent in the terminal whose progress is
+    /// observed through CLI agent session events and hook plugins. Harnesses that drive a native
+    /// conversation directly return `false`.
+    fn drives_cli_agent_session(&self) -> bool {
+        true
+    }
+
     /// Fetch the harness-specific resume payload for an existing conversation.
     ///
     /// The driver calls this when the user passes `--conversation <id>` and the harness
@@ -176,7 +201,7 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
     /// [`AgentDriverError::ConversationResumeStateMissing`] tagged with the harness label).
     async fn fetch_resume_payload(
         &self,
-        _conversation_id: &AIConversationId,
+        _conversation_id: &ServerConversationToken,
         _harness_support_client: Arc<dyn HarnessSupportClient>,
     ) -> Result<Option<ResumePayload>, AgentDriverError> {
         Ok(None)
@@ -194,6 +219,11 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
     /// `resolved_secrets` provides the raw typed managed secrets so harnesses
     /// can read structured fields (e.g. `base_url`) without relying on env vars.
     ///
+    /// `skill_dirs` lists the workspace's skill source directories in precedence order.
+    ///
+    /// `workspace_root` is the root used for workspace-level inputs, while
+    /// `harness_working_dir` is the directory from which the CLI starts.
+    ///
     /// If `resume` is `Some`, the harness matches on its own [`ResumePayload`]
     /// variant and reuses stored session/conversation ids.
     #[allow(clippy::too_many_arguments)]
@@ -203,12 +233,15 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
         system_prompt: Option<&str>,
         resumption_prompt: Option<&str>,
         context: Option<&str>,
-        working_dir: &Path,
+        workspace_root: &Path,
+        harness_working_dir: &Path,
         task_id: Option<AmbientAgentTaskId>,
         server_api: Arc<ServerApi>,
         terminal_driver: ModelHandle<TerminalDriver>,
         resume: Option<ResumePayload>,
         resolved_env_vars: &HashMap<OsString, OsString>,
+        skill_dirs: &[PathBuf],
+        has_deferred_repositories: bool,
         resolved_secrets: &HashMap<String, ManagedSecretValue>,
         resolved_mcp_servers: &HashMap<String, JSONMCPServer>,
         third_party_harness_model_config: Option<&HarnessModelConfig>,
@@ -243,19 +276,66 @@ impl fmt::Debug for HarnessKind {
     }
 }
 
-/// Build a [`HarnessKind`] for the given [`Harness`].
+/// Whether a run renders through a native `AIConversation` on the sharer rather than through
+/// a CLI agent block in the terminal.
+pub(crate) fn renders_natively(harness: Harness, transport: HarnessTransport) -> bool {
+    match (harness, transport) {
+        (Harness::Oz, _) => true,
+        (
+            Harness::Claude
+            | Harness::Codex
+            | Harness::Gemini
+            | Harness::OpenCode
+            | Harness::Unknown,
+            HarnessTransport::Acp,
+        ) => true,
+        (
+            Harness::Claude
+            | Harness::Codex
+            | Harness::Gemini
+            | Harness::OpenCode
+            | Harness::Unknown,
+            HarnessTransport::Pty,
+        ) => false,
+    }
+}
+
+/// Build a [`HarnessKind`] for the given [`Harness`] and transport.
 ///
 /// We shouldn't ever get a `--harness unknown` here because clap should handle
 /// it.
-pub(crate) fn harness_kind(harness: Harness) -> Result<HarnessKind, AgentDriverError> {
-    match harness {
-        Harness::Oz => Ok(HarnessKind::Oz),
-        Harness::Claude => Ok(HarnessKind::ThirdParty(Box::new(ClaudeHarness))),
-        Harness::Codex => Ok(HarnessKind::ThirdParty(Box::new(CodexHarness))),
-        Harness::OpenCode => Ok(HarnessKind::Unsupported(Harness::OpenCode)),
-        Harness::Gemini => Ok(HarnessKind::ThirdParty(Box::new(GeminiHarness))),
-        Harness::Unknown => Err(AgentDriverError::InvalidRuntimeState),
+pub(crate) fn harness_kind(
+    harness: Harness,
+    transport: HarnessTransport,
+) -> Result<HarnessKind, AgentDriverError> {
+    // The transport only selects how a third-party harness is driven; Oz is Warp's own loop.
+    if harness == Harness::Oz {
+        return Ok(HarnessKind::Oz);
     }
+    match transport {
+        HarnessTransport::Pty => match harness {
+            Harness::Oz => Ok(HarnessKind::Oz),
+            Harness::Claude => Ok(HarnessKind::ThirdParty(Box::new(ClaudeHarness))),
+            Harness::Codex => Ok(HarnessKind::ThirdParty(Box::new(CodexHarness))),
+            Harness::OpenCode => Ok(HarnessKind::Unsupported(Harness::OpenCode)),
+            Harness::Gemini => Ok(HarnessKind::ThirdParty(Box::new(GeminiHarness))),
+            Harness::Unknown => Err(AgentDriverError::InvalidRuntimeState),
+        },
+        HarnessTransport::Acp => acp_harness_kind(harness),
+    }
+}
+
+/// Resolves the ACP launch for `harness`, failing when the launch table has no entry for it.
+fn acp_harness_kind(harness: Harness) -> Result<HarnessKind, AgentDriverError> {
+    let Some(launch) = AcpLaunchSpec::for_harness(harness) else {
+        return Err(AgentDriverError::HarnessSetupFailed {
+            harness: harness.to_string(),
+            reason: format!("The {harness} harness cannot be driven over ACP."),
+        });
+    };
+    Ok(HarnessKind::ThirdParty(Box::new(AcpHarness::new(
+        harness, launch,
+    ))))
 }
 
 /// Returns the harness's auth-check preflight command, if any.
@@ -269,7 +349,8 @@ pub(crate) fn harness_kind(harness: Harness) -> Result<HarnessKind, AgentDriverE
 /// for any third-party harness whose `auth_check_command` returns `None`
 /// (e.g. Gemini today).
 pub(crate) fn auth_check_command_for(harness: Harness) -> Option<String> {
-    let HarnessKind::ThirdParty(third_party) = harness_kind(harness).ok()? else {
+    let HarnessKind::ThirdParty(third_party) = harness_kind(harness, HarnessTransport::Pty).ok()?
+    else {
         return None;
     };
     third_party.auth_check_command()
@@ -306,13 +387,23 @@ fn insert_non_empty_task_env_var(
     env_vars.insert(OsString::from(key), OsString::from(value));
 }
 
-fn insert_task_env_var_aliases(
+/// Writes `value` under every name in `keys`.
+///
+/// Gives a variable both its `OZ_` and its `WARP_` name from a single value, so the two cannot
+/// carry different ones. `task_env_vars_mirror_every_oz_var_to_a_warp_name` fails if a name is
+/// listed here under only one of the two spellings.
+///
+/// Takes `AsRef<OsStr>` rather than `&str` so a path-valued variable stays byte-exact: `OZ_CLI`
+/// holds an executable path that agents exec, and a lossy conversion would replace non-UTF-8
+/// bytes and leave them unable to launch it.
+fn insert_task_env_var_names(
     env_vars: &mut HashMap<OsString, OsString>,
     keys: &[&'static str],
-    value: &str,
+    value: impl AsRef<OsStr>,
 ) {
+    let value = value.as_ref();
     for key in keys {
-        env_vars.insert(OsString::from(key), OsString::from(value));
+        env_vars.insert(OsString::from(key), value.to_os_string());
     }
 }
 
@@ -330,49 +421,51 @@ fn task_env_vars_for_harness_name(
     parent_run_id: Option<&str>,
     selected_harness: Harness,
 ) -> HashMap<OsString, OsString> {
-    let mut env_vars = HashMap::with_capacity(7);
+    // Sized for the OZ_/WARP_ pairs written below.
+    let mut env_vars = HashMap::with_capacity(14);
 
     if let Some(id) = task_id {
-        env_vars.insert(
-            OsString::from(OZ_RUN_ID_ENV),
-            OsString::from(id.to_string()),
+        insert_task_env_var_names(
+            &mut env_vars,
+            &[OZ_RUN_ID_ENV, WARP_RUN_ID_ENV],
+            id.to_string(),
         );
     }
 
     if let Some(parent_run_id) = parent_run_id.filter(|id| !id.is_empty()) {
-        env_vars.insert(
-            OsString::from(OZ_PARENT_RUN_ID_ENV),
-            OsString::from(parent_run_id),
+        insert_task_env_var_names(
+            &mut env_vars,
+            &[OZ_PARENT_RUN_ID_ENV, WARP_PARENT_RUN_ID_ENV],
+            parent_run_id,
         );
     }
 
-    env_vars.insert(
-        OsString::from(OZ_CLI_ENV),
-        OsString::from(
-            std::env::current_exe()
-                .unwrap_or_else(|_| ChannelState::channel().cli_command_name().into()),
-        ),
-    );
-    // `OZ_HARNESS` is only consumed by child orchestration telemetry when the child
+    let cli_path = std::env::current_exe()
+        .unwrap_or_else(|_| ChannelState::channel().cli_command_name().into());
+    insert_task_env_var_names(&mut env_vars, &[OZ_CLI_ENV, WARP_CLI_ENV], &cli_path);
+    // The harness name is only consumed by child orchestration telemetry when the child
     // CLI emits `run message *` events.
-    env_vars.insert(
-        OsString::from(OZ_HARNESS_ENV),
-        OsString::from(selected_harness.to_string()),
+    insert_task_env_var_names(
+        &mut env_vars,
+        &[OZ_HARNESS_ENV, WARP_HARNESS_ENV],
+        selected_harness.to_string(),
     );
     if selected_harness == Harness::Claude && task_id.is_some() {
-        insert_task_env_var_aliases(
+        insert_task_env_var_names(
             &mut env_vars,
             &[
                 OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
+                WARP_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
                 LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
             ],
             "1",
         );
         if let Some(state_root) = message_listener_state_root() {
-            insert_task_env_var_aliases(
+            insert_task_env_var_names(
                 &mut env_vars,
                 &[
                     OZ_MESSAGE_LISTENER_STATE_ROOT_ENV,
+                    WARP_MESSAGE_LISTENER_STATE_ROOT_ENV,
                     LEGACY_OZ_PARENT_STATE_ROOT_ENV,
                 ],
                 &state_root,
@@ -406,11 +499,18 @@ fn task_env_vars_for_harness_name(
     env_vars
 }
 
+/// Drops every name under which the externally-managed-listener signal is injected.
+///
+/// The list must stay in step with the one `task_env_vars_for_harness_name` writes: leaving
+/// one name behind would tell the Claude plugin that Warp owns the listener when it does not.
+/// `prepare_local_wake_command_rehydrates_transcript_with_self_managed_listener` asserts none
+/// of them survive.
 pub(crate) fn remove_claude_externally_managed_listener_env_vars(
     env_vars: &mut HashMap<OsString, OsString>,
 ) {
     for env_name in [
         OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
+        WARP_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
         LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
     ] {
         env_vars.remove(OsStr::new(env_name));
@@ -456,12 +556,13 @@ pub(crate) fn harness_model_env_vars(
 /// Indicates when the harness conversation is being saved.
 /// Implementations may use this to customize the saved data, such as
 /// recording additional metadata on completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SavePoint {
     /// A periodic auto-save to minimize data loss.
     Periodic,
-    /// The final save of conversation state, after the harness has completed.
+    /// The closing save after graceful or forced harness termination.
     Final,
-    /// A save after the harness reports it finished an agent turn.
+    /// A save after a completed, failed, or cancelled turn.
     PostTurn,
 }
 
@@ -480,14 +581,13 @@ pub(crate) enum HarnessCleanupDisposition {
 /// Stateful per-run representation of an external harness produced
 /// by [`ThirdPartyHarness::build_runner`].
 ///
-/// All `HarnessRunner` methods take `&self` as a parameter, but may mutate internal
-/// state. There are no `&mut self` methods, as this would require that the `AgentDriver`
-/// store the runner in a mutex and lock it across `await` points.
+/// Methods share runner ownership but may mutate internal state. There are no `&mut self` methods,
+/// as this would require that the `AgentDriver` store the runner in a mutex across `await` points.
 ///
 /// The driver uses this to manage the lifecycle of a particular third-party harness.
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
-pub(crate) trait HarnessRunner: Send + Sync {
+pub(crate) trait HarnessRunner: Send + Sync + 'static {
     fn harness_name(&self) -> &str;
 
     /// Create the external conversation on the server and start the harness
@@ -507,10 +607,51 @@ pub(crate) trait HarnessRunner: Send + Sync {
         &self,
         save_point: SavePoint,
         foreground: &ModelSpawner<AgentDriver>,
-    ) -> Result<()>;
+    ) -> PersistenceOutcome;
+    fn persistence(&self) -> &HarnessPersistence;
+
+    /// Save points the runner raises on its own while the harness is running, which the driver
+    /// forwards to [`Self::enqueue_save`].
+    fn save_requests(&self) -> Option<async_channel::Receiver<SavePoint>> {
+        None
+    }
+
+    /// Queues a save without waiting for persistence; overlapping requests are coalesced.
+    async fn enqueue_save(
+        self: Arc<Self>,
+        save_point: SavePoint,
+        foreground: &ModelSpawner<AgentDriver>,
+    ) -> Result<()> {
+        let background = foreground.spawn(|_, ctx| ctx.background_executor()).await?;
+        self.persistence().enqueue(
+            Arc::downgrade(&self),
+            save_point,
+            foreground.clone(),
+            background,
+        );
+        Ok(())
+    }
+
+    /// Finalizes persistence within one deadline; staged usage does not determine its result.
+    async fn finalize_saves(&self, foreground: &ModelSpawner<AgentDriver>) -> Result<()> {
+        let background = foreground.spawn(|_, ctx| ctx.background_executor()).await?;
+        self.persistence()
+            .finalize(self, foreground, &background)
+            .await
+    }
 
     /// Gracefully ask the harness to exit.
     async fn exit(&self, foreground: &ModelSpawner<AgentDriver>) -> Result<()>;
+
+    /// Sends a follow-up input shortly after [`Self::exit`], without waiting
+    /// to see whether it's needed, to retry a dropped write or dismiss a
+    /// confirmation the harness may have opened (e.g. Claude Code's
+    /// background-task exit confirmation). No-op by default; override for
+    /// harnesses with a known follow-up worth sending blind.
+    async fn exit_followup(&self, _foreground: &ModelSpawner<AgentDriver>) -> Result<()> {
+        Ok(())
+    }
+
     /// Handle a CLI session update such as a prompt submit or completed tool use.
     async fn handle_session_update(&self, _foreground: &ModelSpawner<AgentDriver>) -> Result<()> {
         Ok(())
@@ -586,12 +727,12 @@ pub(super) fn write_temp_file(
 /// Upload a [`SerializedBlock`] as the JSON block snapshot for a third-party harness conversation.
 pub(crate) async fn upload_block_snapshot(
     client: &dyn HarnessSupportClient,
-    conversation_id: AIConversationId,
+    conversation_id: &ServerConversationToken,
     block: SerializedBlock,
 ) -> Result<()> {
     log::info!("Uploading block snapshot for CLI agent to conversation {conversation_id}");
     let target = client
-        .get_block_snapshot_upload_target(&conversation_id)
+        .get_block_snapshot_upload_target(conversation_id)
         .await
         .with_context(|| {
             format!("Unable to get block upload slot for conversation {conversation_id}")
@@ -611,7 +752,7 @@ pub(super) async fn upload_current_block_snapshot(
     foreground: &ModelSpawner<AgentDriver>,
     terminal_driver: &ModelHandle<TerminalDriver>,
     client: &dyn HarnessSupportClient,
-    conversation_id: AIConversationId,
+    conversation_id: &ServerConversationToken,
     block_id: BlockId,
 ) -> Result<()> {
     let td = terminal_driver.clone();

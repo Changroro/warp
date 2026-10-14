@@ -944,6 +944,7 @@ impl TerminalView {
             autoexecute_override: None,
             last_event_sequence: None,
             pinned: false,
+            use_warp_credits_instead_of_chatgpt: false,
         };
 
         // We already early-return for empty `tasks` above, so the strict
@@ -1029,7 +1030,9 @@ impl TerminalView {
         });
 
         // Insert into block list if command_block_index is provided
-        let item = RichContentItem::new(
+        let is_agent_transcript_user_query =
+            restored_block_view_handle.as_ref(ctx).has_user_input(ctx);
+        let item = RichContentItem::new_with_agent_transcript_user_query(
             Some(RichContentType::AIBlock),
             restored_block_view_handle.id(),
             FeatureFlag::AgentView
@@ -1042,6 +1045,7 @@ impl TerminalView {
                     .agent_view_state()
                     .active_conversation_id()
                     .is_some_and(|id| id == conversation_id),
+            is_agent_transcript_user_query,
         );
         if let Some(cmd_block_index) = command_block_index {
             self.model

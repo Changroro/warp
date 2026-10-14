@@ -8,6 +8,7 @@ use warpui::{AppContext, SingletonEntity};
 
 use super::llms::{LLMInfo, LLMPreferences};
 use crate::auth::AuthStateProvider;
+use crate::pricing::PricingInfoModel;
 use crate::workspaces::user_workspaces::UserWorkspaces;
 
 impl From<&LLMInfo> for OnboardingModelInfo {
@@ -25,9 +26,13 @@ pub fn build_onboarding_models(
     prefs: &LLMPreferences,
     app: &AppContext,
 ) -> (Vec<OnboardingModelInfo>, LLMId) {
-    let default_id = prefs.get_default_base_model(app).id.clone();
+    let team_uid = None;
+    let default_id = prefs
+        .get_default_base_model_for_team_uid(team_uid, app)
+        .id
+        .clone();
     let models: Vec<OnboardingModelInfo> = prefs
-        .get_base_llm_choices_for_agent_mode(app)
+        .get_base_llm_choices_for_agent_mode_for_team_uid(team_uid, app)
         .map(|llm| {
             let mut info = OnboardingModelInfo::from(llm);
             info.is_default = info.id == default_id;
@@ -51,4 +56,10 @@ pub fn current_onboarding_auth_state(ctx: &AppContext) -> OnboardingAuthState {
     } else {
         OnboardingAuthState::FreeUser
     }
+}
+
+pub fn onboarding_pricing_promotion_message(ctx: &AppContext) -> Option<String> {
+    PricingInfoModel::as_ref(ctx)
+        .promotion_message()
+        .map(str::to_owned)
 }

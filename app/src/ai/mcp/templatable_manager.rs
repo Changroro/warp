@@ -17,6 +17,8 @@ use mcp::oauth;
 pub use native::McpIntegration;
 #[cfg(not(target_family = "wasm"))]
 use parking_lot::Mutex;
+#[cfg(not(target_family = "wasm"))]
+use simple_logger::SimpleLogger;
 use uuid::Uuid;
 #[cfg(not(target_family = "wasm"))]
 use warpui::ModelSpawner;
@@ -49,6 +51,8 @@ pub struct TemplatableMCPServerManager {
 
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     spawned_servers: HashMap<Uuid, SpawnedServerInfo>,
+    #[cfg(not(target_family = "wasm"))]
+    reconnectable_ephemeral_installations: HashMap<Uuid, TemplatableMCPServerInstallation>,
     /// Cached credentials for each server.
     ///
     /// We persist these to secure storage, and if they are present when the server is started,
@@ -99,6 +103,15 @@ pub struct TemplatableMCPServerManager {
     /// spawned, so the field would be dead code there.
     #[cfg(not(target_family = "wasm"))]
     builtin_server_token: Option<String>,
+    /// Log-file handles for spawned server instances, keyed by installation
+    /// UUID. `LogManager` reserves one log path per template UUID and rejects
+    /// re-registration while an unclosed logger holds it, so shutdown paths
+    /// close the outgoing instance's logger eagerly instead of waiting for
+    /// async teardown to drop the remaining clones. Without this, an
+    /// immediate respawn (e.g. the built-in Factory MCP picking up a rotated
+    /// token) loses the race and fails to spawn.
+    #[cfg(not(target_family = "wasm"))]
+    server_loggers: HashMap<Uuid, SimpleLogger>,
 }
 
 /// Information about a spawned server task.
@@ -178,6 +191,47 @@ impl TemplatableMCPServerManager {
         self.is_server_active(uuid) || self.spawned_servers.contains_key(&uuid)
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn reconnectable_installation(
+        &self,
+        installation_uuid: Uuid,
+    ) -> Option<&TemplatableMCPServerInstallation> {
+        self.locally_installed_servers
+            .get(&installation_uuid)
+            .or_else(|| {
+                self.reconnectable_ephemeral_installations
+                    .get(&installation_uuid)
+            })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn register_reconnect_waiter(
+        &mut self,
+        installation_uuid: Uuid,
+        result_tx: ReconnectResultSender,
+    ) -> bool {
+        let should_start_reconnect = !self.pending_reconnections.contains_key(&installation_uuid)
+            && !self.spawned_servers.contains_key(&installation_uuid);
+        self.pending_reconnections
+            .entry(installation_uuid)
+            .or_default()
+            .push(result_tx);
+        should_start_reconnect
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn notify_reconnect_waiters(
+        &mut self,
+        installation_uuid: Uuid,
+        result: Result<rmcp::Peer<rmcp::RoleClient>, String>,
+    ) {
+        if let Some(waiters) = self.pending_reconnections.remove(&installation_uuid) {
+            for tx in waiters {
+                let _ = tx.send(result.clone());
+            }
+        }
+    }
+
     pub fn get_server_state(&self, installation_uuid: Uuid) -> Option<MCPServerState> {
         self.server_states.get(&installation_uuid).copied()
     }
@@ -242,6 +296,14 @@ impl TemplatableMCPServerManager {
         }
         self.get_template_uuid(installation_uuid)
             .is_some_and(|uuid| self.server_credentials.contains_key(&uuid))
+    }
+    #[cfg(all(not(target_family = "wasm"), feature = "tui"))]
+    pub fn can_log_out(&self, installation_uuid: Uuid, app: &warpui::AppContext) -> bool {
+        self.has_credentials(installation_uuid, app)
+            || self
+                .active_servers
+                .get(&installation_uuid)
+                .is_some_and(TemplatableMCPServerInfo::is_authenticated_transport)
     }
 
     /// Returns the JSON Schema `input_schema` for a named tool across active MCP servers.
@@ -362,3 +424,7 @@ impl Entity for TemplatableMCPServerManager {
 }
 
 impl SingletonEntity for TemplatableMCPServerManager {}
+
+#[cfg(test)]
+#[path = "templatable_manager_tests.rs"]
+mod tests;

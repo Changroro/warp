@@ -41,7 +41,10 @@ use crate::ai::AIRequestUsageModel;
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::blocklist::SerializedBlockListItem;
 use crate::ai::llms::{LLMPreferences, LLMPreferencesEvent};
-use crate::ai::onboarding::{build_onboarding_models, current_onboarding_auth_state};
+use crate::ai::onboarding::{
+    build_onboarding_models, current_onboarding_auth_state, onboarding_pricing_promotion_message,
+};
+use crate::ai::request_usage_model::AIRequestUsageModelEvent;
 use crate::app_state::{AppState, PaneUuid, WindowSnapshot};
 use crate::appearance::Appearance;
 use crate::auth::auth_manager::{AuthManager, AuthManagerEvent};
@@ -71,6 +74,7 @@ use crate::linear::LinearIssueWork;
 use crate::notebooks::manager::NotebookSource;
 use crate::pane_group::{NewTerminalOptions, PanesLayout};
 use crate::persistence::ModelEvent;
+use crate::pricing::{PricingInfoModel, PricingInfoModelEvent};
 use crate::server::cloud_objects::update_manager::UpdateManager;
 use crate::server::ids::{ServerId, SyncId};
 use crate::server::server_api::auth::UserAuthenticationError;
@@ -92,7 +96,7 @@ use crate::terminal::shell::ShellType;
 use crate::terminal::view::{TerminalAction, cell_size_and_padding};
 use crate::themes::onboarding_theme_picker_themes;
 use crate::themes::theme::{AnsiColorIdentifier, Blend, Fill, ThemeKind, WarpThemeConfig};
-use crate::uri::{OpenMCPSettingsArgs, OpenSettingsArgs};
+use crate::uri::{OpenMCPSettingsArgs, OpenSettingsArgs, url_reports_checkout_success};
 use crate::util::bindings::{self, is_binding_pty_compliant};
 use crate::util::traffic_lights::{TrafficLightData, TrafficLightMouseStates, traffic_light_data};
 use crate::view_components::DismissibleToast;
@@ -100,10 +104,12 @@ use crate::window_settings::WindowSettings;
 use crate::workspace::hoa_onboarding::mark_hoa_onboarding_completed;
 use crate::workspace::tab_settings::TabSettings;
 use crate::workspace::view::OnboardingTutorial;
-use crate::workspace::{PaneViewLocator, Workspace, WorkspaceAction, WorkspaceRegistry};
+use crate::workspace::{
+    OneTimeModalModel, PaneViewLocator, Workspace, WorkspaceAction, WorkspaceRegistry,
+};
 use crate::workspaces::team_tester::TeamTesterStatus;
 use crate::workspaces::update_manager::TeamUpdateManager;
-use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
+use crate::workspaces::user_workspaces::{ResolvedTeamScope, UserWorkspaces, UserWorkspacesEvent};
 use crate::workspaces::workspace::FtueAccountClass;
 use crate::{
     ChannelState, GlobalResourceHandles, GlobalResourceHandlesProvider, UpdateQuakeModeEventArg,
@@ -138,6 +144,45 @@ fn offer_variant_for_account_class(account_class: FtueAccountClass) -> Option<Of
         FtueAccountClass::FreeIcp => Some(OfferVariant::HeadStart),
         FtueAccountClass::FreeStandard => Some(OfferVariant::ChooseHowToStart),
     }
+}
+
+/// Whether the team selected in `ctx`'s window imposes any AI autonomy policy, which is
+/// what decides whether onboarding offers the user an autonomy choice at all.
+fn team_enforces_autonomy(ctx: &ViewContext<RootView>) -> bool {
+    let user_workspaces = UserWorkspaces::as_ref(ctx);
+    let scope = user_workspaces.team_context(&ctx.handle(), ctx);
+    user_workspaces
+        .ai_autonomy_settings(&scope)
+        .has_any_overrides()
+}
+
+/// Lets app-level models react to this window's workspace becoming visible, e.g. to surface
+/// one-time modals that were deferred while auth or onboarding covered it.
+fn notify_workspace_shown(ctx: &mut ViewContext<RootView>) {
+    let window_id = ctx.window_id();
+    OneTimeModalModel::handle(ctx).update(ctx, |model, ctx| {
+        model.on_workspace_shown(window_id, ctx);
+    });
+}
+
+/// Re-reads the account state onboarding decides on once the user has been out
+/// in the browser: whether they can now use AI, which models they may pick, and
+/// their billing plan. The AI availability read is what the offer slide
+/// advances off, so every path that could follow a purchase goes through here
+/// rather than refreshing its own subset.
+fn refresh_onboarding_account_state(ctx: &mut ViewContext<RootView>) {
+    let scope = ResolvedTeamScope::from_scope(
+        &UserWorkspaces::as_ref(ctx).team_context(&ctx.handle(), ctx),
+    );
+    AIRequestUsageModel::handle(ctx).update(ctx, |usage, ctx| {
+        usage.request_availability_refresh(ctx);
+    });
+    LLMPreferences::handle(ctx).update(ctx, |prefs, ctx| {
+        prefs.refresh_available_models(&scope, ctx);
+    });
+    TeamUpdateManager::handle(ctx).update(ctx, |manager, ctx| {
+        drop(manager.refresh_workspace_metadata(ctx));
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -592,10 +637,9 @@ fn requires_post_onboarding_login(
     warp_drive_enabled: bool,
 ) -> bool {
     !is_logged_in
-        && (FeatureFlag::AccountFirstOnboarding.is_enabled()
-            || ((ai_enabled || warp_drive_enabled)
-                && FeatureFlag::OpenWarpNewSettingsModes.is_enabled()))
+        && (FeatureFlag::AccountFirstOnboarding.is_enabled() || ai_enabled || warp_drive_enabled)
 }
+
 /// Replaces the settings and tutorial snapshots consumed when post-auth
 /// onboarding eventually completes.
 ///
@@ -658,7 +702,7 @@ pub fn create_transferred_window(
             window_bounds,
             title: Some(WINDOW_TITLE.to_owned()),
             background_blur_radius_pixels: Some(*window_settings.background_blur_radius),
-            background_blur_texture: *window_settings.background_blur_texture,
+            background_backdrop: *window_settings.background_backdrop,
             on_gpu_driver_selected: on_gpu_driver_selected_callback(),
             ..Default::default()
         },
@@ -721,11 +765,11 @@ fn open_from_restored(arg: &OpenFromRestoredArg, ctx: &mut AppContext) {
     if let Some(app_state) = &arg.app_state {
         maybe_register_global_window_shortcuts(global_resource_handles.clone(), ctx);
 
-        let (background_blur_radius_pixels, background_blur_texture) = {
+        let (background_blur_radius_pixels, background_backdrop) = {
             let window_settings = WindowSettings::as_ref(ctx);
             (
                 Some(*window_settings.background_blur_radius),
-                *window_settings.background_blur_texture,
+                *window_settings.background_backdrop,
             )
         };
 
@@ -757,7 +801,7 @@ fn open_from_restored(arg: &OpenFromRestoredArg, ctx: &mut AppContext) {
                             title: Some("Warp".to_owned()),
                             fullscreen_state: window.fullscreen_state,
                             background_blur_radius_pixels,
-                            background_blur_texture,
+                            background_backdrop,
                             // Don't use the quake window for positioning new windows.
                             anchor_new_windows_from_closed_position:
                                 NextNewWindowsHasThisWindowsBoundsUponClose::No,
@@ -800,7 +844,7 @@ fn open_from_restored(arg: &OpenFromRestoredArg, ctx: &mut AppContext) {
                                 title: Some("Warp".to_owned()),
                                 fullscreen_state: window.fullscreen_state,
                                 background_blur_radius_pixels,
-                                background_blur_texture,
+                                background_backdrop,
                                 on_gpu_driver_selected: on_gpu_driver_selected_callback(),
                                 ..Default::default()
                             },
@@ -852,7 +896,7 @@ fn open_from_restored(arg: &OpenFromRestoredArg, ctx: &mut AppContext) {
                         title: Some("Warp".to_owned()),
                         fullscreen_state: window.fullscreen_state,
                         background_blur_radius_pixels,
-                        background_blur_texture,
+                        background_backdrop,
                         on_gpu_driver_selected: on_gpu_driver_selected_callback(),
                         ..Default::default()
                     },
@@ -907,6 +951,7 @@ pub(crate) fn open_new_from_path(
                 NewTerminalOptions::default()
                     .with_initial_directory_opt(path_if_directory(&arg.path).map(Into::into)),
             ),
+            initial_team_uid: None,
         },
         ctx,
     )
@@ -941,6 +986,7 @@ fn create_environment(arg: &CreateEnvironmentArg, ctx: &mut AppContext) {
     let (window_id, root_handle) = open_new_with_workspace_source(
         NewWorkspaceSource::Session {
             options: Box::default(),
+            initial_team_uid: None,
         },
         ctx,
     );
@@ -974,6 +1020,7 @@ fn create_environment_and_run(arg: &CreateEnvironmentArg, ctx: &mut AppContext) 
     let (window_id, root_handle) = open_new_with_workspace_source(
         NewWorkspaceSource::Session {
             options: Box::default(),
+            initial_team_uid: None,
         },
         ctx,
     );
@@ -1251,7 +1298,7 @@ fn default_window_options(window_settings: &WindowSettings, ctx: &AppContext) ->
         window_bounds: next_bounds,
         title: Some("Warp".to_owned()),
         background_blur_radius_pixels: Some(*window_settings.background_blur_radius),
-        background_blur_texture: *window_settings.background_blur_texture,
+        background_backdrop: *window_settings.background_backdrop,
         on_gpu_driver_selected: on_gpu_driver_selected_callback(),
         ..Default::default()
     }
@@ -1436,7 +1483,7 @@ fn toggle_quake_mode_window(global_resource_handles: &GlobalResourceHandles, ctx
                     window_bounds: WindowBounds::ExactPosition(config.window_bounds),
                     title: Some("Warp".to_owned()),
                     background_blur_radius_pixels: Some(*window_settings.background_blur_radius),
-                    background_blur_texture: *window_settings.background_blur_texture,
+                    background_backdrop: *window_settings.background_backdrop,
                     // Ignore the quake window for positioning the next window
                     anchor_new_windows_from_closed_position:
                         warpui::NextNewWindowsHasThisWindowsBoundsUponClose::No,
@@ -1557,6 +1604,7 @@ pub enum NewWorkspaceSource {
     },
     Session {
         options: Box<NewTerminalOptions>,
+        initial_team_uid: Option<ServerId>,
     },
     SharedSessionAsViewer {
         session_id: SessionId,
@@ -1581,6 +1629,10 @@ pub enum NewWorkspaceSource {
     },
     /// Starts the workspace with the Cloud Agent setup tab.
     AmbientAgent,
+    /// Opens a new window pre-scoped to a specific team, chosen via the title-bar team switcher.
+    TeamSwitched {
+        team_uid: ServerId,
+    },
     /// A tab is being transferred from another window via the transferable views framework.
     /// The workspace will create a placeholder tab, which will be replaced by the transferred
     /// PaneGroup after window creation.
@@ -1625,6 +1677,13 @@ impl NewWorkspaceSource {
     }
 
     pub fn team_uid(&self, ctx: &AppContext) -> Option<ServerId> {
+        if let Self::Session {
+            initial_team_uid: Some(team_uid),
+            ..
+        } = self
+        {
+            return Some(*team_uid);
+        }
         let source_window_id = match self {
             Self::Empty {
                 previous_active_window,
@@ -1642,13 +1701,29 @@ impl NewWorkspaceSource {
             | Self::WorkflowById { .. }
             | Self::AgentSession { .. }
             | Self::AmbientAgent => None,
-            Self::Restored { .. } => {
-                // TODO: Store the team UID in WindowSnapshot and restore it here.
+            Self::TeamSwitched { team_uid } => return Some(*team_uid),
+            Self::Restored {
+                window_snapshot, ..
+            } => {
+                if let Some(team_uid) = window_snapshot.team_uid {
+                    return Some(team_uid);
+                }
                 None
             }
         };
 
         UserWorkspaces::as_ref(ctx).inherited_or_default_team_uid(source_window_id)
+    }
+
+    /// Whether this source points at specific content (e.g. a shared session or a cloud
+    /// conversation) that a new window should reach directly, rather than being deferred
+    /// behind product onboarding.
+    pub(crate) fn is_content_deep_link(&self) -> bool {
+        matches!(
+            self,
+            NewWorkspaceSource::SharedSessionAsViewer { .. }
+                | NewWorkspaceSource::FromCloudConversationId { .. }
+        )
     }
 }
 
@@ -1681,6 +1756,9 @@ enum AccountFirstCompletion {
     PaidTeam,
     FreeIcpSetupLater,
     FreeStandardSetupLater,
+    /// The user gained AI usage from the offer without ending up on a plan,
+    /// so they remain free-standard.
+    FreeStandardCreditsPurchased,
     UpgradeCompleted,
 }
 
@@ -1691,6 +1769,9 @@ impl AccountFirstCompletion {
             AccountFirstCompletion::PaidTeam => "paid_team",
             AccountFirstCompletion::FreeIcpSetupLater => "free_icp_setup_later",
             AccountFirstCompletion::FreeStandardSetupLater => "free_standard_setup_later",
+            AccountFirstCompletion::FreeStandardCreditsPurchased => {
+                "free_standard_credits_purchased"
+            }
             AccountFirstCompletion::UpgradeCompleted => "upgrade_completed",
         }
     }
@@ -1702,7 +1783,10 @@ impl AccountFirstCompletion {
                 Some(FtueAccountClass::Paid)
             }
             AccountFirstCompletion::FreeIcpSetupLater => Some(FtueAccountClass::FreeIcp),
-            AccountFirstCompletion::FreeStandardSetupLater => Some(FtueAccountClass::FreeStandard),
+            AccountFirstCompletion::FreeStandardSetupLater
+            | AccountFirstCompletion::FreeStandardCreditsPurchased => {
+                Some(FtueAccountClass::FreeStandard)
+            }
         }
     }
 
@@ -1712,6 +1796,7 @@ impl AccountFirstCompletion {
             AccountFirstCompletion::PaidTeam
                 | AccountFirstCompletion::FreeIcpSetupLater
                 | AccountFirstCompletion::FreeStandardSetupLater
+                | AccountFirstCompletion::FreeStandardCreditsPurchased
                 | AccountFirstCompletion::UpgradeCompleted
         )
     }
@@ -1788,6 +1873,8 @@ pub struct RootView {
     /// settings to apply after a new user login / initial cloud load completes
     pending_post_auth_onboarding_settings: Option<SelectedSettings>,
     pending_account_first_settings_class: Option<FtueAccountClass>,
+    /// Prevents onboarding on a new device from overwriting an existing preference.
+    pending_account_first_is_new_account: bool,
     pending_account_first_tutorial_after_settings: bool,
     pending_account_first_sso_login: Option<AccountFirstLoginContext>,
     account_first_refresh_in_flight: bool,
@@ -1846,20 +1933,14 @@ impl RootView {
                 if #[cfg(target_family = "wasm")] {
                     AuthOnboardingState::WebImport(AuthOnboardingTarget::Workspace(workspace_args.into()))
                 } else {
-                    // Account-first onboarding and the current settings-modes flow both run before
-                    // login for users who have not completed onboarding locally.
-                    let pre_login_onboarding_enabled =
-                        FeatureFlag::AccountFirstOnboarding.is_enabled()
-                            || FeatureFlag::OpenWarpNewSettingsModes.is_enabled();
-                    let has_completed_local_onboarding = pre_login_onboarding_enabled
-                        && has_completed_local_onboarding(ctx);
-                    let should_show_pre_login_onboarding = pre_login_onboarding_enabled
-                        && FeatureFlag::AgentOnboarding.is_enabled()
-                        && !has_completed_local_onboarding;
+
                     if FeatureFlag::ForceLogin.is_enabled() {
                         // ForceLogin is true for Preview
                         AuthOnboardingState::Auth(workspace_args.into())
-                    } else if should_show_pre_login_onboarding {
+                    } else if FeatureFlag::AgentOnboarding.is_enabled()
+                        && !has_completed_local_onboarding(ctx)
+                        && !workspace_args.workspace_setting.is_content_deep_link()
+                    {
                         let workspace_args_box: Box<WorkspaceArgs> = workspace_args.into();
                         let onboarding_view = Self::create_agent_onboarding_view(ctx);
                         onboarding_view.update(ctx, |view, ctx| {
@@ -1904,6 +1985,7 @@ impl RootView {
             pending_tutorial: None,
             pending_post_auth_onboarding_settings: None,
             pending_account_first_settings_class: None,
+            pending_account_first_is_new_account: false,
             pending_account_first_tutorial_after_settings: false,
             pending_account_first_sso_login: None,
             account_first_refresh_in_flight: false,
@@ -2100,32 +2182,47 @@ impl RootView {
     fn create_agent_onboarding_view(
         ctx: &mut ViewContext<Self>,
     ) -> ViewHandle<AgentOnboardingView> {
+        let scope = ResolvedTeamScope::from_scope(
+            &UserWorkspaces::as_ref(ctx).team_context(&ctx.handle(), ctx),
+        );
         LLMPreferences::handle(ctx).update(ctx, |prefs, ctx| {
-            prefs.refresh_available_models(ctx);
+            prefs.refresh_available_models(&scope, ctx);
         });
 
         let themes = onboarding_theme_picker_themes();
+        // Resolved against the root view rather than inside the closure below: the view being
+        // constructed there is not in a window yet, so it cannot resolve its own team.
+        let enforces_autonomy = team_enforces_autonomy(ctx);
         let onboarding_view = ctx.add_typed_action_view(move |ctx| {
             let (models, default_model_id) =
                 build_onboarding_models(LLMPreferences::as_ref(ctx), ctx);
 
-            let workspace_enforces_autonomy = UserWorkspaces::as_ref(ctx)
-                .ai_autonomy_settings()
-                .has_any_overrides();
-
             let auth_state = current_onboarding_auth_state(ctx);
 
-            AgentOnboardingView::new(
+            let mut view = AgentOnboardingView::new(
                 themes.clone(),
                 false, // Always use unskippable onboarding.
                 models,
                 default_model_id,
-                workspace_enforces_autonomy,
-                FeatureFlag::AgentView.is_enabled(),
+                enforces_autonomy,
                 auth_state,
                 ctx,
-            )
+            );
+            view.set_pricing_promotion_message(onboarding_pricing_promotion_message(ctx), ctx);
+            view
         });
+        // Keep the offer slide's promotion in sync with server pricing.
+        let onboarding_view_for_pricing = onboarding_view.clone();
+        ctx.subscribe_to_model(
+            &PricingInfoModel::handle(ctx),
+            move |_, _pricing, event, ctx| {
+                let PricingInfoModelEvent::PricingInfoUpdated = event;
+                let promotion_message = onboarding_pricing_promotion_message(ctx);
+                onboarding_view_for_pricing.update(ctx, |onboarding_view, ctx| {
+                    onboarding_view.set_pricing_promotion_message(promotion_message, ctx);
+                });
+            },
+        );
 
         let onboarding_view_clone = onboarding_view.clone();
         ctx.subscribe_to_model(
@@ -2149,12 +2246,9 @@ impl RootView {
         let onboarding_view_for_workspaces = onboarding_view.clone();
         ctx.subscribe_to_model(
             &UserWorkspaces::handle(ctx),
-            move |_, user_workspaces, event, ctx| {
+            move |_, _user_workspaces, event, ctx| {
                 if matches!(event, UserWorkspacesEvent::UpdateWorkspaceSettingsSuccess) {
-                    let workspace_enforces_autonomy = user_workspaces
-                        .as_ref(ctx)
-                        .ai_autonomy_settings()
-                        .has_any_overrides();
+                    let workspace_enforces_autonomy = team_enforces_autonomy(ctx);
                     onboarding_view_for_workspaces.update(ctx, |onboarding_view, ctx| {
                         onboarding_view
                             .set_workspace_enforces_autonomy(workspace_enforces_autonomy, ctx);
@@ -2163,6 +2257,26 @@ impl RootView {
                 let auth_state = current_onboarding_auth_state(ctx);
                 onboarding_view_for_workspaces.update(ctx, |onboarding_view, ctx| {
                     onboarding_view.set_auth_state(auth_state, ctx);
+                });
+            },
+        );
+
+        // Browser checkout doesn't report back to the app, so the offer is only
+        // satisfied once the user can actually make an AI request.
+        let onboarding_view_for_usage = onboarding_view.clone();
+        ctx.subscribe_to_model(
+            &AIRequestUsageModel::handle(ctx),
+            move |_, _usage, event, ctx| {
+                if !matches!(event, AIRequestUsageModelEvent::CreditAvailabilityUpdated) {
+                    return;
+                }
+                let available = {
+                    let user_workspaces = UserWorkspaces::as_ref(ctx);
+                    let scope = user_workspaces.team_context_for_view(ctx);
+                    AIRequestUsageModel::as_ref(ctx).has_any_ai_remaining(&scope, ctx)
+                };
+                onboarding_view_for_usage.update(ctx, |onboarding_view, ctx| {
+                    onboarding_view.on_ai_credit_availability_observed(available, ctx);
                 });
             },
         );
@@ -2180,12 +2294,7 @@ impl RootView {
                         onboarding_view.set_auth_state(auth_state, ctx);
                     });
                     if matches!(event, AuthManagerEvent::AuthComplete) {
-                        LLMPreferences::handle(ctx).update(ctx, |prefs, ctx| {
-                            prefs.refresh_available_models(ctx);
-                        });
-                        TeamUpdateManager::handle(ctx).update(ctx, |manager, ctx| {
-                            drop(manager.refresh_workspace_metadata(ctx));
-                        });
+                        refresh_onboarding_account_state(ctx);
                     }
                 }
             },
@@ -2394,6 +2503,10 @@ impl RootView {
         if FeatureFlag::HOAOnboardingFlow.is_enabled() {
             mark_hoa_onboarding_completed(ctx);
         }
+        let is_new_account = !AuthStateProvider::as_ref(ctx)
+            .get()
+            .is_onboarded()
+            .unwrap_or(true);
         if AuthStateProvider::as_ref(ctx).get().is_logged_in() {
             AuthManager::handle(ctx).update(ctx, |model, ctx| model.set_user_onboarded(ctx));
         }
@@ -2404,11 +2517,19 @@ impl RootView {
         let settings_applied = if account_class.is_none() || cloud_ready {
             self.pending_account_first_settings_class = None;
             if let Some(selected_settings) = self.pending_post_auth_onboarding_settings.take() {
-                apply_account_first_onboarding_settings(&selected_settings, account_class, ctx);
+                let team_context = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+                apply_account_first_onboarding_settings(
+                    &selected_settings,
+                    account_class,
+                    is_new_account,
+                    team_context,
+                    ctx,
+                );
             }
             true
         } else {
             self.pending_account_first_settings_class = account_class;
+            self.pending_account_first_is_new_account = is_new_account;
             false
         };
 
@@ -2427,6 +2548,7 @@ impl RootView {
 
         self.auth_onboarding_state = AuthOnboardingState::Terminal(target.to_workspace(ctx));
         ctx.emit(RootViewEvent::AuthOnboardingStateChanged);
+        notify_workspace_shown(ctx);
         if completion.starts_agent_tutorial() && settings_applied {
             self.start_pending_tutorial(ctx);
         }
@@ -2455,6 +2577,7 @@ impl RootView {
                 self.pending_tutorial = None;
                 self.pending_post_auth_onboarding_settings = None;
                 self.pending_account_first_settings_class = None;
+                self.pending_account_first_is_new_account = false;
                 self.pending_account_first_tutorial_after_settings = false;
                 ctx.emit(RootViewEvent::AuthOnboardingStateChanged);
                 self.focus(ctx);
@@ -2473,7 +2596,8 @@ impl RootView {
                 // User opted out of login: apply locally (no cloud race).
                 // Skipping leaves the user without an account, so AI is disabled.
                 if let Some(selected_settings) = self.pending_post_auth_onboarding_settings.take() {
-                    apply_onboarding_settings(&selected_settings, false, ctx);
+                    let team_context = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+                    apply_onboarding_settings(&selected_settings, false, team_context, ctx);
                 }
                 self.auth_onboarding_state = AuthOnboardingState::Terminal(workspace);
                 ctx.emit(RootViewEvent::AuthOnboardingStateChanged);
@@ -2625,7 +2749,8 @@ impl RootView {
                     return;
                 }
 
-                apply_onboarding_settings(selected_settings, is_logged_in, ctx);
+                let team_context = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+                apply_onboarding_settings(selected_settings, is_logged_in, team_context, ctx);
 
                 if is_logged_in {
                     AuthManager::handle(ctx)
@@ -2637,6 +2762,7 @@ impl RootView {
                 self.pending_tutorial = Some(tutorial);
                 self.auth_onboarding_state = AuthOnboardingState::Terminal(workspace);
                 ctx.emit(RootViewEvent::AuthOnboardingStateChanged);
+                notify_workspace_shown(ctx);
                 self.start_pending_tutorial(ctx);
                 self.start_autoupdate_polling(ctx);
                 ctx.notify();
@@ -2660,6 +2786,7 @@ impl RootView {
                 let workspace = target.to_workspace(ctx);
                 self.auth_onboarding_state = AuthOnboardingState::Terminal(workspace);
                 ctx.emit(RootViewEvent::AuthOnboardingStateChanged);
+                notify_workspace_shown(ctx);
                 self.start_autoupdate_polling(ctx);
                 ctx.notify();
             }
@@ -2840,15 +2967,24 @@ impl RootView {
                     self.complete_account_first(AccountFirstCompletion::FreeStandardSetupLater, ctx)
                 }
             },
+            AgentOnboardingEvent::OfferAiSellSatisfied { variant } => match variant {
+                // Only the free-standard offer sells AI usage.
+                OfferVariant::ChooseHowToStart => {
+                    // The user may have bought a plan or one-time credits;
+                    // record whichever they did.
+                    let completion = if Self::account_first_is_paid(ctx) {
+                        AccountFirstCompletion::UpgradeCompleted
+                    } else {
+                        AccountFirstCompletion::FreeStandardCreditsPurchased
+                    };
+                    self.complete_account_first(completion, ctx);
+                }
+                OfferVariant::HeadStart => {}
+            },
             AgentOnboardingEvent::AppBecameActive => {
-                // fetch the models / workspace metadata when the user tabs/intents back
-                // into the app during onboarding after potentially upgrading
-                LLMPreferences::handle(ctx).update(ctx, |prefs, ctx| {
-                    prefs.refresh_available_models(ctx);
-                });
-                TeamUpdateManager::handle(ctx).update(ctx, |manager, ctx| {
-                    drop(manager.refresh_workspace_metadata(ctx));
-                });
+                // Coming back to the app is when a purchase made in the browser
+                // becomes visible, whichever call to action sent the user there.
+                refresh_onboarding_account_state(ctx);
             }
         }
     }
@@ -2930,7 +3066,28 @@ impl RootView {
                 });
             }
         }
+        // The web checkout confirmation hands the user back through the same
+        // desktop redirect it uses for auth, so the success flag rides along on
+        // a URL that may also have failed to parse as an auth payload.
+        if url_reports_checkout_success(url) {
+            self.notify_onboarding_checkout_succeeded(ctx);
+        }
         true
+    }
+
+    /// Routes a completed web checkout to onboarding. Returns whether an
+    /// AI-sell onboarding screen consumed the signal and advanced.
+    fn notify_onboarding_checkout_succeeded(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        let AuthOnboardingState::PostAuthOnboarding {
+            onboarding_view, ..
+        } = &self.auth_onboarding_state
+        else {
+            return false;
+        };
+        let onboarding_view = onboarding_view.clone();
+        onboarding_view.update(ctx, |onboarding_view, ctx| {
+            onboarding_view.on_checkout_succeeded(ctx)
+        })
     }
 
     #[allow(clippy::ptr_arg)]
@@ -3074,14 +3231,17 @@ impl RootView {
                 // Generic session link: ambient-ness (if any) is discovered at SessionJoined.
                 workspace.add_tab_for_joining_shared_session(*session_id, false, ctx);
             });
-            let window_id = ctx.window_id();
-            ctx.windows().show_window_and_focus_app(window_id);
-            ctx.notify();
-            true
-        } else {
+        } else if !self
+            .auth_onboarding_state
+            .retarget_pending_workspace_for_shared_session(*session_id)
+        {
             log::warn!("Auth not complete before trying to join shared session");
-            false
+            return false;
         }
+        let window_id = ctx.window_id();
+        ctx.windows().show_window_and_focus_app(window_id);
+        ctx.notify();
+        true
     }
 
     /// Opens a cloud conversation in an existing window.
@@ -3274,18 +3434,30 @@ impl RootView {
     ) -> bool {
         let window_id = ctx.window_id();
         if let AuthOnboardingState::Terminal(handle) = &self.auth_onboarding_state {
+            let handle = handle.clone();
             ctx.dispatch_typed_action_for_view(
                 window_id,
                 handle.id(),
                 &WorkspaceAction::ShowSettingsPage(*section),
             );
             ctx.windows().show_window_and_focus_app(window_id);
-        } else {
-            report_error!(
-                "Auth not complete before trying to open settings page",
-                extra: { "section" => ?section }
-            );
+            return true;
         }
+
+        // A checkout confirmation that predates the unified success hand-off
+        // still returns the user through the Billing & Usage deeplink. Landing
+        // it mid-onboarding would interrupt the flow, so onboarding takes it as
+        // the purchase succeeding and moves on instead.
+        if *section == SettingsSection::BillingAndUsage
+            && self.notify_onboarding_checkout_succeeded(ctx)
+        {
+            return true;
+        }
+
+        report_error!(
+            "Auth not complete before trying to open settings page",
+            extra: { "section" => ?section }
+        );
         true
     }
 
@@ -3514,7 +3686,9 @@ impl RootView {
                         self.pending_post_auth_onboarding_settings.take()
                     {
                         // Skipped login → no account → AI disabled.
-                        apply_onboarding_settings(&selected_settings, false, ctx);
+                        let team_context =
+                            UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+                        apply_onboarding_settings(&selected_settings, false, team_context, ctx);
                     }
                     self.auth_onboarding_state = AuthOnboardingState::Terminal(workspace);
                     ctx.emit(RootViewEvent::AuthOnboardingStateChanged);
@@ -3719,10 +3893,14 @@ impl RootView {
             return;
         }
         if let Some(account_class) = self.pending_account_first_settings_class.take() {
+            let is_new_account = self.pending_account_first_is_new_account;
             if let Some(selected_settings) = self.pending_post_auth_onboarding_settings.take() {
+                let team_context = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
                 apply_account_first_onboarding_settings(
                     &selected_settings,
                     Some(account_class),
+                    is_new_account,
+                    team_context,
                     ctx,
                 );
             }
@@ -3745,7 +3923,8 @@ impl RootView {
             return;
         };
         // Reached only after a successful login, so the user has an account.
-        apply_onboarding_settings(&selected_settings, true, ctx);
+        let team_context = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+        apply_onboarding_settings(&selected_settings, true, team_context, ctx);
     }
 
     /// If onboarding stored a pending tutorial (because login was required first),
@@ -3759,9 +3938,7 @@ impl RootView {
             return;
         };
 
-        if FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
-            && FeatureFlag::TabConfigs.is_enabled()
-        {
+        if FeatureFlag::TabConfigs.is_enabled() {
             let intention = tutorial.intention();
             if matches!(intention, OnboardingIntention::AgentDrivenDevelopment) {
                 workspace.update(ctx, |view, ctx| {
@@ -3990,14 +4167,23 @@ impl AuthOnboardingState {
             _ => {}
         };
         ctx.emit(RootViewEvent::AuthOnboardingStateChanged);
+        if matches!(self, AuthOnboardingState::Terminal(_)) {
+            notify_workspace_shown(ctx);
+        }
     }
 
     fn try_open_onboarding_slides(&mut self, ctx: &mut ViewContext<RootView>) {
         let target = match self {
             AuthOnboardingState::Auth(args) | AuthOnboardingState::ConfirmIncomingAuth(args) => {
+                if args.workspace_setting.is_content_deep_link() {
+                    return;
+                }
                 AuthOnboardingTarget::Workspace(args.clone())
             }
             AuthOnboardingState::Terminal(workspace) => {
+                if workspace.as_ref(ctx).opened_from_content_deep_link() {
+                    return;
+                }
                 AuthOnboardingTarget::Terminal(workspace.clone())
             }
             _ => {
@@ -4020,6 +4206,7 @@ impl AuthOnboardingState {
         if let AuthOnboardingState::NeedsSsoLink(needs_sso_link_mode) = self {
             *self = AuthOnboardingState::Terminal(needs_sso_link_mode.to_workspace(ctx));
             ctx.emit(RootViewEvent::AuthOnboardingStateChanged);
+            notify_workspace_shown(ctx);
         }
     }
 
@@ -4069,11 +4256,10 @@ impl AuthOnboardingState {
                 report_error!("SSO link required after web user import");
             }
             AuthOnboardingState::NeedsSsoLink { .. } => (),
-            AuthOnboardingState::Onboarding { .. }
-            | AuthOnboardingState::LoginSlide { .. }
-            | AuthOnboardingState::PostAuthOnboarding { .. } => {
-                // For onboarding/login slide, we don't have a workspace yet, so we can't convert to SSO link
-                // This case shouldn't normally occur
+            AuthOnboardingState::Onboarding { target, .. }
+            | AuthOnboardingState::LoginSlide { target, .. }
+            | AuthOnboardingState::PostAuthOnboarding { target, .. } => {
+                *self = AuthOnboardingState::NeedsSsoLink(target.clone())
             }
             AuthOnboardingState::Terminal(terminal_view_handle) => {
                 *self = AuthOnboardingState::NeedsSsoLink(AuthOnboardingTarget::Terminal(
@@ -4134,6 +4320,34 @@ impl AuthOnboardingState {
                 ctx.emit(RootViewEvent::AuthOnboardingStateChanged);
             }
         }
+    }
+
+    /// Redirects a workspace that has not yet been created to join `session_id`.
+    fn retarget_pending_workspace_for_shared_session(&mut self, session_id: SessionId) -> bool {
+        let workspace_args = match self {
+            AuthOnboardingState::Auth(args) | AuthOnboardingState::ConfirmIncomingAuth(args) => {
+                args
+            }
+            AuthOnboardingState::Onboarding { target, .. }
+            | AuthOnboardingState::LoginSlide { target, .. }
+            | AuthOnboardingState::PostAuthOnboarding { target, .. }
+            | AuthOnboardingState::NeedsSsoLink(target) => {
+                let AuthOnboardingTarget::Workspace(args) = target else {
+                    return false;
+                };
+                args
+            }
+            #[cfg(target_family = "wasm")]
+            AuthOnboardingState::WebImport(target) => {
+                let AuthOnboardingTarget::Workspace(args) = target else {
+                    return false;
+                };
+                args
+            }
+            AuthOnboardingState::Terminal(_) => return false,
+        };
+        workspace_args.workspace_setting = NewWorkspaceSource::SharedSessionAsViewer { session_id };
+        true
     }
 }
 
