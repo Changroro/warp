@@ -64,6 +64,8 @@ Hooks in upstream files (`rg -n 'ssh_manager|ssh_profile|SshManager|SshProfiles'
 | `app/src/workspace/header_toolbar_item.rs` | `HeaderToolbarItemKind::SshProfiles` |
 | `app/src/terminal/view.rs` | state field, `handle_ssh_manager_block_started` on `AfterBlockStarted`, `handle_ssh_manager_precmd` on `BlockMetadataReceived`, `paste_image_over_ssh` in `paste`, `wrap_with_ssh_session_bar` in `render`, auto-inject activation, clear on warpify |
 | `app/src/pane_group/pane/terminal_pane.rs` | `set_ssh_manager_attached` on attach and detach, so closed tabs kept for undo don't count as open |
+| `app/src/terminal/model/session.rs` | `Session::ssh_wrapper_socket_path` accessor for image uploads over the SSH wrapper's ControlMaster |
+| `app/src/bin/oss.rs` | enables `FeatureFlag::SshRemoteServer` (remote file browsing) without `release_bundle` |
 | `app/src/terminal/model/terminal_model.rs` | `ignore_bootstrapping_messages_until_command_finished` and its checks in the bootstrap hooks |
 | `app/src/terminal/ssh/util.rs` | `-l` login name parsing into `InteractiveSshCommand::user`, `split_ssh_destination` |
 | `app/src/settings/ssh.rs` | `saved_ssh_host_profiles` and `ssh_host_usage` settings |

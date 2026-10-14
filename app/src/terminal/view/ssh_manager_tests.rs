@@ -309,3 +309,11 @@ fn reconnect_banner_ignores_local_prompts_before_the_watched_command_starts() {
         });
     })
 }
+
+#[test]
+fn warpified_connections_go_through_the_ssh_wrapper() {
+    let (command, control_path) =
+        connection_command("command ssh -p 2222 -- root@host".to_string(), true);
+    assert_eq!(command, "ssh -p 2222 -- root@host");
+    assert_eq!(control_path, None);
+}
