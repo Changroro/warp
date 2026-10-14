@@ -61,7 +61,6 @@ const FIELD_RADIUS: f32 = 6.;
 const NOTICE_SPACING: f32 = 6.;
 const COLOR_DOT_SIZE: f32 = 10.;
 const CHECKBOX_SIZE: f32 = 15.;
-const MAX_RECENT_ROWS: usize = 5;
 const PERMISSION_HINT: &str =
     " Check that you can read and write ~/.ssh/config and that ~/.ssh is yours.";
 
@@ -77,6 +76,7 @@ pub enum SshProfilesPanelAction {
     Edit(Uuid),
     Remove(Uuid),
     TogglePinned(Uuid),
+    OpenRemoteSessions(Uuid),
     QuickConnect,
     SetFilter(HostFilter),
     ToggleGroup(String),
@@ -98,6 +98,7 @@ struct ProfileRowMouseStates {
     checkbox: MouseStateHandle,
     actions: MouseStateHandle,
     connect: MouseStateHandle,
+    remote_sessions: MouseStateHandle,
     pin: MouseStateHandle,
     edit: MouseStateHandle,
     remove: MouseStateHandle,
@@ -109,7 +110,6 @@ struct ProfileRowMouseStates {
 enum RowSection {
     Search,
     Pinned,
-    Recent,
     Group,
 }
 
@@ -1022,20 +1022,6 @@ impl SshProfilesPanelView {
                         .map(|profile| row(profile, RowSection::Pinned)),
                 );
             }
-            let recent = usage
-                .recent_profiles()
-                .filter(|(id, _)| !usage.is_pinned(*id))
-                .filter_map(|(id, _)| find(id))
-                .take(MAX_RECENT_ROWS)
-                .collect::<Vec<_>>();
-            if !recent.is_empty() {
-                children.push(self.render_section_header("Recent", recent.len(), None, appearance));
-                children.extend(
-                    recent
-                        .into_iter()
-                        .map(|profile| row(profile, RowSection::Recent)),
-                );
-            }
         }
 
         let has_tags = profiles.iter().any(|profile| profile.group().is_some());
@@ -1257,6 +1243,12 @@ impl SshProfilesPanelView {
                         appearance,
                     ))
                     .with_child(Self::render_row_action(
+                        Icon::LayoutAlt01,
+                        mouse_states.remote_sessions.clone(),
+                        SshProfilesPanelAction::OpenRemoteSessions(profile_id),
+                        appearance,
+                    ))
+                    .with_child(Self::render_row_action(
                         if is_pinned {
                             Icon::PinFilled
                         } else {
@@ -1444,6 +1436,9 @@ impl TypedActionView for SshProfilesPanelView {
             SshProfilesPanelAction::Edit(id) => self.open_edit_modal(*id, ctx),
             SshProfilesPanelAction::Remove(id) => self.open_delete_modal(*id, ctx),
             SshProfilesPanelAction::TogglePinned(id) => self.toggle_pinned(*id, ctx),
+            SshProfilesPanelAction::OpenRemoteSessions(id) => ctx.dispatch_typed_action(
+                &WorkspaceAction::SshManager(SshManagerAction::OpenRemoteSessions(*id)),
+            ),
             SshProfilesPanelAction::QuickConnect => self.quick_connect(ctx),
             SshProfilesPanelAction::SetFilter(filter) => {
                 self.filter = *filter;

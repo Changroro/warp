@@ -57,6 +57,22 @@ pub fn register(service_name: &str, ctx: &mut warpui_core::AppContext) {
 }
 
 /// Registers a no-op Secure Storage provider with the application.
+/// The platform secure storage that [`register`] or `register_with_fallback` would register,
+/// for processes that run without an app.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
+pub fn platform(
+    service_name: &str,
+    #[cfg_attr(target_os = "macos", allow(unused_variables))] fallback_dir: std::path::PathBuf,
+) -> Model {
+    #[cfg(target_os = "macos")]
+    return Box::new(imp::SecureStorage::new(service_name));
+    #[cfg(not(target_os = "macos"))]
+    return Box::new(imp::SecureStorage::new_with_fallback(
+        service_name,
+        fallback_dir,
+    ));
+}
+
 pub fn register_noop(service_name: &str, ctx: &mut warpui_core::AppContext) {
     ctx.add_singleton_model(|_| -> Model { Box::new(noop::SecureStorage::new(service_name)) });
 }

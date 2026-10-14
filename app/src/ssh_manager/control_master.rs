@@ -13,11 +13,13 @@ pub fn new_control_path() -> Option<PathBuf> {
     if !cfg!(unix) {
         return None;
     }
-    let dir = dirs::home_dir()?.join(".ssh").join("warp-cm");
-    if let Err(err) = create_private_dir(&dir) {
-        log::warn!("Not using an SSH ControlMaster: failed to create {dir:?}: {err:#}");
-        return None;
-    }
+    let dir = match private_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            log::warn!("Not using an SSH ControlMaster: {err:#}");
+            return None;
+        }
+    };
     let name = Uuid::new_v4().simple().to_string();
     let path = dir.join(&name[..12]);
     if !fits_socket_path_limit(&path) {
@@ -25,6 +27,17 @@ pub fn new_control_path() -> Option<PathBuf> {
         return None;
     }
     Some(path)
+}
+
+/// `~/.ssh/warp-cm`, created if needed and private to the current user.
+pub(super) fn private_dir() -> anyhow::Result<PathBuf> {
+    use anyhow::Context as _;
+    let dir = dirs::home_dir()
+        .context("no home directory")?
+        .join(".ssh")
+        .join("warp-cm");
+    create_private_dir(&dir).with_context(|| format!("failed to create {dir:?}"))?;
+    Ok(dir)
 }
 
 /// Unix socket paths are limited to 104 bytes on macOS and 108 on Linux, and ssh appends a
@@ -72,7 +85,7 @@ pub fn with_control_master(command: &str, control_path: &Path) -> String {
 }
 
 /// ssh expands `%` tokens in ControlPath.
-fn escape_ssh_tokens(path: &Path) -> String {
+pub(super) fn escape_ssh_tokens(path: &Path) -> String {
     path.to_string_lossy().replace('%', "%%")
 }
 

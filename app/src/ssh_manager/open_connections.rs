@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 use warpui::{
-    AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity, WeakViewHandle,
+    AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity, ViewHandle,
+    WeakViewHandle,
 };
 
 use crate::terminal::TerminalView;
@@ -46,14 +47,19 @@ impl SshOpenConnections {
     }
 
     pub fn open_count(profile_id: Uuid, app: &AppContext) -> usize {
+        Self::terminals(profile_id, app).len()
+    }
+
+    pub fn terminals(profile_id: Uuid, app: &AppContext) -> Vec<ViewHandle<TerminalView>> {
         if !app.has_singleton_model::<Self>() {
-            return 0;
+            return Vec::new();
         }
         Self::as_ref(app)
             .connections
             .values()
-            .filter(|(terminal, id)| *id == Some(profile_id) && terminal.upgrade(app).is_some())
-            .count()
+            .filter(|(_, id)| *id == Some(profile_id))
+            .filter_map(|(terminal, _)| terminal.upgrade(app))
+            .collect()
     }
 }
 

@@ -57,19 +57,20 @@ Hooks in upstream files (`rg -n 'ssh_manager|ssh_profile|SshManager|SshProfiles'
 
 | File | Hook |
 | --- | --- |
-| `app/src/lib.rs` | `mod ssh_manager;` |
+| `app/src/lib.rs` | `mod ssh_manager;` and the `run_ssh_askpass_if_requested` re-export |
 | `app/src/workspace/mod.rs` | `crate::ssh_manager::init(app)` registers bindings |
 | `app/src/workspace/action.rs` | `WorkspaceAction::SshManager` variant and its save-state arm |
 | `app/src/workspace/view.rs` | state field, constructor, toolbar button/panel arms, action arm, modal, SSH section in `unified_new_session_menu_items` |
 | `app/src/workspace/header_toolbar_item.rs` | `HeaderToolbarItemKind::SshProfiles` |
-| `app/src/terminal/view.rs` | state field, `handle_ssh_manager_block_started` on `AfterBlockStarted`, `handle_ssh_manager_precmd` on `BlockMetadataReceived`, `paste_image_over_ssh` in `paste`, `wrap_with_ssh_session_bar` in `render`, auto-inject activation, clear on warpify |
+| `app/src/terminal/view.rs` | state field, `handle_ssh_manager_block_started` on `AfterBlockStarted`, `handle_ssh_manager_precmd` on `BlockMetadataReceived`, `paste_image_over_ssh` in `paste`, `wrap_with_ssh_session_bar` in `render`, `askpass::strip_env_prefix` on both `warpify_command`s so ssh behind the password helper's env prefix is still detected |
 | `app/src/pane_group/pane/terminal_pane.rs` | `set_ssh_manager_attached` on attach and detach, so closed tabs kept for undo don't count as open |
 | `app/src/terminal/model/session.rs` | `Session::ssh_wrapper_socket_path` accessor for image uploads over the SSH wrapper's ControlMaster |
-| `app/src/bin/oss.rs` | enables `FeatureFlag::SshRemoteServer` (remote file browsing) without `release_bundle` |
+| `app/src/bin/oss.rs` | enables `FeatureFlag::SshRemoteServer` (remote file browsing) without `release_bundle`; exits early as ssh's `SSH_ASKPASS` helper |
 | `app/src/terminal/model/terminal_model.rs` | `ignore_bootstrapping_messages_until_command_finished` and its checks in the bootstrap hooks |
 | `app/src/terminal/ssh/util.rs` | `-l` login name parsing into `InteractiveSshCommand::user`, `split_ssh_destination` |
 | `app/src/settings/ssh.rs` | `saved_ssh_host_profiles` and `ssh_host_usage` settings |
 | `app/src/editor/view/mod.rs` | `set_is_password` / `is_password` |
+| `crates/warpui_extras/src/secure_storage/mod.rs` | `platform()` opens secure storage without an app, for the password helper |
 | `Cargo.toml`, `app/Cargo.toml` | `zeroize` dependency |
 
 ## Session archive

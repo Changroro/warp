@@ -34,6 +34,12 @@ fn main() -> Result<()> {
     }
     ChannelState::set(state);
 
+    // Fork: ssh runs this binary as its password helper for SSH manager connections.
+    #[cfg(unix)]
+    if let Some(exit_code) = warp::run_ssh_askpass_if_requested() {
+        std::process::exit(exit_code);
+    }
+
     warp::run()
 }
 

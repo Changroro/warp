@@ -7,10 +7,6 @@ use crate::test_util::terminal::{add_window_with_terminal, initialize_app_for_te
 
 const SSH_PROFILE_TEST_COMMAND: &str = "command ssh -p 2222 -- root@10.0.0.5";
 
-fn ssh_profile_test_id() -> Uuid {
-    Uuid::from_u128(0x5f2b_1c00_0000_0000_0000_0000_0000_0001)
-}
-
 fn start_block_with_command(
     view: &mut TerminalView,
     command: &str,
@@ -51,13 +47,7 @@ fn arming_an_ssh_profile_with_warpify_disabled_records_the_rendered_command() {
         let terminal = add_window_with_terminal(&mut app, None);
 
         terminal.update(&mut app, |view, ctx| {
-            view.arm_ssh_profile_auto_inject(
-                ssh_profile_test_id(),
-                SSH_PROFILE_TEST_COMMAND.to_string(),
-                false,
-                false,
-                ctx,
-            );
+            view.arm_ssh_profile_connection(SSH_PROFILE_TEST_COMMAND.to_string(), false, ctx);
 
             assert!(!view.ssh_profile.warpification_enabled_at_arm);
             assert_eq!(
@@ -75,13 +65,7 @@ fn arming_an_ssh_profile_with_warpify_enabled_records_no_suppression_command() {
         let terminal = add_window_with_terminal(&mut app, None);
 
         terminal.update(&mut app, |view, ctx| {
-            view.arm_ssh_profile_auto_inject(
-                ssh_profile_test_id(),
-                SSH_PROFILE_TEST_COMMAND.to_string(),
-                true,
-                false,
-                ctx,
-            );
+            view.arm_ssh_profile_connection(SSH_PROFILE_TEST_COMMAND.to_string(), true, ctx);
 
             assert!(view.ssh_profile.warpification_enabled_at_arm);
             assert_eq!(view.ssh_profile.warpify_disabled_command, None);
@@ -101,13 +85,7 @@ fn observing_the_armed_command_suppresses_bootstrap_when_warpify_is_disabled() {
                 "the InitShell probe only re-initializes the shell on a bootstrapped block list"
             );
 
-            view.arm_ssh_profile_auto_inject(
-                ssh_profile_test_id(),
-                SSH_PROFILE_TEST_COMMAND.to_string(),
-                false,
-                false,
-                ctx,
-            );
+            view.arm_ssh_profile_connection(SSH_PROFILE_TEST_COMMAND.to_string(), false, ctx);
             start_block_with_command(view, SSH_PROFILE_TEST_COMMAND, ctx);
 
             assert!(
@@ -125,13 +103,7 @@ fn observing_the_armed_command_does_not_suppress_bootstrap_when_warpify_is_enabl
         let terminal = add_window_with_terminal(&mut app, None);
 
         terminal.update(&mut app, |view, ctx| {
-            view.arm_ssh_profile_auto_inject(
-                ssh_profile_test_id(),
-                SSH_PROFILE_TEST_COMMAND.to_string(),
-                true,
-                false,
-                ctx,
-            );
+            view.arm_ssh_profile_connection(SSH_PROFILE_TEST_COMMAND.to_string(), true, ctx);
             start_block_with_command(view, SSH_PROFILE_TEST_COMMAND, ctx);
 
             assert!(
@@ -149,13 +121,7 @@ fn observing_an_unrelated_command_does_not_suppress_bootstrap() {
         let terminal = add_window_with_terminal(&mut app, None);
 
         terminal.update(&mut app, |view, ctx| {
-            view.arm_ssh_profile_auto_inject(
-                ssh_profile_test_id(),
-                SSH_PROFILE_TEST_COMMAND.to_string(),
-                false,
-                false,
-                ctx,
-            );
+            view.arm_ssh_profile_connection(SSH_PROFILE_TEST_COMMAND.to_string(), false, ctx);
             start_block_with_command(view, "ls -la", ctx);
 
             assert!(
@@ -170,16 +136,10 @@ const SSH_PROFILE_BARE_COMMAND: &str = "ssh -p 2222 -- root@10.0.0.5";
 
 fn arm_warpify_disabled_profile(
     view: &mut TerminalView,
-    password_auto_inject: bool,
+    command: &str,
     ctx: &mut ViewContext<TerminalView>,
 ) {
-    view.arm_ssh_profile_auto_inject(
-        ssh_profile_test_id(),
-        SSH_PROFILE_BARE_COMMAND.to_string(),
-        false,
-        password_auto_inject,
-        ctx,
-    );
+    view.arm_ssh_profile_connection(command.to_string(), false, ctx);
 }
 
 #[test]
@@ -189,7 +149,7 @@ fn suppression_matches_the_armed_command_through_the_command_builtin_prefix() {
         let terminal = add_window_with_terminal(&mut app, None);
 
         terminal.update(&mut app, |view, ctx| {
-            arm_warpify_disabled_profile(view, false, ctx);
+            arm_warpify_disabled_profile(view, SSH_PROFILE_BARE_COMMAND, ctx);
             start_block_with_command(view, "command ssh -p 2222 -- root@10.0.0.5", ctx);
 
             assert!(
@@ -201,13 +161,13 @@ fn suppression_matches_the_armed_command_through_the_command_builtin_prefix() {
 }
 
 #[test]
-fn suppression_falls_back_to_the_parsed_ssh_target_when_password_auto_inject_is_armed() {
+fn suppression_falls_back_to_the_parsed_ssh_target() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         let terminal = add_window_with_terminal(&mut app, None);
 
         terminal.update(&mut app, |view, ctx| {
-            arm_warpify_disabled_profile(view, true, ctx);
+            arm_warpify_disabled_profile(view, SSH_PROFILE_BARE_COMMAND, ctx);
             start_block_with_command(view, "ssh  -p 2222  --  root@10.0.0.5", ctx);
 
             assert!(
@@ -218,22 +178,23 @@ fn suppression_falls_back_to_the_parsed_ssh_target_when_password_auto_inject_is_
     })
 }
 
-/// Profiles with jump hosts disable password auto-inject, which also removes the parsed-target
-/// fallback and leaves suppression on exact string matching alone.
 #[test]
-fn suppression_misses_respaced_commands_without_password_auto_inject() {
+fn suppression_matches_commands_with_the_password_helper_prefix() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         let terminal = add_window_with_terminal(&mut app, None);
+        let mut profile = SshHostProfile::new("box".to_string(), "10.0.0.5".to_string());
+        profile.user = Some("root".to_string());
+        let command = format!(
+            "{}{SSH_PROFILE_BARE_COMMAND}",
+            askpass::env_prefix(&profile).unwrap()
+        );
 
         terminal.update(&mut app, |view, ctx| {
-            arm_warpify_disabled_profile(view, false, ctx);
-            start_block_with_command(view, "ssh  -p 2222  --  root@10.0.0.5", ctx);
+            arm_warpify_disabled_profile(view, &command, ctx);
+            start_block_with_command(view, &command, ctx);
 
-            assert!(
-                model_honors_remote_init_shell(view),
-                "string-only matching does not absorb re-spacing"
-            );
+            assert!(!model_honors_remote_init_shell(view));
         });
     })
 }
@@ -247,7 +208,7 @@ fn suppression_misses_absolute_ssh_paths() {
         let terminal = add_window_with_terminal(&mut app, None);
 
         terminal.update(&mut app, |view, ctx| {
-            arm_warpify_disabled_profile(view, true, ctx);
+            arm_warpify_disabled_profile(view, SSH_PROFILE_BARE_COMMAND, ctx);
             start_block_with_command(view, "/usr/bin/ssh -p 2222 -- root@10.0.0.5", ctx);
 
             assert!(
@@ -259,12 +220,55 @@ fn suppression_misses_absolute_ssh_paths() {
 }
 
 fn watch_quick_connect(view: &mut TerminalView) {
+    watch_quick_connect_in(view, None);
+}
+
+fn watch_quick_connect_in(view: &mut TerminalView, directory: Option<&str>) {
     view.ssh_profile.connection = Some(SshConnectionWatch::new(
         "ssh root@remote".to_string(),
         None,
         "root@remote".to_string(),
         None,
+        directory.map(str::to_string),
     ));
+}
+
+#[test]
+fn startup_directory_is_entered_once_per_connection_on_the_first_remote_prompt() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let local = SessionId::from(1);
+        let remote = SessionId::from(2);
+        let sent = |view: &TerminalView| {
+            view.ssh_profile
+                .connection
+                .as_ref()
+                .is_some_and(|connection| connection.startup_directory_sent)
+        };
+
+        terminal.update(&mut app, |view, ctx| {
+            watch_quick_connect_in(view, Some("/srv/app"));
+            view.active_block_metadata = Some(BlockMetadata::new(Some(local), None));
+            view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(remote), None), ctx);
+            assert!(!sent(view), "nothing is sent before ssh starts");
+
+            start_block_with_command(view, "ssh root@remote", ctx);
+            view.handle_ssh_manager_precmd(&BlockMetadata::new(None, None), ctx);
+            assert!(
+                !sent(view),
+                "a precmd without a session is not the remote shell"
+            );
+
+            view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(remote), None), ctx);
+            assert!(sent(view));
+
+            view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(local), None), ctx);
+            view.active_block_metadata = Some(BlockMetadata::new(Some(local), None));
+            start_block_with_command(view, "ssh root@remote", ctx);
+            assert!(!sent(view), "a reconnect enters the directory again");
+        });
+    })
 }
 
 #[test]
