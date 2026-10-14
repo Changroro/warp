@@ -111,10 +111,26 @@ impl SshConnectionWatch {
 const DISCONNECT_SCAN_CHARS: usize = 600;
 const SESSION_BAR_HEIGHT: f32 = 34.;
 
-fn command_with_control_master(command: String, control_path: Option<&PathBuf>) -> String {
-    match control_path {
-        Some(control_path) => with_control_master(&command, control_path),
-        None => command,
+/// Turns a `command ssh ...` command into the one to run, plus the ControlMaster socket Warp owns
+/// for it.
+///
+/// With SSH Warpification on, the command goes through Warp's `ssh` shell wrapper instead: the
+/// wrapper owns the ControlMaster, and only wrapper sessions get the SSH extension that provides
+/// remote file browsing.
+fn connection_command(command: String, through_wrapper: bool) -> (String, Option<PathBuf>) {
+    if through_wrapper {
+        let command = command
+            .strip_prefix("command ")
+            .unwrap_or(&command)
+            .to_string();
+        return (command, None);
+    }
+    match new_control_path() {
+        Some(control_path) => (
+            with_control_master(&command, &control_path),
+            Some(control_path),
+        ),
+        None => (command, None),
     }
 }
 
@@ -173,8 +189,8 @@ impl TerminalView {
         let enable_ssh_warpification = *WarpifySettings::as_ref(ctx)
             .enable_ssh_warpification
             .value();
-        let control_path = new_control_path();
-        let command = command_with_control_master(profile.to_ssh_command(), control_path.as_ref());
+        let (command, control_path) =
+            connection_command(profile.to_ssh_command(), enable_ssh_warpification);
         // A jump host's prompt can arrive first, so auto-inject would send the final password to it.
         let enable_password_auto_inject = profile.jump_hosts.is_empty();
         log::info!(
@@ -200,9 +216,11 @@ impl TerminalView {
 
     /// Runs `ssh` with the given arguments in this terminal.
     pub fn connect_ssh_destination(&mut self, args: String, ctx: &mut ViewContext<Self>) {
-        let control_path = new_control_path();
-        let command =
-            command_with_control_master(format!("command ssh {args}"), control_path.as_ref());
+        let through_wrapper = *WarpifySettings::as_ref(ctx)
+            .enable_ssh_warpification
+            .value();
+        let (command, control_path) =
+            connection_command(format!("command ssh {args}"), through_wrapper);
         self.ssh_profile.connection = Some(SshConnectionWatch::new(
             command.clone(),
             None,
@@ -225,6 +243,22 @@ impl TerminalView {
         }
     }
 
+    /// The ControlMaster socket of the live connection: Warp's own, or the SSH wrapper's.
+    fn ssh_upload_control_path(&self, app: &AppContext) -> Option<PathBuf> {
+        let connection = self
+            .ssh_profile
+            .connection
+            .as_ref()
+            .filter(|connection| connection.local_session_id.is_some())?;
+        connection.control_path.clone().or_else(|| {
+            let session = self
+                .sessions
+                .as_ref(app)
+                .get(self.active_block_session_id()?)?;
+            session.ssh_wrapper_socket_path().map(PathBuf::from)
+        })
+    }
+
     /// Sends a clipboard image to the remote host of a connected SSH manager session and pastes its
     /// remote path, since programs on the remote host can't read the local clipboard. Returns
     /// whether the paste was handled.
@@ -233,13 +267,7 @@ impl TerminalView {
         clipboard_content: &ClipboardContent,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
-        let Some(control_path) = self
-            .ssh_profile
-            .connection
-            .as_ref()
-            .filter(|connection| connection.local_session_id.is_some())
-            .and_then(|connection| connection.control_path.clone())
-        else {
+        let Some(control_path) = self.ssh_upload_control_path(ctx) else {
             return false;
         };
         // Text copied from apps like spreadsheets often carries an image rendition too.
@@ -271,16 +299,7 @@ impl TerminalView {
         ctx.spawn(
             upload(control_path, data, remote_path),
             move |me, result, ctx| match result {
-                Ok(())
-                    if !me
-                        .ssh_profile
-                        .connection
-                        .as_ref()
-                        .is_some_and(|connection| {
-                            connection.local_session_id.is_some()
-                                && connection.control_path.as_ref() == Some(&uploaded_through)
-                        }) =>
-                {
+                Ok(()) if me.ssh_upload_control_path(ctx) != Some(uploaded_through.clone()) => {
                     log::info!("Not pasting the uploaded image path: the SSH connection ended");
                 }
                 Ok(()) => {

@@ -24,6 +24,14 @@ fn main() -> Result<()> {
     if cfg!(debug_assertions) {
         state = state.with_additional_features(warp_core::features::DEBUG_FLAGS);
     }
+    // Fork: the SSH manager's remote file browsing needs the SSH extension, which upstream only
+    // enables through `release_bundle`. That feature also turns on single-instance mode, which the
+    // fork's per-workspace launcher can't use on Linux.
+    #[cfg(not(windows))]
+    {
+        state =
+            state.with_additional_features(&[warp_core::features::FeatureFlag::SshRemoteServer]);
+    }
     ChannelState::set(state);
 
     warp::run()
