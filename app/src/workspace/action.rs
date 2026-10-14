@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use session_sharing_protocol::common::SessionId;
 use ui_components::lightbox;
-use uuid::Uuid;
 use warp_util::path::LineAndColumnArg;
 use warpui::accessibility::AccessibilityVerbosity;
 use warpui::geometry::rect::RectF;
@@ -400,9 +399,7 @@ pub enum WorkspaceAction {
     /// Toggles the vertical tabs panel. This happens as an explicit action from the user.
     ToggleVerticalTabsPanel,
     OpenVerticalTabsPanel,
-    ToggleSshProfilesPanel,
-    /// Opens a new terminal tab and runs the saved SSH profile command.
-    ConnectSshProfile(Uuid),
+    SshManager(crate::ssh_manager::SshManagerAction),
     ToggleVerticalTabsSettingsPopup,
     SetVerticalTabsDisplayGranularity(VerticalTabsDisplayGranularity),
     SetVerticalTabsTabItemMode(VerticalTabsTabItemMode),
@@ -944,6 +941,7 @@ impl WorkspaceAction {
             ContinueConversationLocally { .. } => true,
             #[cfg(not(target_family = "wasm"))]
             ContinueThirdPartyConversationLocally { .. } => true,
+            SshManager(action) => action.should_save_app_state_on_action(),
             ActivateTab(_)
             | ActivateTabByNumber(_)
             | SetTabShortcutModifierKey { .. }
@@ -1026,7 +1024,6 @@ impl WorkspaceAction {
             | SummarizeAIConversation { .. }
             | OpenRepository { .. }
             | SelectTabConfig(_)
-            | ConnectSshProfile(_)
             | ToggleVerticalTabsPanel
             | OpenVerticalTabsPanel => true, // actions that actually change a state of the state of user's
             // workspace would most likely require a save, so that if the app gets
@@ -1111,7 +1108,6 @@ impl WorkspaceAction {
             | ClosePanel
             | ToggleRightPanel
             | OpenCodeReviewPanel(..)
-            | ToggleSshProfilesPanel
             | ToggleVerticalTabsSettingsPopup
             | SetVerticalTabsDisplayGranularity(_)
             | SetVerticalTabsTabItemMode(_)

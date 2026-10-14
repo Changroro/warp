@@ -680,7 +680,7 @@ fn a_malformed_jump_sources_comment_is_kept_as_a_comment() {
 
 #[test]
 fn rewritten_ids_stop_the_normalizer_from_reassigning_on_every_load() {
-    use crate::terminal::ssh::util::normalize_ssh_host_profiles;
+    use crate::ssh_manager::profile::normalize_ssh_host_profiles;
 
     let duplicate = Uuid::new_v4();
     let nil = Uuid::nil();

@@ -16,7 +16,7 @@ pub(crate) mod onboarding;
 pub(crate) mod openwarp_launch_modal;
 pub(crate) mod orchestration_launch_modal;
 pub(crate) mod right_panel;
-pub(crate) mod ssh_profiles_panel;
+mod ssh_manager;
 mod startup_directory;
 mod tab_grouping;
 #[cfg(test)]
@@ -548,7 +548,7 @@ use crate::workspace::view::orchestration_launch_modal::{
     OrchestrationLaunchModal, OrchestrationLaunchModalEvent,
 };
 use crate::workspace::view::right_panel::{RightPanelEvent, RightPanelView};
-use crate::workspace::view::ssh_profiles_panel::{SshProfilesPanelEvent, SshProfilesPanelView};
+use crate::workspace::view::ssh_manager::SshManagerWorkspaceState;
 use crate::workspace::{ForkFromExchange, ForkedConversationDestination};
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::workspaces::user_workspaces::{ResolvedTeamScope, UserWorkspaces};
@@ -1205,11 +1205,10 @@ pub struct Workspace {
     ai_fact_view: ViewHandle<AIFactView>,
     left_panel_open: bool,
     vertical_tabs_panel_open: bool,
-    ssh_profiles_panel_open: bool,
     vertical_tabs_panel: VerticalTabsPanelState,
     left_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
-    ssh_profiles_panel_view: ViewHandle<SshProfilesPanelView>,
+    ssh_manager: SshManagerWorkspaceState,
     right_panel_view: ViewHandle<RightPanelView>,
     working_directories_model: ModelHandle<pane_group::WorkingDirectoriesModel>,
     agent_management_view: ViewHandle<AgentManagementView>,
@@ -3148,12 +3147,7 @@ impl Workspace {
             me.handle_left_panel_event(event, ctx);
         });
 
-        let ssh_profiles_panel_view = ctx.add_typed_action_view(SshProfilesPanelView::new);
-        ctx.subscribe_to_view(&ssh_profiles_panel_view, |_, _, event, ctx| {
-            if matches!(event, SshProfilesPanelEvent::ModalToggled) {
-                ctx.notify();
-            }
-        });
+        let ssh_manager = SshManagerWorkspaceState::new(ctx);
 
         let right_panel_view = ctx.add_typed_action_view(|ctx| {
             RightPanelView::new(working_directories_model.clone(), ctx)
@@ -3561,11 +3555,10 @@ impl Workspace {
             ai_fact_view,
             left_panel_open: false,
             vertical_tabs_panel_open: false,
-            ssh_profiles_panel_open: false,
             vertical_tabs_panel: Default::default(),
             left_panel_view,
             left_panel_views,
-            ssh_profiles_panel_view,
+            ssh_manager,
             right_panel_view,
             working_directories_model,
             shown_staging_banner_count: 0,
@@ -9636,71 +9629,6 @@ impl Workspace {
             self.vertical_tabs_panel.clear_detail_sidecar();
         }
         self.sync_window_button_visibility(ctx);
-        ctx.notify();
-    }
-
-    fn toggle_ssh_profiles_panel(&mut self, ctx: &mut ViewContext<Self>) {
-        self.ssh_profiles_panel_open = !self.ssh_profiles_panel_open;
-        if !self.ssh_profiles_panel_open {
-            self.ssh_profiles_panel_view
-                .update(ctx, |panel, ctx| panel.on_panel_hidden(ctx));
-        }
-        ctx.notify();
-    }
-
-    fn connect_ssh_profile(&mut self, profile_id: uuid::Uuid, ctx: &mut ViewContext<Self>) {
-        let Some(profile) = SshSettings::as_ref(ctx)
-            .saved_ssh_host_profiles
-            .value()
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .cloned()
-        else {
-            log::warn!(
-                "Failed to start SSH profile session: no saved profile for profile_id={profile_id}"
-            );
-            return;
-        };
-
-        let enable_ssh_warpification = *WarpifySettings::as_ref(ctx)
-            .enable_ssh_warpification
-            .value();
-        let command = profile.to_ssh_command();
-        // A jump host's prompt can arrive first, so auto-inject would send the final password to it.
-        let enable_password_auto_inject = profile.jump_hosts.is_empty();
-        log::info!(
-            "Connecting SSH profile: profile_id={profile_id}, enable_ssh_warpification={enable_ssh_warpification}"
-        );
-        let window_id = ctx.window_id();
-        self.add_new_session_tab_internal_with_default_session_mode_behavior(
-            NewSessionSource::Tab,
-            Some(window_id),
-            None,
-            None,
-            false,
-            DefaultSessionModeBehavior::Ignore,
-            ctx,
-        );
-
-        self.active_tab_pane_group()
-            .update(ctx, |active_group, ctx| {
-                if let Some(terminal_view) = active_group.active_session_view(ctx) {
-                    terminal_view.update(ctx, |terminal_view, ctx| {
-                        terminal_view.arm_ssh_profile_auto_inject(
-                            profile_id,
-                            command.clone(),
-                            enable_ssh_warpification,
-                            enable_password_auto_inject,
-                            ctx,
-                        );
-                        terminal_view.execute_command_or_set_pending(&command, ctx);
-                    });
-                } else {
-                    log::warn!(
-                        "Failed to start SSH profile session: no active session view for profile_id={profile_id}"
-                    );
-                }
-            });
         ctx.notify();
     }
 
@@ -21154,37 +21082,6 @@ impl Workspace {
         .finish()
     }
 
-    fn render_ssh_profiles_button(
-        &self,
-        appearance: &Appearance,
-        ctx: &AppContext,
-    ) -> Box<dyn Element> {
-        SavePosition::new(
-            Container::new(
-                Align::new(
-                    self.render_tab_bar_icon_button(
-                        appearance,
-                        icons::Icon::Globe,
-                        &self.mouse_states.ssh_profiles_icon,
-                        WorkspaceAction::ToggleSshProfilesPanel,
-                        "SSH profiles".to_string(),
-                        keybinding_name_to_display_string(
-                            "workspace:toggle_ssh_profiles_panel",
-                            ctx,
-                        ),
-                        self.ssh_profiles_panel_open,
-                        false,
-                    )
-                    .finish(),
-                )
-                .finish(),
-            )
-            .finish(),
-            "workspace:toggle_ssh_profiles_panel",
-        )
-        .finish()
-    }
-
     fn should_enable_file_tree_and_global_search_for_pane_group(pane_group: &PaneGroup) -> bool {
         pane_group
             .pane_ids()
@@ -23419,12 +23316,7 @@ impl Workspace {
                 }
                 Some(ChildView::new(&self.left_panel_view).finish())
             }
-            HeaderToolbarItemKind::SshProfiles => {
-                if !self.ssh_profiles_panel_open || warpui::platform::is_mobile_device() {
-                    return None;
-                }
-                Some(ChildView::new(&self.ssh_profiles_panel_view).finish())
-            }
+            HeaderToolbarItemKind::SshProfiles => self.render_ssh_profiles_panel(),
             HeaderToolbarItemKind::CodeReview => {
                 if !pane_group.right_panel_open {
                     return None;
@@ -25351,12 +25243,7 @@ impl TypedActionView for Workspace {
                     self.toggle_vertical_tabs_panel(ctx);
                 }
             }
-            ToggleSshProfilesPanel => {
-                self.toggle_ssh_profiles_panel(ctx);
-            }
-            ConnectSshProfile(profile_id) => {
-                self.connect_ssh_profile(*profile_id, ctx);
-            }
+            SshManager(action) => self.handle_ssh_manager_action(action, ctx),
             ToggleNotificationMailbox { select_first } => {
                 if FeatureFlag::HOANotifications.is_enabled()
                     && *AISettings::as_ref(ctx).show_agent_notifications
@@ -27996,11 +27883,7 @@ impl View for Workspace {
             stack.add_child(ChildView::new(&self.header_toolbar_editor_modal).finish());
         }
 
-        if self.ssh_profiles_panel_open
-            && let Some(modal) = self
-                .ssh_profiles_panel_view
-                .read(app, |panel, _| panel.render_modal())
-        {
+        if let Some(modal) = self.render_ssh_profiles_modal(app) {
             stack.add_child(modal);
         }
 

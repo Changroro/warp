@@ -13,6 +13,7 @@ pub(crate) mod queued_prompts_panel;
 #[cfg(test)]
 #[path = "view/queued_prompts_tests.rs"]
 mod queued_prompts_tests;
+mod ssh_manager;
 use ai::agent::action::InsertReviewComment;
 pub use load_ai_conversation::ConversationRestorationInNewPaneType;
 // TODO(advait): if we align on prompt suggestions banner in Input, move code out of inline_banner mod.
@@ -129,6 +130,7 @@ pub(crate) use shared_session::cloud_conversation_continuation::{
 };
 use shared_session::{SharedSessionAdapter, Viewer};
 use ssh_file_upload::{FileUpload, FileUploadEvent};
+use ssh_manager::SshProfileSessionState;
 use sum_tree::SeekBias;
 use use_agent_footer::UseAgentToolbar;
 use uuid::Uuid;
@@ -183,8 +185,6 @@ use warpui::{
     View, ViewAsRef, ViewContext, ViewHandle, WeakModelHandle, WeakViewHandle, WindowId,
     end_trace_after_next, record_trace_event, windowing,
 };
-use warpui_extras::secure_storage::AppContextExt as _;
-use zeroize::Zeroizing;
 
 use self::link_detection::HighlightedLinkOption;
 pub use self::link_detection::{GridHighlightedLink, RichContentLink, RichContentLinkTooltipInfo};
@@ -202,15 +202,7 @@ use super::model::secrets::RichContentSecretTooltipInfo;
 use super::model::selection::ExpandedSelectionRange;
 use super::model::session::SessionBootstrappedEvent;
 use super::settings::AltScreenPaddingMode;
-use super::ssh::auto_inject::{
-    SSH_AUTO_INJECT_POLL_INTERVAL, SSH_PASSWORD_PROMPT_SCAN_CHARS,
-    SSH_PROFILE_WARPIFY_DISABLED_COMMAND_TTL, SshAutoInjectDecision, SshAutoInjectState,
-    normalize_ssh_command, password_has_control_chars,
-};
-use super::ssh::util::{
-    InteractiveSshCommand, SshLoginState, SshWarpifyCommand, check_ssh_login_state,
-    parse_interactive_ssh_command, parse_ssh_login_prompt, ssh_profile_password_key,
-};
+use super::ssh::util::{InteractiveSshCommand, SshWarpifyCommand, parse_interactive_ssh_command};
 use super::warpify::WarpificationSource;
 use super::warpify::success_block::{WarpifySuccessBlock, WarpifySuccessBlockEvent};
 use super::warpify::trigger_state::{SshBlockState, WarpifyState};
@@ -767,12 +759,6 @@ pub const LONG_RUNNING_AGENT_REQUESTED_COMMAND_USER_TOOK_OVER_CONTEXT_KEY: &str 
 
 /// We only auto open the code review pane if the pane it's getting opened from has a certain width
 const MINIMUM_WIDTH_TO_AUTO_OPEN_PANE: f32 = 600.0;
-
-fn last_chars(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars().rev().take(max_chars).collect::<Vec<_>>();
-    chars.reverse();
-    chars.into_iter().collect()
-}
 
 lazy_static! {
     static ref CTRL_SHIFT_A_KEYSTROKE: Keystroke = Keystroke {
@@ -2850,9 +2836,7 @@ pub struct TerminalView {
     find_model: ModelHandle<TerminalFindModel>,
 
     warpify_state: WarpifyState,
-    ssh_auto_inject_state: Option<SshAutoInjectState>,
-    ssh_profile_warpification_enabled_at_arm: bool,
-    ssh_profile_warpify_disabled_command: Option<String>,
+    ssh_profile: SshProfileSessionState,
 
     /// The keystroke bound to canceling a command.
     ///
@@ -4506,9 +4490,7 @@ impl TerminalView {
             input_hoverable_handle: Default::default(),
             find_model,
             warpify_state: Default::default(),
-            ssh_auto_inject_state: None,
-            ssh_profile_warpification_enabled_at_arm: false,
-            ssh_profile_warpify_disabled_command: None,
+            ssh_profile: Default::default(),
             cancel_command_keystroke: keybinding_name_to_keystroke(CANCEL_COMMAND_KEYBINDING, ctx),
             is_file_drop_target: false,
             is_ssh_file_uploader: false,
@@ -12782,21 +12764,8 @@ impl TerminalView {
                     .is_compatible_subshell_command(command, shell_family)
                     || warpify_settings
                         .is_compatible_subshell_command(warpify_command, shell_family);
-                let is_ssh_profile_command_with_warpify_disabled = !self
-                    .ssh_profile_warpification_enabled_at_arm
-                    && (self.ssh_profile_warpify_disabled_command_matches(command)
-                        || self.ssh_profile_warpify_disabled_command_matches(warpify_command)
-                        || self.ssh_auto_inject_state.as_ref().is_some_and(|state| {
-                            state.matches_command(command) || state.matches_command(warpify_command)
-                        }));
-                if is_ssh_profile_command_with_warpify_disabled {
-                    self.model
-                        .lock()
-                        .ignore_bootstrapping_messages_until_command_finished();
-                    log::info!(
-                        "Suppressing SSH profile shell bootstrap because SSH Warpification is disabled"
-                    );
-                }
+                let is_ssh_profile_command_with_warpify_disabled = self
+                    .suppress_ssh_profile_bootstrap_if_warpify_disabled(command, warpify_command);
                 let command_is_denylisted = warpify_settings
                     .is_denylisted_subshell_command(command)
                     || warpify_settings.is_denylisted_subshell_command(warpify_command)
@@ -16879,219 +16848,6 @@ impl TerminalView {
     pub fn execute_command_or_set_pending(&mut self, command: &str, ctx: &mut ViewContext<Self>) {
         self.set_pending_command(command, ctx);
         self.execute_pending_command((), ctx);
-    }
-
-    pub fn arm_ssh_profile_auto_inject(
-        &mut self,
-        profile_id: uuid::Uuid,
-        command: String,
-        ssh_warpification_enabled: bool,
-        enable_password_auto_inject: bool,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        self.ssh_auto_inject_state = if enable_password_auto_inject {
-            let armed_block_id = self.model.lock().block_list().active_block_id().clone();
-            let state = SshAutoInjectState::new(profile_id, command.clone(), armed_block_id);
-            if state.is_none() {
-                log::warn!(
-                    "Not arming SSH profile password auto-inject: no SSH target could be parsed from the profile command for profile_id={profile_id}"
-                );
-            }
-            state
-        } else {
-            None
-        };
-        self.ssh_profile_warpification_enabled_at_arm = ssh_warpification_enabled;
-        self.ssh_profile_warpify_disabled_command = (!ssh_warpification_enabled).then_some(command);
-        log::info!(
-            "Armed SSH profile connection: profile_id={profile_id}, ssh_warpification_enabled={ssh_warpification_enabled}, enable_password_auto_inject={enable_password_auto_inject}"
-        );
-        if !ssh_warpification_enabled {
-            let command_to_clear = self.ssh_profile_warpify_disabled_command.clone();
-            ctx.spawn(
-                async {
-                    Timer::after(SSH_PROFILE_WARPIFY_DISABLED_COMMAND_TTL).await;
-                },
-                move |terminal_view, _, _| {
-                    if terminal_view.ssh_profile_warpify_disabled_command == command_to_clear {
-                        terminal_view.ssh_profile_warpify_disabled_command = None;
-                        terminal_view.ssh_profile_warpification_enabled_at_arm = false;
-                    }
-                },
-            );
-        }
-        if self.ssh_auto_inject_state.is_some() {
-            self.schedule_ssh_profile_auto_inject_poll(ctx);
-        }
-    }
-
-    fn ssh_profile_warpify_disabled_command_matches(&self, command: &str) -> bool {
-        self.ssh_profile_warpify_disabled_command
-            .as_deref()
-            .is_some_and(|profile_command| {
-                normalize_ssh_command(profile_command) == normalize_ssh_command(command)
-            })
-    }
-
-    fn maybe_activate_ssh_profile_auto_inject(
-        &mut self,
-        command: &str,
-        block_id: BlockId,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        let Some(mut state) = self.ssh_auto_inject_state.take() else {
-            return;
-        };
-        if state.is_expired() {
-            self.disarm_ssh_profile_auto_inject();
-            return;
-        }
-        if state.has_target_block() {
-            self.ssh_auto_inject_state = Some(state);
-            return;
-        }
-        if !state.matches_command(command) {
-            if state.armed_block_id() == &block_id {
-                self.ssh_auto_inject_state = Some(state);
-            } else {
-                log::info!(
-                    "Disarming SSH profile password auto-inject: another command started for profile_id={}",
-                    state.profile_id()
-                );
-                self.disarm_ssh_profile_auto_inject();
-            }
-            return;
-        }
-
-        state.activate(block_id);
-        self.ssh_auto_inject_state = Some(state);
-        self.schedule_ssh_profile_auto_inject_poll(ctx);
-    }
-
-    fn disarm_ssh_profile_auto_inject(&mut self) {
-        self.ssh_auto_inject_state = None;
-        self.ssh_profile_warpification_enabled_at_arm = false;
-        self.ssh_profile_warpify_disabled_command = None;
-    }
-
-    fn schedule_ssh_profile_auto_inject_poll(&mut self, ctx: &mut ViewContext<Self>) {
-        if self.ssh_auto_inject_state.is_none() {
-            return;
-        }
-        ctx.spawn(
-            async {
-                Timer::after(SSH_AUTO_INJECT_POLL_INTERVAL).await;
-            },
-            |terminal_view, _, ctx| {
-                if !terminal_view.poll_ssh_profile_auto_inject(ctx) {
-                    terminal_view.schedule_ssh_profile_auto_inject_poll(ctx);
-                }
-            },
-        );
-    }
-
-    fn poll_ssh_profile_auto_inject(&mut self, ctx: &mut ViewContext<Self>) -> bool {
-        let Some(mut state) = self.ssh_auto_inject_state.take() else {
-            return true;
-        };
-
-        if state.is_expired() {
-            self.disarm_ssh_profile_auto_inject();
-            return true;
-        }
-
-        let profile_id = state.profile_id();
-        let (active_block_id, active_command, output_tail) = {
-            let model = self.model.lock();
-            let active_block = model.block_list().active_block();
-            (
-                active_block.id().clone(),
-                active_block.command_to_string(),
-                last_chars(
-                    &active_block.output_to_string(),
-                    SSH_PASSWORD_PROMPT_SCAN_CHARS,
-                ),
-            )
-        };
-
-        let target_block_id = if let Some(target_block_id) = state.target_block_id().cloned() {
-            target_block_id
-        } else if state.matches_command(&active_command) {
-            state.activate(active_block_id.clone());
-            active_block_id.clone()
-        } else if state.armed_block_id() == &active_block_id {
-            self.ssh_auto_inject_state = Some(state);
-            return false;
-        } else {
-            log::info!(
-                "Disarming SSH profile password auto-inject: another command started for profile_id={profile_id}"
-            );
-            self.disarm_ssh_profile_auto_inject();
-            return true;
-        };
-
-        if active_block_id != target_block_id {
-            self.disarm_ssh_profile_auto_inject();
-            return true;
-        }
-
-        if matches!(
-            check_ssh_login_state(&output_tail),
-            SshLoginState::LastLogin | SshLoginState::PromptDetected
-        ) {
-            log::info!(
-                "Disarming SSH profile password auto-inject: the session left authentication for profile_id={profile_id}"
-            );
-            self.disarm_ssh_profile_auto_inject();
-            return true;
-        }
-
-        let Some(prompt) = parse_ssh_login_prompt(&output_tail) else {
-            self.ssh_auto_inject_state = Some(state);
-            return false;
-        };
-
-        if let SshAutoInjectDecision::Skip(reason) = state.evaluate_login_prompt(&prompt) {
-            log::warn!(
-                "Disarming SSH profile password auto-inject: {reason} for profile_id={profile_id}"
-            );
-            self.disarm_ssh_profile_auto_inject();
-            return true;
-        }
-
-        let key = ssh_profile_password_key(profile_id);
-        let password = match ctx.secure_storage().read_value(&key) {
-            Ok(password) => Zeroizing::new(password),
-            Err(err) => {
-                log::warn!(
-                    "Skipping SSH profile password auto-inject: failed to read the stored password for profile_id={profile_id}: {err:#}"
-                );
-                self.disarm_ssh_profile_auto_inject();
-                return true;
-            }
-        };
-
-        if password.is_empty() {
-            log::warn!(
-                "Skipping SSH profile password auto-inject: the stored password is empty for profile_id={profile_id}"
-            );
-            self.disarm_ssh_profile_auto_inject();
-            return true;
-        }
-        if password_has_control_chars(&password) {
-            log::warn!(
-                "Skipping SSH profile password auto-inject: the stored password contains control characters for profile_id={profile_id}"
-            );
-            self.disarm_ssh_profile_auto_inject();
-            return true;
-        }
-
-        let mut password_bytes = Vec::with_capacity(password.len() + 1);
-        password_bytes.extend_from_slice(password.as_bytes());
-        password_bytes.push(escape_sequences::C0::CR);
-        drop(password);
-        self.write_to_pty(password_bytes, ctx);
-        true
     }
 
     fn hide_slow_bootstrap_banner(&mut self, ctx: &mut ViewContext<Self>) {
@@ -27342,7 +27098,7 @@ impl TerminalView {
                 );
             }
             SshLoginStatus::ReadyToWarpify => {
-                self.ssh_auto_inject_state = None;
+                self.ssh_profile.clear_auto_inject();
 
                 // The tmux-based SSH warpification flow has been removed in favor of the
                 // remote-server SSH extension. If this user had previously opted into the tmux

@@ -73,6 +73,7 @@ mod server;
 mod session_archive;
 mod session_management;
 mod shell_indicator;
+mod ssh_manager;
 mod suggestions;
 mod system;
 mod tab;

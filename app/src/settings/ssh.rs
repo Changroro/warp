@@ -1,7 +1,7 @@
 use settings::macros::define_settings_group;
 use settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
 
-use crate::terminal::ssh::util::SshHostProfile;
+use crate::ssh_manager::profile::SshHostProfile;
 
 define_settings_group!(SshSettings,
     settings: [

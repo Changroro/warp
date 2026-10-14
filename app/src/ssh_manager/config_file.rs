@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use super::util::{SshHostProfile, SshJumpHost, default_ssh_port};
+use super::profile::{SshHostProfile, SshJumpHost, default_ssh_port};
 
 const WARP_ID_PREFIX: &str = "# warp-id:";
 const WARP_TAGS_PREFIX: &str = "# warp-tags:";

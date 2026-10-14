@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Merges upstream Warp into the current branch and verifies the fork still builds. See FORK.md.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+    echo "Commit or stash tracked changes before syncing." >&2
+    exit 1
+fi
+
+git fetch upstream master
+before=$(git rev-parse HEAD)
+if ! git merge --no-edit upstream/master; then
+    echo >&2
+    echo "Merge conflicts in:" >&2
+    git diff --name-only --diff-filter=U >&2
+    echo "Resolve them, commit, and rerun this script." >&2
+    exit 1
+fi
+echo "Merged $(git rev-list --count "$before"..HEAD) commits from upstream/master."
+
+cargo check -p warp --all-targets
+cargo nextest run -p warp -E 'test(/ssh|archive|bootstrap/)'

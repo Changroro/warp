@@ -28,11 +28,11 @@ use crate::appearance::Appearance;
 use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
 use crate::modal::{Modal, ModalEvent, ModalViewState};
 use crate::settings::SshSettings;
-use crate::terminal::ssh::config_file;
-use crate::terminal::ssh::util::{
+use crate::ssh_manager::profile::{
     SshHostProfile, SshJumpHost, SshProfileIdReassignment, default_ssh_port,
     normalize_ssh_host_profiles, ssh_profile_password_key,
 };
+use crate::ssh_manager::{SshManagerAction, TOGGLE_PANEL_BINDING_NAME, config_file};
 use crate::themes::theme::Fill as ThemeFill;
 use crate::ui_components::buttons::{icon_button, icon_button_with_color};
 use crate::ui_components::icons::Icon;
@@ -484,8 +484,7 @@ impl SshProfilesPanelView {
         let theme = appearance.theme();
         let close_button = {
             let ui_builder = appearance.ui_builder().clone();
-            let keybinding =
-                keybinding_name_to_display_string("workspace:toggle_ssh_profiles_panel", app);
+            let keybinding = keybinding_name_to_display_string(TOGGLE_PANEL_BINDING_NAME, app);
             let tooltip = if let Some(keybinding) = keybinding {
                 ui_builder
                     .tool_tip_with_sublabel("Close panel".to_string(), keybinding)
@@ -508,7 +507,9 @@ impl SshProfilesPanelView {
             .with_tooltip(move || tooltip)
             .build()
             .on_click(|ctx, _, _| {
-                ctx.dispatch_typed_action(WorkspaceAction::ToggleSshProfilesPanel)
+                ctx.dispatch_typed_action(WorkspaceAction::SshManager(
+                    SshManagerAction::TogglePanel,
+                ))
             })
             .with_cursor(Cursor::PointingHand)
             .finish()
@@ -764,7 +765,9 @@ impl SshProfilesPanelView {
         });
 
         row = row.on_click(move |ctx, _, _| {
-            ctx.dispatch_typed_action(WorkspaceAction::ConnectSshProfile(profile_id));
+            ctx.dispatch_typed_action(WorkspaceAction::SshManager(SshManagerAction::Connect(
+                profile_id,
+            )));
         });
         row.with_defer_events_to_children().finish()
     }

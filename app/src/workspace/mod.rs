@@ -87,6 +87,7 @@ pub fn init(app: &mut AppContext) {
     delete_conversation_confirmation_dialog::init(app);
     crate::tab_configs::remove_confirmation_dialog::init(app);
     hoa_onboarding::init(app);
+    crate::ssh_manager::init(app);
     tab_configs::session_config_modal::init(app);
     view::launch_modal::oz_launch::init(app);
     view::openwarp_launch_modal::init(app);
@@ -768,14 +769,6 @@ pub fn init(app: &mut AppContext) {
         )
         .with_context_predicate(id!("Workspace"))
         .with_custom_action(CustomAction::ToggleWarpDrive),
-        EditableBinding::new(
-            "workspace:toggle_ssh_profiles_panel",
-            BindingDescription::new("Toggle SSH profiles panel")
-                .with_custom_description(bindings::MAC_MENUS_CONTEXT, "Toggle SSH Profiles Panel"),
-            WorkspaceAction::ToggleSshProfilesPanel,
-        )
-        .with_group(bindings::BindingGroup::Navigation.as_str())
-        .with_context_predicate(id!("Workspace")),
         EditableBinding::new(
             TOGGLE_RIGHT_PANEL_BINDING_NAME,
             BindingDescription::new("Toggle code review")
