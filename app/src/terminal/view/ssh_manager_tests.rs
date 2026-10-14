@@ -257,3 +257,55 @@ fn suppression_misses_absolute_ssh_paths() {
         });
     })
 }
+
+fn watch_quick_connect(view: &mut TerminalView) {
+    view.ssh_profile.connection = Some(SshConnectionWatch::new(
+        "ssh root@remote".to_string(),
+        None,
+        "root@remote".to_string(),
+        None,
+    ));
+}
+
+#[test]
+fn reconnect_banner_shows_when_the_local_shell_prompts_after_a_watched_ssh_command() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let local = SessionId::from(1);
+        let remote = SessionId::from(2);
+
+        terminal.update(&mut app, |view, ctx| {
+            watch_quick_connect(view);
+            view.active_block_metadata = Some(BlockMetadata::new(Some(local), None));
+            start_block_with_command(view, "ssh root@remote", ctx);
+
+            view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(remote), None), ctx);
+            assert!(view.ssh_profile.reconnect_banner.is_none());
+
+            view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(local), None), ctx);
+            assert!(view.ssh_profile.reconnect_banner.is_some());
+
+            start_block_with_command(view, "ssh root@remote", ctx);
+            assert!(view.ssh_profile.reconnect_banner.is_none());
+        });
+    })
+}
+
+#[test]
+fn reconnect_banner_ignores_local_prompts_before_the_watched_command_starts() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let local = SessionId::from(1);
+
+        terminal.update(&mut app, |view, ctx| {
+            watch_quick_connect(view);
+            view.active_block_metadata = Some(BlockMetadata::new(Some(local), None));
+            start_block_with_command(view, "ls", ctx);
+
+            view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(local), None), ctx);
+            assert!(view.ssh_profile.reconnect_banner.is_none());
+        });
+    })
+}

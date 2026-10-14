@@ -12764,8 +12764,8 @@ impl TerminalView {
                     .is_compatible_subshell_command(command, shell_family)
                     || warpify_settings
                         .is_compatible_subshell_command(warpify_command, shell_family);
-                let is_ssh_profile_command_with_warpify_disabled = self
-                    .suppress_ssh_profile_bootstrap_if_warpify_disabled(command, warpify_command);
+                let is_ssh_profile_command_with_warpify_disabled =
+                    self.handle_ssh_manager_block_started(command, warpify_command);
                 let command_is_denylisted = warpify_settings
                     .is_denylisted_subshell_command(command)
                     || warpify_settings.is_denylisted_subshell_command(warpify_command)
@@ -13384,6 +13384,7 @@ impl TerminalView {
                 self.handle_control_master_error(ctx);
             }
             ModelEvent::BlockMetadataReceived(block_metadata_received_event) => {
+                self.handle_ssh_manager_precmd(&block_metadata_received_event.block_metadata, ctx);
                 self.apply_block_metadata_update(
                     &block_metadata_received_event.block_metadata,
                     block_metadata_received_event.is_after_in_band_command,
@@ -17329,6 +17330,10 @@ impl TerminalView {
             TerminalView::middle_click_paste_content(shell_family, ctx)
         } else {
             let clipboard_content = ctx.clipboard().read();
+
+            if !should_paste_in_input && self.paste_image_over_ssh(&clipboard_content, ctx) {
+                return;
+            }
 
             if is_cli_agent_paste && clipboard_content.has_image_data() {
                 if !cfg!(windows) {
@@ -29503,6 +29508,7 @@ impl View for TerminalView {
         } else {
             element
         };
+        let final_element = self.wrap_with_ssh_session_bar(final_element, app);
 
         // Wrap with conversation details panel on the right if open.
         // On WASM, the panel is rendered in the wasm_view instead.

@@ -2,6 +2,7 @@ use settings::macros::define_settings_group;
 use settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
 
 use crate::ssh_manager::profile::SshHostProfile;
+use crate::ssh_manager::usage::SshHostUsage;
 
 define_settings_group!(SshSettings,
     settings: [
@@ -28,6 +29,17 @@ define_settings_group!(SshSettings,
             storage_key: "SavedSSHHostProfiles",
             toml_path: "ssh.saved_profiles",
             description: "Saved SSH host profiles. Passwords are stored separately in secure storage.",
+        },
+        ssh_host_usage: SshHostUsageSetting {
+            type: SshHostUsage,
+            default: SshHostUsage::default(),
+            supported_platforms: SupportedPlatforms::ALL,
+            sync_to_cloud: SyncToCloud::Never,
+            surface: settings::SettingSurfaces::GUI,
+            private: true,
+            storage_key: "SshHostUsage",
+            toml_path: "ssh.host_usage",
+            description: "Pinned and recently used SSH host profiles.",
         },
     ]
 );

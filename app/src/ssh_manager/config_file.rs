@@ -733,9 +733,12 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
 
 fn validate_profile(profile: &SshHostProfile) -> Result<()> {
     validate_value("name", &profile.name)?;
+    validate_token("name", &profile.name)?;
     validate_value("host", &profile.host)?;
+    validate_token("host", &profile.host)?;
     if let Some(user) = &profile.user {
         validate_value("user", user)?;
+        validate_token("user", user)?;
     }
     if let Some(identity_file) = &profile.identity_file {
         validate_value("identity file", identity_file)?;
@@ -745,8 +748,10 @@ fn validate_profile(profile: &SshHostProfile) -> Result<()> {
     }
     for jump in &profile.jump_hosts {
         validate_value("jump host", &jump.host)?;
+        validate_token("jump host", &jump.host)?;
         if let Some(user) = &jump.user {
             validate_value("jump host user", user)?;
+            validate_token("jump host user", user)?;
         }
         if let Some(identity_file) = &jump.identity_file {
             validate_value("jump host identity file", identity_file)?;
@@ -761,6 +766,23 @@ fn validate_value(field: &str, value: &str) -> Result<()> {
             "SSH profile {field} contains the control character U+{:04X}, which cannot be written to ~/.ssh/config",
             control as u32
         );
+    }
+    Ok(())
+}
+
+/// Characters that ssh_config would read as quoting, comments, token expansion, or a word break.
+const UNSAFE_TOKEN_CHARS: [char; 5] = ['"', '\'', '#', '%', '\\'];
+
+/// Rejects values that ssh_config or the command line could read as more than one plain word.
+fn validate_token(field: &str, value: &str) -> Result<()> {
+    if value.starts_with('-') {
+        anyhow::bail!("SSH profile {field} cannot start with '-'");
+    }
+    if let Some(c) = value
+        .chars()
+        .find(|c| c.is_whitespace() || UNSAFE_TOKEN_CHARS.contains(c))
+    {
+        anyhow::bail!("SSH profile {field} cannot contain {c:?}");
     }
     Ok(())
 }

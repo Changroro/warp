@@ -401,3 +401,78 @@ fn legacy_jump_host_without_source_profile_id_deserializes() {
     assert_eq!(decoded.jump_hosts[0].source_profile_id, None);
     assert_eq!(decoded.jump_hosts[0].port, 2200);
 }
+
+#[test]
+fn matches_query_checks_name_host_user_and_tags() {
+    let mut profile = SshHostProfile::new("Web".to_string(), "10.0.0.5".to_string());
+    profile.user = Some("deploy".to_string());
+    profile.tags = vec!["Prod".to_string()];
+    for query in ["web", "10.0", "DEPLOY", "prod", " web "] {
+        assert!(profile.matches_query(query), "{query}");
+    }
+    assert!(!profile.matches_query("staging"));
+}
+
+#[test]
+fn quick_connect_args_accepts_input_with_or_without_ssh() {
+    assert_eq!(
+        quick_connect_args("user@host").as_deref(),
+        Some("user@host")
+    );
+    assert_eq!(
+        quick_connect_args(" ssh  -p 2222 host ").as_deref(),
+        Some("-p 2222 host")
+    );
+    assert_eq!(quick_connect_args("sshbox").as_deref(), Some("sshbox"));
+    assert_eq!(quick_connect_args("ssh"), None);
+    assert_eq!(quick_connect_args("   "), None);
+}
+
+#[test]
+fn quick_connect_destination_parses_user_host_and_port() {
+    let parse = QuickConnectDestination::parse;
+    assert_eq!(
+        parse("deploy@10.0.3.45:2222"),
+        Some(QuickConnectDestination {
+            user: Some("deploy".to_string()),
+            host: "10.0.3.45".to_string(),
+            port: 2222,
+        })
+    );
+    assert_eq!(parse("box").map(|d| (d.user, d.port)), Some((None, 22)));
+    assert_eq!(
+        parse("[::1]:2200").map(|d| (d.host, d.port)),
+        Some(("::1".to_string(), 2200))
+    );
+    assert_eq!(
+        parse("fe80::1").map(|d| d.host),
+        Some("fe80::1".to_string())
+    );
+    assert_eq!(parse("-p 22 host"), None);
+    assert_eq!(parse("host:notaport"), None);
+    assert_eq!(parse("@host"), None);
+}
+
+#[test]
+fn quick_connect_args_turns_host_port_into_a_port_flag() {
+    assert_eq!(
+        quick_connect_args("deploy@10.0.3.45:2222").as_deref(),
+        Some("deploy@10.0.3.45 -p 2222")
+    );
+    assert_eq!(quick_connect_args("ssh box:22").as_deref(), Some("box"));
+}
+
+#[test]
+fn quick_connect_input_never_reaches_the_shell_as_syntax() {
+    assert_eq!(QuickConnectDestination::parse("a;id@host"), None);
+    assert_eq!(QuickConnectDestination::parse("$(id)@host"), None);
+    assert_eq!(QuickConnectDestination::parse("host\"x"), None);
+    assert_eq!(
+        quick_connect_args("host; touch /tmp/pwned").as_deref(),
+        Some("'host;' touch /tmp/pwned")
+    );
+    assert_eq!(
+        quick_connect_args("-p 2222 $(id)@host").as_deref(),
+        Some("-p 2222 '$(id)@host'")
+    );
+}

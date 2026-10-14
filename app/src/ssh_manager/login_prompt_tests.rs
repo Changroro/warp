@@ -77,3 +77,17 @@ fn strict_ssh_password_prompt_detection_rejects_lookalike_prompts() {
             .is_none()
     );
 }
+
+#[test]
+fn password_prompt_must_follow_only_ssh_client_output() {
+    assert!(only_ssh_client_output_before_prompt(
+        "root@web's password: "
+    ));
+    assert!(only_ssh_client_output_before_prompt(
+        "Warning: Permanently added 'web' (ED25519) to the list of known hosts.\nroot@web's password: "
+    ));
+    // A logged-in remote shell printing a look-alike prompt to collect the saved password.
+    assert!(!only_ssh_client_output_before_prompt(
+        "Welcome to Ubuntu 24.04 LTS\nLast login: Mon Oct 13\nroot@web's password: "
+    ));
+}

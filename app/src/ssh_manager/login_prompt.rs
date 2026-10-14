@@ -19,6 +19,32 @@ pub enum SshLoginPromptKind {
     },
 }
 
+/// Lines the ssh client itself prints before asking for a password.
+const SSH_CLIENT_PREAMBLE: [&str; 5] = [
+    "warning:",
+    "the authenticity of host",
+    "key fingerprint is",
+    "this key is not known by any other names",
+    "are you sure you want to continue connecting",
+];
+
+/// Whether everything before the last line of `output` came from the ssh client. Output from the
+/// remote host means authentication already finished, so a password prompt after it could be
+/// forged by the remote to collect the saved password.
+pub fn only_ssh_client_output_before_prompt(output: &str) -> bool {
+    let mut lines = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    lines.pop();
+    lines.iter().all(|line| {
+        let line = line.trim().to_lowercase();
+        SSH_CLIENT_PREAMBLE
+            .iter()
+            .any(|preamble| line.contains(preamble))
+    })
+}
+
 pub fn parse_ssh_login_prompt(output: &str) -> Option<SshLoginPromptKind> {
     lazy_static! {
         static ref PASSWORD_PROMPT: Regex = Regex::new(r"^(?P<principal>.*)'s password:\s*$")

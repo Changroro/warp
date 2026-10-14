@@ -88,6 +88,23 @@ impl SshHostProfile {
         ssh_target(&self.user, &self.host, self.port, false)
     }
 
+    /// Hosts are grouped by their first tag.
+    pub fn group(&self) -> Option<&str> {
+        self.tags.first().map(String::as_str)
+    }
+
+    pub fn matches_query(&self, query: &str) -> bool {
+        let query = query.trim().to_lowercase();
+        [
+            self.name.as_str(),
+            self.host.as_str(),
+            self.user.as_deref().unwrap_or_default(),
+        ]
+        .into_iter()
+        .chain(self.tags.iter().map(String::as_str))
+        .any(|field| field.to_lowercase().contains(&query))
+    }
+
     pub fn to_ssh_command(&self) -> String {
         let mut argv = SSH_COMMAND_LAUNCHER
             .iter()
@@ -263,6 +280,124 @@ fn ssh_target(user: &Option<String>, host: &str, port: u16, include_port: bool) 
         target.push_str(&port.to_string());
     }
     target
+}
+
+/// A quick-connect entry that names one host as `[user@]host[:port]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuickConnectDestination {
+    pub user: Option<String>,
+    pub host: String,
+    pub port: u16,
+}
+
+impl QuickConnectDestination {
+    pub fn parse(input: &str) -> Option<Self> {
+        let input = input.trim();
+        let input = input.strip_prefix("ssh ").map(str::trim).unwrap_or(input);
+        if input.is_empty()
+            || input == "ssh"
+            || input.contains(char::is_whitespace)
+            || input.starts_with('-')
+        {
+            return None;
+        }
+        let (user, host_port) = match input.rsplit_once('@') {
+            Some((user, rest)) if !user.is_empty() => (Some(user.to_string()), rest),
+            Some(_) => return None,
+            None => (None, input),
+        };
+        let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+            let (host, after) = rest.split_once(']')?;
+            match after.strip_prefix(':') {
+                Some(port) => (host, port.parse().ok()?),
+                None if after.is_empty() => (host, default_ssh_port()),
+                None => return None,
+            }
+        } else {
+            match host_port.split_once(':') {
+                // More than one colon is a bare IPv6 address.
+                Some((host, port)) if !port.contains(':') => (host, port.parse().ok()?),
+                _ => (host_port, default_ssh_port()),
+            }
+        };
+        if !is_plain_ssh_word(host) || user.as_deref().is_some_and(|user| !is_plain_ssh_word(user))
+        {
+            return None;
+        }
+        (!host.is_empty() && port != 0).then(|| Self {
+            user,
+            host: host.to_string(),
+            port,
+        })
+    }
+
+    pub fn to_profile(&self) -> SshHostProfile {
+        let mut profile = SshHostProfile::new(self.host.clone(), self.host.clone());
+        profile.user = self.user.clone();
+        profile.port = self.port;
+        profile
+    }
+}
+
+/// Returns the `ssh` arguments for a quick-connect entry, which may start with `ssh` and may name
+/// the port as `host:port`.
+pub fn quick_connect_args(input: &str) -> Option<String> {
+    if let Some(destination) = QuickConnectDestination::parse(input) {
+        let target = ssh_target(
+            &destination.user,
+            &destination.host,
+            destination.port,
+            false,
+        );
+        return Some(if destination.port == default_ssh_port() {
+            target
+        } else {
+            format!("{target} -p {}", destination.port)
+        });
+    }
+    let input = input.trim();
+    let args = input
+        .strip_prefix("ssh ")
+        .map(str::trim_start)
+        .unwrap_or(input);
+    // Quote every word so the input reaches ssh as arguments and never as shell syntax.
+    let words = shell_words::split(args).ok()?;
+    (!words.is_empty() && args != "ssh").then(|| {
+        words
+            .iter()
+            .map(|word| shell_quote_arg(word))
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
+/// A user or host that the shell, ssh options, and ssh_config all read as one literal word.
+fn is_plain_ssh_word(value: &str) -> bool {
+    !value.starts_with('-')
+        && !value.chars().any(|c| {
+            matches!(
+                c,
+                '"' | '\''
+                    | '#'
+                    | '%'
+                    | '\\'
+                    | '$'
+                    | '`'
+                    | ';'
+                    | '&'
+                    | '|'
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+                    | '*'
+                    | '?'
+                    | '!'
+                    | '~'
+                    | '{'
+                    | '}'
+            )
+        })
 }
 
 #[cfg(test)]

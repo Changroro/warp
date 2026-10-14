@@ -1,70 +1,67 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::PoisonError;
 
+use chrono::Utc;
 use pathfinder_geometry::vector::vec2f;
 use settings::Setting as _;
 use uuid::Uuid;
+use warp_core::ui::theme::AnsiColorIdentifier;
 use warp_core::ui::theme::color::internal_colors;
-use warp_editor::editor::NavigationKey;
 use warpui::elements::{
-    Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
-    Container, CornerRadius, CrossAxisAlignment, Expanded, Fill as ElementFill, Flex, Hoverable,
-    MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, Padding, ParentAnchor,
-    ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth, Shrinkable, Stack, Text, Wrap,
+    Border, ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
+    CornerRadius, CrossAxisAlignment, Empty, Expanded, Fill as ElementFill, Flex, Hoverable,
+    MainAxisSize, MouseStateHandle, OffsetPositioning, Padding, ParentAnchor, ParentElement,
+    ParentOffsetBounds, Radius, ScrollbarWidth, Shrinkable, Stack, Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
 use warpui::text_layout::ClipConfig;
-use warpui::ui_components::button::ButtonVariant;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
 };
 use warpui_extras::secure_storage::AppContextExt as _;
-use zeroize::Zeroizing;
 
 use crate::appearance::Appearance;
 use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
 use crate::modal::{Modal, ModalEvent, ModalViewState};
 use crate::settings::SshSettings;
-use crate::ssh_manager::profile::{
-    SshHostProfile, SshJumpHost, SshProfileIdReassignment, default_ssh_port,
-    normalize_ssh_host_profiles, ssh_profile_password_key,
+use crate::ssh_manager::host_editor::{
+    PasswordIntent, SshProfileDeleteModalEvent, SshProfileDeleteModalView, SshProfileModalEvent,
+    SshProfileModalMode, SshProfileModalView,
 };
+use crate::ssh_manager::open_connections::SshOpenConnections;
+use crate::ssh_manager::profile::{
+    QuickConnectDestination, SshHostProfile, SshJumpHost, SshProfileIdReassignment,
+    normalize_ssh_host_profiles, quick_connect_args, ssh_profile_password_key,
+};
+use crate::ssh_manager::ui::{ansi_color, host_color, host_subtitle, render_chip, render_dot};
+use crate::ssh_manager::usage::{SshHostUsage, format_relative_time};
 use crate::ssh_manager::{SshManagerAction, TOGGLE_PANEL_BINDING_NAME, config_file};
 use crate::themes::theme::Fill as ThemeFill;
-use crate::ui_components::buttons::{icon_button, icon_button_with_color};
+use crate::ui_components::buttons::icon_button_with_color;
 use crate::ui_components::icons::Icon;
 use crate::util::bindings::keybinding_name_to_display_string;
-use crate::view_components::action_button::{ActionButton, PrimaryTheme, SecondaryTheme};
-use crate::view_components::{Dropdown, DropdownItem};
 use crate::workspace::WorkspaceAction;
 
-pub(crate) const PANEL_WIDTH: f32 = 280.;
+pub(crate) const PANEL_WIDTH: f32 = 360.;
 const PANEL_PADDING: f32 = 10.;
-const ROW_WIDTH: f32 = PANEL_WIDTH - PANEL_PADDING * 2.;
 const ROW_RADIUS: f32 = 4.;
-const ROW_GAP: f32 = 4.;
-const ROW_PADDING: f32 = 8.;
-const ROW_SPACING: f32 = 8.;
-const ROW_ICON_SIZE: f32 = 16.;
-const ROW_ICON_PADDING: f32 = 8.;
-const ROW_ICON_RADIUS: f32 = 24.;
+const ROW_SPACING: f32 = 9.;
 const ROW_ACTION_BUTTON_ICON_SIZE: f32 = 12.;
-const ROW_ACTION_BUTTON_PADDING: f32 = 2.;
+const ROW_ACTION_BUTTON_PADDING: f32 = 3.;
 const ROW_ACTION_BUTTON_GAP: f32 = 2.;
 const SCROLLBAR_WIDTH: f32 = 4.;
-const JUMP_HOST_DROPDOWN_WIDTH: f32 = 460.;
 const PROFILE_MODAL_WIDTH: f32 = 520.;
 const MODAL_MAX_HEIGHT_PERCENTAGE: f32 = 0.8;
 const DELETE_MODAL_HEIGHT: f32 = 220.;
 const DELETE_MODAL_BODY_HEIGHT: f32 = 150.;
 const FIELD_RADIUS: f32 = 6.;
-const FIELD_LABEL_SPACING: f32 = 5.;
-const EDITOR_COUNT: usize = 7;
-const LABEL_FORBIDDEN_CHARACTERS: [char; 6] = ['#', '*', '?', '!', '"', '\''];
 const NOTICE_SPACING: f32 = 6.;
+const COLOR_DOT_SIZE: f32 = 10.;
+const CHECKBOX_SIZE: f32 = 15.;
+const MAX_RECENT_ROWS: usize = 5;
 const PERMISSION_HINT: &str =
     " Check that you can read and write ~/.ssh/config and that ~/.ssh is yours.";
 
@@ -76,24 +73,66 @@ pub enum SshProfilesPanelEvent {
 #[derive(Debug, Clone)]
 pub enum SshProfilesPanelAction {
     Add,
+    Connect(Uuid),
     Edit(Uuid),
     Remove(Uuid),
+    TogglePinned(Uuid),
+    QuickConnect,
+    SetFilter(HostFilter),
+    ToggleGroup(String),
+    ToggleSelected(Uuid),
+    ClearSelection,
+    OpenSelected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HostFilter {
+    All,
+    Pinned,
+    Open,
 }
 
 #[derive(Default, Clone)]
 struct ProfileRowMouseStates {
     row: MouseStateHandle,
+    checkbox: MouseStateHandle,
     actions: MouseStateHandle,
+    connect: MouseStateHandle,
+    pin: MouseStateHandle,
     edit: MouseStateHandle,
     remove: MouseStateHandle,
+}
+
+/// The list section a row is drawn in. A host can show up in more than one section, and each copy
+/// needs its own mouse state.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RowSection {
+    Search,
+    Pinned,
+    Recent,
+    Group,
+}
+
+#[derive(Default)]
+struct PanelMouseStates {
+    close: MouseStateHandle,
+    new_host: MouseStateHandle,
+    quick_connect: MouseStateHandle,
+    clear_selection: MouseStateHandle,
+    open_selected: MouseStateHandle,
+    filters: HashMap<HostFilter, MouseStateHandle>,
+    groups: RefCell<HashMap<String, MouseStateHandle>>,
 }
 
 pub struct SshProfilesPanelView {
     modal_state: ModalViewState<Modal<SshProfileModalView>>,
     delete_modal_state: ModalViewState<Modal<SshProfileDeleteModalView>>,
-    row_mouse_states: RefCell<HashMap<Uuid, ProfileRowMouseStates>>,
-    add_row_mouse_state: MouseStateHandle,
-    close_button_mouse_state: MouseStateHandle,
+    search_editor: ViewHandle<EditorView>,
+    filter: HostFilter,
+    collapsed_groups: HashSet<String>,
+    selected: Vec<Uuid>,
+    row_mouse_states: RefCell<HashMap<(RowSection, Uuid), ProfileRowMouseStates>>,
+    mouse_states: PanelMouseStates,
     list_scroll_state: ClippedScrollStateHandle,
     notices: Vec<String>,
 }
@@ -161,13 +200,40 @@ impl SshProfilesPanelView {
             me.reconcile_row_mouse_states(ctx);
             ctx.notify();
         });
+        let open_connections = SshOpenConnections::handle_or_init(ctx);
+        ctx.subscribe_to_model(&open_connections, |_, _, _, ctx| ctx.notify());
+
+        let search_editor = ctx.add_view(|ctx| {
+            EditorView::single_line(
+                SingleLineEditorOptions {
+                    text: TextOptions::ui_text(None, Appearance::as_ref(ctx)),
+                    ..Default::default()
+                },
+                ctx,
+            )
+        });
+        search_editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text("Search name, tag, or user@host", ctx);
+        });
+        ctx.subscribe_to_view(&search_editor, |me, _, event, ctx| {
+            me.handle_search_event(event, ctx);
+        });
 
         Self {
             modal_state: ModalViewState::new(modal),
             delete_modal_state: ModalViewState::new(delete_modal),
+            search_editor,
+            filter: HostFilter::All,
+            collapsed_groups: HashSet::new(),
+            selected: Vec::new(),
             row_mouse_states: Default::default(),
-            add_row_mouse_state: Default::default(),
-            close_button_mouse_state: Default::default(),
+            mouse_states: PanelMouseStates {
+                filters: [HostFilter::All, HostFilter::Pinned, HostFilter::Open]
+                    .into_iter()
+                    .map(|filter| (filter, MouseStateHandle::default()))
+                    .collect(),
+                ..Default::default()
+            },
             list_scroll_state: Default::default(),
             notices,
         }
@@ -192,6 +258,112 @@ impl SshProfilesPanelView {
         self.close_delete_modal(ctx);
     }
 
+    pub fn focus_search(&mut self, ctx: &mut ViewContext<Self>) {
+        ctx.focus(&self.search_editor);
+    }
+
+    fn search_query(&self, app: &AppContext) -> String {
+        self.search_editor
+            .as_ref(app)
+            .buffer_text(app)
+            .trim()
+            .to_string()
+    }
+
+    fn clear_search(&mut self, ctx: &mut ViewContext<Self>) {
+        self.search_editor
+            .update(ctx, |editor, ctx| editor.clear_buffer(ctx));
+    }
+
+    fn handle_search_event(&mut self, event: &EditorEvent, ctx: &mut ViewContext<Self>) {
+        match event {
+            EditorEvent::Enter => {
+                let query = self.search_query(ctx);
+                if query.is_empty() {
+                    return;
+                }
+                let first_match = Self::profiles(ctx)
+                    .into_iter()
+                    .find(|profile| profile.matches_query(&query));
+                self.clear_search(ctx);
+                let action = match first_match {
+                    Some(profile) => SshManagerAction::Connect(profile.id),
+                    None => SshManagerAction::QuickConnect(query),
+                };
+                ctx.dispatch_typed_action(&WorkspaceAction::SshManager(action));
+            }
+            EditorEvent::Escape => {
+                if self.search_query(ctx).is_empty() {
+                    ctx.dispatch_typed_action(&WorkspaceAction::SshManager(
+                        SshManagerAction::TogglePanel,
+                    ));
+                } else {
+                    self.clear_search(ctx);
+                }
+            }
+            _ => ctx.notify(),
+        }
+    }
+
+    fn quick_connect(&mut self, ctx: &mut ViewContext<Self>) {
+        let query = self.search_query(ctx);
+        self.clear_search(ctx);
+        ctx.dispatch_typed_action(&WorkspaceAction::SshManager(
+            SshManagerAction::QuickConnect(query),
+        ));
+    }
+
+    fn toggle_pinned(&mut self, profile_id: Uuid, ctx: &mut ViewContext<Self>) {
+        SshSettings::handle(ctx).update(ctx, |settings, ctx| {
+            let mut usage = settings.ssh_host_usage.value().clone();
+            usage.toggle_pinned(profile_id);
+            if let Err(err) = settings.ssh_host_usage.set_value(usage, ctx) {
+                log::warn!("Failed to save pinned SSH profiles: {err:#}");
+            }
+        });
+    }
+
+    /// Saves `destination` as a profile in `~/.ssh/config` and returns its id.
+    pub fn save_destination(
+        &mut self,
+        destination: &QuickConnectDestination,
+        ctx: &mut ViewContext<Self>,
+    ) -> Result<Uuid, String> {
+        let profiles = Self::profiles(ctx);
+        let mut profile = destination.to_profile();
+        let taken = |name: &str| profiles.iter().any(|other| other.name == name);
+        let mut suffix = 2;
+        while taken(&profile.name) {
+            profile.name = format!("{}-{suffix}", destination.host);
+            suffix += 1;
+        }
+        if let Err(err) = config_file::upsert_profile(&profile) {
+            log::error!("Failed to save SSH profile to ~/.ssh/config: {err:#}");
+            return Err(format!("Could not write ~/.ssh/config: {err:#}"));
+        }
+        self.sync_profiles(ctx);
+        ctx.notify();
+        Ok(profile.id)
+    }
+
+    fn toggle_selected(&mut self, profile_id: Uuid, ctx: &mut ViewContext<Self>) {
+        if let Some(index) = self.selected.iter().position(|id| *id == profile_id) {
+            self.selected.remove(index);
+        } else {
+            self.selected.push(profile_id);
+        }
+        ctx.notify();
+    }
+
+    fn open_selected(&mut self, ctx: &mut ViewContext<Self>) {
+        for profile_id in std::mem::take(&mut self.selected) {
+            ctx.dispatch_typed_action(&WorkspaceAction::SshManager(SshManagerAction::Connect(
+                profile_id,
+            )));
+        }
+        ctx.notify();
+    }
+
     fn profiles(app: &AppContext) -> Vec<SshHostProfile> {
         SshSettings::as_ref(app)
             .saved_ssh_host_profiles
@@ -206,7 +378,7 @@ impl SshProfilesPanelView {
             .collect::<std::collections::HashSet<_>>();
         self.row_mouse_states
             .borrow_mut()
-            .retain(|id, _| ids.contains(id));
+            .retain(|(_, id), _| ids.contains(id));
     }
 
     fn open_add_modal(&mut self, ctx: &mut ViewContext<Self>) {
@@ -353,8 +525,19 @@ impl SshProfilesPanelView {
         ctx: &mut ViewContext<Self>,
     ) -> Result<(), String> {
         let mut profile = profile;
+        let mut password = password;
         if let SshProfileModalMode::Edit(id) = mode {
             profile.id = id;
+            let destination_changed = Self::profiles(ctx).iter().any(|old| {
+                old.id == id
+                    && (old.host != profile.host
+                        || old.user != profile.user
+                        || old.port != profile.port)
+            });
+            // A saved password belongs to the machine it was typed for.
+            if destination_changed && matches!(password, PasswordIntent::Keep) {
+                password = PasswordIntent::Clear;
+            }
         }
 
         if let Err(err) = config_file::upsert_profile(&profile) {
@@ -386,7 +569,7 @@ impl SshProfilesPanelView {
     ) -> Result<(), String> {
         let key = ssh_profile_password_key(profile_id);
         ctx.secure_storage()
-            .write_value(&key, password)
+            .write_value_with_owner_only_fallback(&key, password)
             .map_err(|err| {
                 log::error!("Failed to write SSH profile password: {err:#}");
                 format!("The profile was saved, but its password could not be stored: {err:#}")
@@ -468,7 +651,9 @@ impl SshProfilesPanelView {
         }
 
         self.sync_profiles(ctx);
-        self.row_mouse_states.borrow_mut().remove(&profile_id);
+        self.row_mouse_states
+            .borrow_mut()
+            .retain(|(_, id), _| *id != profile_id);
         ctx.notify();
 
         self.remove_profile_password(profile_id, ctx)
@@ -480,7 +665,12 @@ impl SshProfilesPanelView {
             })
     }
 
-    fn render_header(&self, appearance: &Appearance, app: &AppContext) -> Box<dyn Element> {
+    fn render_header(
+        &self,
+        count: usize,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let close_button = {
             let ui_builder = appearance.ui_builder().clone();
@@ -501,7 +691,7 @@ impl SshProfilesPanelView {
                 appearance,
                 Icon::X,
                 false,
-                self.close_button_mouse_state.clone(),
+                self.mouse_states.close.clone(),
                 theme.sub_text_color(theme.background()),
             )
             .with_tooltip(move || tooltip)
@@ -515,230 +705,583 @@ impl SshProfilesPanelView {
             .finish()
         };
 
+        let new_host = Hoverable::new(self.mouse_states.new_host.clone(), move |state| {
+            let background = if state.is_hovered() {
+                internal_colors::accent_overlay_3(theme)
+            } else {
+                internal_colors::accent_overlay_2(theme)
+            };
+            Container::new(
+                Text::new_inline("+ New host", appearance.ui_font_family(), 12.)
+                    .with_color(theme.accent().into_solid())
+                    .with_style(Properties::default().weight(Weight::Semibold))
+                    .finish(),
+            )
+            .with_background(background)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_RADIUS)))
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(3.)
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(SshProfilesPanelAction::Add))
+        .finish();
+
         Container::new(
             Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(8.)
                 .with_child(
-                    Expanded::new(
-                        1.,
-                        Text::new("SSH Profiles", appearance.ui_font_family(), 13.)
-                            .with_color(theme.active_ui_text_color().into())
-                            .with_style(Properties::default().weight(Weight::Medium))
-                            .finish(),
-                    )
-                    .finish(),
+                    Text::new_inline("SSH hosts", appearance.ui_font_family(), 13.)
+                        .with_color(theme.active_ui_text_color().into())
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .finish(),
                 )
+                .with_child(render_chip(&count.to_string(), appearance))
+                .with_child(Expanded::new(1., Empty::new().finish()).finish())
+                .with_child(new_host)
                 .with_child(close_button)
                 .finish(),
         )
-        .with_padding_left(PANEL_PADDING)
+        .with_padding_left(PANEL_PADDING + 2.)
         .with_padding_right(PANEL_PADDING)
+        .with_vertical_padding(8.)
+        .with_border(Border::bottom(1.).with_border_fill(theme.outline()))
+        .finish()
+    }
+
+    fn render_search_field(&self, appearance: &Appearance) -> Box<dyn Element> {
+        Container::new(
+            appearance
+                .ui_builder()
+                .text_input(self.search_editor.clone())
+                .with_style(UiComponentStyles {
+                    padding: Some(Coords {
+                        top: 6.,
+                        bottom: 6.,
+                        left: 8.,
+                        right: 8.,
+                    }),
+                    background: Some(appearance.theme().background().into()),
+                    border_color: Some(appearance.theme().outline().into()),
+                    border_width: Some(1.),
+                    border_radius: Some(CornerRadius::with_all(Radius::Pixels(FIELD_RADIUS))),
+                    ..Default::default()
+                })
+                .build()
+                .finish(),
+        )
+        .with_padding_left(PANEL_PADDING + 2.)
+        .with_padding_right(PANEL_PADDING + 2.)
         .with_padding_top(10.)
         .with_padding_bottom(6.)
         .finish()
     }
 
-    fn render_empty_state(&self, appearance: &Appearance) -> Box<dyn Element> {
+    fn render_filters(
+        &self,
+        profiles: &[SshHostProfile],
+        usage: &SshHostUsage,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
         let theme = appearance.theme();
-        Container::new(
-            Text::new("No saved profiles yet.", appearance.ui_font_family(), 12.)
-                .with_color(theme.sub_text_color(theme.background()).into())
+        let pinned = profiles.iter().filter(|p| usage.is_pinned(p.id)).count();
+        let open = profiles
+            .iter()
+            .filter(|p| SshOpenConnections::open_count(p.id, app) > 0)
+            .count();
+        let mut row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.);
+        for (filter, label) in [
+            (HostFilter::All, format!("All {}", profiles.len())),
+            (HostFilter::Pinned, format!("★ {pinned}")),
+            (HostFilter::Open, format!("● Open {open}")),
+        ] {
+            let active = self.filter == filter;
+            let mouse_state = self.mouse_states.filters[&filter].clone();
+            row = row.with_child(
+                Hoverable::new(mouse_state, move |state| {
+                    let (border, text, background) = if active {
+                        (
+                            theme.accent(),
+                            theme.accent().into_solid(),
+                            Some(internal_colors::accent_overlay_2(theme)),
+                        )
+                    } else {
+                        (
+                            theme.outline(),
+                            theme.sub_text_color(theme.background()).into_solid(),
+                            state
+                                .is_hovered()
+                                .then(|| internal_colors::fg_overlay_1(theme)),
+                        )
+                    };
+                    let mut chip = Container::new(
+                        Text::new_inline(label.clone(), appearance.ui_font_family(), 11.5)
+                            .with_color(text)
+                            .finish(),
+                    )
+                    .with_border(Border::all(1.).with_border_fill(border))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(11.)))
+                    .with_horizontal_padding(9.)
+                    .with_vertical_padding(2.);
+                    if let Some(background) = background {
+                        chip = chip.with_background(background);
+                    }
+                    chip.finish()
+                })
+                .with_cursor(Cursor::PointingHand)
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(SshProfilesPanelAction::SetFilter(filter))
+                })
                 .finish(),
-        )
-        .with_padding(Padding::uniform(12.))
-        .finish()
+            );
+        }
+        Container::new(row.finish())
+            .with_padding_left(PANEL_PADDING + 2.)
+            .with_padding_right(PANEL_PADDING + 2.)
+            .with_padding_bottom(8.)
+            .finish()
     }
 
-    fn render_add_row(&self, appearance: &Appearance) -> Box<dyn Element> {
+    fn render_section_header(
+        &self,
+        title: &str,
+        count: usize,
+        group_key: Option<&str>,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
         let theme = appearance.theme();
-        let mouse_state = self.add_row_mouse_state.clone();
-
-        Hoverable::new(mouse_state, move |state| {
-            let icon_color = theme.main_text_color(theme.background());
-            let icon = Container::new(
-                ConstrainedBox::new(Icon::Plus.to_warpui_icon(icon_color).finish())
-                    .with_width(ROW_ICON_SIZE)
-                    .with_height(ROW_ICON_SIZE)
+        let collapsed = group_key.is_some_and(|key| self.collapsed_groups.contains(key));
+        let mut row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.);
+        if group_key.is_some() {
+            let chevron = if collapsed {
+                Icon::ChevronRight
+            } else {
+                Icon::ChevronDown
+            };
+            row = row.with_child(
+                ConstrainedBox::new(
+                    chevron
+                        .to_warpui_icon(theme.disabled_ui_text_color())
+                        .finish(),
+                )
+                .with_width(10.)
+                .with_height(10.)
+                .finish(),
+            );
+        }
+        row = row
+            .with_child(
+                Text::new_inline(title.to_string(), appearance.ui_font_family(), 11.5)
+                    .with_color(theme.sub_text_color(theme.background()).into())
+                    .with_style(Properties::default().weight(Weight::Semibold))
                     .finish(),
             )
-            .with_padding(Padding::uniform(ROW_ICON_PADDING))
-            .with_background(internal_colors::fg_overlay_2(theme))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_ICON_RADIUS)))
+            .with_child(
+                Text::new_inline(count.to_string(), appearance.ui_font_family(), 11.5)
+                    .with_color(theme.disabled_ui_text_color().into())
+                    .finish(),
+            );
+        let header = Container::new(row.finish())
+            .with_padding_left(PANEL_PADDING + 2.)
+            .with_padding_top(9.)
+            .with_padding_bottom(5.)
             .finish();
+        let Some(group_key) = group_key else {
+            return header;
+        };
+        let group_key = group_key.to_string();
+        let mouse_state = self
+            .mouse_states
+            .groups
+            .borrow_mut()
+            .entry(group_key.clone())
+            .or_default()
+            .clone();
+        Hoverable::new(mouse_state, move |_| header)
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(SshProfilesPanelAction::ToggleGroup(group_key.clone()))
+            })
+            .finish()
+    }
 
-            let row_content = Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(ROW_SPACING)
-                .with_child(icon)
+    fn render_quick_connect_row(
+        &self,
+        command: String,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        Hoverable::new(self.mouse_states.quick_connect.clone(), move |state| {
+            let text = Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                .with_spacing(2.)
                 .with_child(
-                    Text::new_inline("Add SSH profile", appearance.ui_font_family(), 12.)
+                    Text::new_inline(command.clone(), appearance.monospace_font_family(), 12.)
                         .with_clip(ClipConfig::ellipsis())
                         .with_color(theme.active_ui_text_color().into())
                         .finish(),
                 )
+                .with_child(
+                    Text::new_inline(
+                        "Quick connect · connects without saving",
+                        appearance.ui_font_family(),
+                        11.,
+                    )
+                    .with_color(theme.sub_text_color(theme.background()).into())
+                    .finish(),
+                )
                 .finish();
+            let mut container = Container::new(text)
+                .with_border(Border::all(1.).with_border_fill(theme.accent()))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .with_horizontal_padding(10.)
+                .with_vertical_padding(8.)
+                .with_margin_left(PANEL_PADDING)
+                .with_margin_right(PANEL_PADDING)
+                .with_margin_top(6.);
+            container = container.with_background(if state.is_hovered() {
+                internal_colors::accent_overlay_2(theme)
+            } else {
+                internal_colors::accent_overlay_1(theme)
+            });
+            container.finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(SshProfilesPanelAction::QuickConnect))
+        .finish()
+    }
 
-            let mut container = Container::new(row_content)
-                .with_padding(Padding::uniform(ROW_PADDING))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_RADIUS)));
+    fn render_host_list(
+        &self,
+        profiles: Vec<SshHostProfile>,
+        query: &str,
+        usage: &SshHostUsage,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Vec<Box<dyn Element>> {
+        let mut children = Vec::new();
+        let row = |profile: SshHostProfile, section: RowSection| {
+            self.render_profile_row(profile, section, usage, appearance, app)
+        };
 
-            if state.is_hovered() || state.is_clicked() {
-                container = container.with_background(internal_colors::fg_overlay_1(theme));
+        if !query.is_empty() {
+            let matches = profiles
+                .into_iter()
+                .filter(|profile| profile.matches_query(query))
+                .collect::<Vec<_>>();
+            if !matches.is_empty() {
+                children.push(self.render_section_header("Hosts", matches.len(), None, appearance));
             }
+            children.extend(
+                matches
+                    .into_iter()
+                    .map(|profile| row(profile, RowSection::Search)),
+            );
+            if let Some(args) = quick_connect_args(query) {
+                children.push(self.render_quick_connect_row(format!("ssh {args}"), appearance));
+            }
+            return children;
+        }
 
-            ConstrainedBox::new(container.finish())
-                .with_width(ROW_WIDTH)
+        let profiles = match self.filter {
+            HostFilter::All => profiles,
+            HostFilter::Pinned => profiles
+                .into_iter()
+                .filter(|profile| usage.is_pinned(profile.id))
+                .collect(),
+            HostFilter::Open => profiles
+                .into_iter()
+                .filter(|profile| SshOpenConnections::open_count(profile.id, app) > 0)
+                .collect(),
+        };
+        let find = |id: Uuid| profiles.iter().find(|profile| profile.id == id).cloned();
+
+        if self.filter == HostFilter::All {
+            let pinned = usage
+                .pinned
+                .iter()
+                .filter_map(|id| find(*id))
+                .collect::<Vec<_>>();
+            if !pinned.is_empty() {
+                children.push(self.render_section_header(
+                    "★ Pinned",
+                    pinned.len(),
+                    None,
+                    appearance,
+                ));
+                children.extend(
+                    pinned
+                        .into_iter()
+                        .map(|profile| row(profile, RowSection::Pinned)),
+                );
+            }
+            let recent = usage
+                .recent_profiles()
+                .filter(|(id, _)| !usage.is_pinned(*id))
+                .filter_map(|(id, _)| find(id))
+                .take(MAX_RECENT_ROWS)
+                .collect::<Vec<_>>();
+            if !recent.is_empty() {
+                children.push(self.render_section_header("Recent", recent.len(), None, appearance));
+                children.extend(
+                    recent
+                        .into_iter()
+                        .map(|profile| row(profile, RowSection::Recent)),
+                );
+            }
+        }
+
+        let has_tags = profiles.iter().any(|profile| profile.group().is_some());
+        let mut groups = BTreeMap::<(bool, String), Vec<SshHostProfile>>::new();
+        for profile in profiles {
+            let key = match profile.group() {
+                Some(group) => (false, group.to_string()),
+                None if has_tags => (true, "Ungrouped".to_string()),
+                None => (true, "All hosts".to_string()),
+            };
+            groups.entry(key).or_default().push(profile);
+        }
+        for ((_, title), rows) in groups {
+            children.push(self.render_section_header(&title, rows.len(), Some(&title), appearance));
+            if self.collapsed_groups.contains(&title) {
+                continue;
+            }
+            children.extend(
+                rows.into_iter()
+                    .map(|profile| row(profile, RowSection::Group)),
+            );
+        }
+        children
+    }
+
+    fn render_row_action(
+        icon: Icon,
+        mouse_state: MouseStateHandle,
+        action: SshProfilesPanelAction,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let color = theme.sub_text_color(theme.background());
+        Hoverable::new(mouse_state, move |state| {
+            let mut button = Container::new(
+                ConstrainedBox::new(icon.to_warpui_icon(color).finish())
+                    .with_width(ROW_ACTION_BUTTON_ICON_SIZE)
+                    .with_height(ROW_ACTION_BUTTON_ICON_SIZE)
+                    .finish(),
+            )
+            .with_padding(Padding::uniform(ROW_ACTION_BUTTON_PADDING))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_RADIUS)));
+            if state.is_hovered() {
+                button = button.with_background(internal_colors::fg_overlay_3(theme));
+            }
+            button.finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+        .finish()
+    }
+
+    fn render_checkbox(
+        checked: bool,
+        mouse_state: MouseStateHandle,
+        profile_id: Uuid,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        Hoverable::new(mouse_state, move |_| {
+            let mut box_ = Container::new(if checked {
+                Icon::Check.to_warpui_icon(theme.background()).finish()
+            } else {
+                Empty::new().finish()
+            })
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.)))
+            .with_padding(Padding::uniform(1.5));
+            box_ = if checked {
+                box_.with_background(theme.accent())
+                    .with_border(Border::all(1.).with_border_fill(theme.accent()))
+            } else {
+                box_.with_border(Border::all(1.).with_border_fill(theme.outline()))
+            };
+            ConstrainedBox::new(box_.finish())
+                .with_width(CHECKBOX_SIZE)
+                .with_height(CHECKBOX_SIZE)
                 .finish()
         })
         .with_cursor(Cursor::PointingHand)
-        .on_click(|ctx, _, _| ctx.dispatch_typed_action(SshProfilesPanelAction::Add))
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(SshProfilesPanelAction::ToggleSelected(profile_id))
+        })
         .finish()
     }
 
     fn render_profile_row(
         &self,
         profile: SshHostProfile,
+        section: RowSection,
+        usage: &SshHostUsage,
         appearance: &Appearance,
+        app: &AppContext,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let mouse_states = self
             .row_mouse_states
             .borrow_mut()
-            .entry(profile.id)
+            .entry((section, profile.id))
             .or_default()
             .clone();
         let profile_id = profile.id;
-        let subtitle = if profile.port == default_ssh_port() {
-            profile.target()
+        let is_pinned = usage.is_pinned(profile_id);
+        let checked = self.selected.contains(&profile_id);
+        let selecting = !self.selected.is_empty();
+        let open_count = SshOpenConnections::open_count(profile_id, app);
+        let status = if open_count > 0 {
+            Some((true, format!("Open ×{open_count}")))
         } else {
-            format!("{}:{}", profile.target(), profile.port)
+            usage
+                .last_connected(profile_id)
+                .map(|at| (false, format_relative_time(at, Utc::now())))
         };
+        let color = host_color(&profile)
+            .map(|color| ansi_color(color, appearance))
+            .unwrap_or_else(|| internal_colors::fg_overlay_4(theme).into_solid());
         let action_buttons_mouse_over = mouse_states
             .actions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .is_mouse_over_element();
 
-        let mut row = Hoverable::new(mouse_states.row.clone(), move |state| {
-            let profile_icon = Container::new(
-                ConstrainedBox::new(
-                    Icon::Globe
-                        .to_warpui_icon(theme.main_text_color(theme.background()))
-                        .finish(),
-                )
-                .with_width(ROW_ICON_SIZE)
-                .with_height(ROW_ICON_SIZE)
-                .finish(),
-            )
-            .with_padding(Padding::uniform(ROW_ICON_PADDING))
-            .with_background(internal_colors::fg_overlay_2(theme))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_ICON_RADIUS)))
-            .finish();
-
-            let mut text_column = Flex::column()
+        let row = Hoverable::new(mouse_states.row.clone(), move |state| {
+            let hovered = state.is_hovered() || action_buttons_mouse_over;
+            let name = if is_pinned && section != RowSection::Pinned {
+                format!("{} ★", profile.name)
+            } else {
+                profile.name.clone()
+            };
+            let text = Flex::column()
                 .with_main_axis_size(MainAxisSize::Min)
                 .with_cross_axis_alignment(CrossAxisAlignment::Start)
                 .with_spacing(2.)
                 .with_child(
-                    Text::new_inline(profile.name.clone(), appearance.ui_font_family(), 12.)
+                    Text::new_inline(name, appearance.ui_font_family(), 13.)
                         .with_clip(ClipConfig::ellipsis())
                         .with_color(theme.active_ui_text_color().into())
                         .finish(),
                 )
                 .with_child(
-                    Text::new_inline(subtitle.clone(), appearance.ui_font_family(), 12.)
-                        .with_clip(ClipConfig::ellipsis())
-                        .with_color(theme.sub_text_color(theme.background()).into())
-                        .finish(),
-                );
+                    Text::new_inline(
+                        host_subtitle(&profile),
+                        appearance.monospace_font_family(),
+                        11.,
+                    )
+                    .with_clip(ClipConfig::ellipsis())
+                    .with_color(theme.sub_text_color(theme.background()).into())
+                    .finish(),
+                )
+                .finish();
 
+            let mut right = Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::End)
+                .with_spacing(3.);
             if !profile.tags.is_empty() {
-                text_column = text_column.with_child(
-                    Text::new(profile.tags.join(", "), appearance.ui_font_family(), 10.)
-                        .with_color(theme.disabled_ui_text_color().into())
-                        .finish(),
-                );
+                let mut tags = Flex::row().with_spacing(4.);
+                for tag in profile.tags.iter().take(2) {
+                    tags = tags.with_child(render_chip(tag, appearance));
+                }
+                right = right.with_child(tags.finish());
             }
-
-            let row_content = Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(ROW_SPACING)
-                .with_child(profile_icon)
-                .with_child(Shrinkable::new(1., text_column.finish()).finish())
-                .finish();
-
-            let background = (state.is_hovered() || state.is_clicked())
-                .then(|| internal_colors::fg_overlay_1(theme));
-
-            let mut container = Container::new(row_content)
-                .with_padding(Padding::uniform(ROW_PADDING))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_RADIUS)));
-
-            if let Some(background) = background {
-                container = container.with_background(background);
-            }
-
-            let row_body = ConstrainedBox::new(container.finish())
-                .with_width(ROW_WIDTH)
-                .finish();
-            let mut stack = Stack::new().with_child(row_body);
-
-            if state.is_hovered() || action_buttons_mouse_over {
-                let meta_color = theme.sub_text_color(theme.background());
-                let edit_button = Hoverable::new(mouse_states.edit.clone(), move |button_state| {
-                    let mut button = Container::new(
-                        ConstrainedBox::new(Icon::DotsVertical.to_warpui_icon(meta_color).finish())
-                            .with_width(ROW_ACTION_BUTTON_ICON_SIZE)
-                            .with_height(ROW_ACTION_BUTTON_ICON_SIZE)
+            if let Some((open, label)) = status.clone() {
+                let mut line = Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(5.);
+                if open {
+                    line = line.with_child(render_dot(
+                        ansi_color(AnsiColorIdentifier::Green, appearance),
+                        7.,
+                    ));
+                }
+                right = right.with_child(
+                    line.with_child(
+                        Text::new_inline(label, appearance.ui_font_family(), 11.)
+                            .with_color(theme.sub_text_color(theme.background()).into())
                             .finish(),
                     )
-                    .with_padding(Padding::uniform(ROW_ACTION_BUTTON_PADDING))
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_RADIUS)));
-                    if button_state.is_hovered() {
-                        button = button.with_background(internal_colors::fg_overlay_2(theme));
-                    }
-                    button.finish()
-                })
-                .with_cursor(Cursor::PointingHand)
-                .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(SshProfilesPanelAction::Edit(profile_id));
-                })
-                .finish();
+                    .finish(),
+                );
+            }
 
-                let remove_button =
-                    Hoverable::new(mouse_states.remove.clone(), move |button_state| {
-                        let mut button = Container::new(
-                            ConstrainedBox::new(Icon::Trash.to_warpui_icon(meta_color).finish())
-                                .with_width(ROW_ACTION_BUTTON_ICON_SIZE)
-                                .with_height(ROW_ACTION_BUTTON_ICON_SIZE)
-                                .finish(),
-                        )
-                        .with_padding(Padding::uniform(ROW_ACTION_BUTTON_PADDING))
-                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_RADIUS)));
-                        if button_state.is_hovered() {
-                            button = button.with_background(internal_colors::fg_overlay_3(theme));
-                        }
-                        button.finish()
-                    })
-                    .with_cursor(Cursor::PointingHand)
-                    .on_click(move |ctx, _, _| {
-                        ctx.dispatch_typed_action(SshProfilesPanelAction::Remove(profile_id));
-                    })
-                    .finish();
+            let mut content = Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(ROW_SPACING);
+            if selecting || hovered {
+                content = content.with_child(Self::render_checkbox(
+                    checked,
+                    mouse_states.checkbox.clone(),
+                    profile_id,
+                    appearance,
+                ));
+            }
+            content = content
+                .with_child(render_color_square(color))
+                .with_child(Expanded::new(1., text).finish())
+                .with_child(right.finish());
 
-                let action_buttons = Flex::row()
+            let mut container = Container::new(content.finish())
+                .with_padding_left(PANEL_PADDING + 4.)
+                .with_padding_right(PANEL_PADDING + 2.)
+                .with_vertical_padding(6.);
+            if checked {
+                container = container.with_background(internal_colors::accent_overlay_2(theme));
+            } else if hovered || state.is_clicked() {
+                container = container.with_background(internal_colors::fg_overlay_1(theme));
+            }
+            let mut stack = Stack::new().with_child(container.finish());
+
+            if hovered && !selecting {
+                let actions = Flex::row()
                     .with_main_axis_size(MainAxisSize::Min)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_spacing(ROW_ACTION_BUTTON_GAP)
-                    .with_child(edit_button)
-                    .with_child(remove_button)
+                    .with_child(Self::render_row_action(
+                        Icon::Play,
+                        mouse_states.connect.clone(),
+                        SshProfilesPanelAction::Connect(profile_id),
+                        appearance,
+                    ))
+                    .with_child(Self::render_row_action(
+                        if is_pinned {
+                            Icon::PinFilled
+                        } else {
+                            Icon::Pin
+                        },
+                        mouse_states.pin.clone(),
+                        SshProfilesPanelAction::TogglePinned(profile_id),
+                        appearance,
+                    ))
+                    .with_child(Self::render_row_action(
+                        Icon::Pencil,
+                        mouse_states.edit.clone(),
+                        SshProfilesPanelAction::Edit(profile_id),
+                        appearance,
+                    ))
+                    .with_child(Self::render_row_action(
+                        Icon::Trash,
+                        mouse_states.remove.clone(),
+                        SshProfilesPanelAction::Remove(profile_id),
+                        appearance,
+                    ))
                     .finish();
-
                 let belt_border_color = internal_colors::neutral_4(theme);
                 let actions = Hoverable::new(mouse_states.actions.clone(), move |_| {
-                    Container::new(action_buttons)
+                    Container::new(actions)
                         .with_background(ThemeFill::Solid(internal_colors::neutral_3(theme)))
                         .with_border(
                             Border::all(1.).with_border_fill(ThemeFill::Solid(belt_border_color)),
@@ -749,28 +1292,140 @@ impl SshProfilesPanelView {
                 })
                 .with_defer_events_to_children()
                 .finish();
-
                 stack.add_positioned_overlay_child(
                     actions,
                     OffsetPositioning::offset_from_parent(
-                        vec2f(-4., -4.),
+                        vec2f(-8., 0.),
                         ParentOffsetBounds::WindowByPosition,
-                        ParentAnchor::TopRight,
-                        ChildAnchor::TopRight,
+                        ParentAnchor::MiddleRight,
+                        ChildAnchor::MiddleRight,
                     ),
                 );
             }
-
             stack.finish()
         });
 
-        row = row.on_click(move |ctx, _, _| {
-            ctx.dispatch_typed_action(WorkspaceAction::SshManager(SshManagerAction::Connect(
-                profile_id,
-            )));
-        });
-        row.with_defer_events_to_children().finish()
+        row.with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| {
+                if selecting {
+                    ctx.dispatch_typed_action(SshProfilesPanelAction::ToggleSelected(profile_id));
+                } else {
+                    ctx.dispatch_typed_action(WorkspaceAction::SshManager(
+                        SshManagerAction::Connect(profile_id),
+                    ));
+                }
+            })
+            .with_defer_events_to_children()
+            .finish()
     }
+
+    fn render_selection_bar(
+        &self,
+        profiles: &[SshHostProfile],
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let names = self
+            .selected
+            .iter()
+            .filter_map(|id| profiles.iter().find(|profile| profile.id == *id))
+            .map(|profile| profile.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let count = self.selected.len();
+
+        let clear = Hoverable::new(self.mouse_states.clear_selection.clone(), move |state| {
+            let color = if state.is_hovered() {
+                theme.active_ui_text_color()
+            } else {
+                theme.sub_text_color(theme.background())
+            };
+            Text::new_inline("Clear", appearance.ui_font_family(), 12.)
+                .with_color(color.into())
+                .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(SshProfilesPanelAction::ClearSelection))
+        .finish();
+
+        let open = Hoverable::new(self.mouse_states.open_selected.clone(), move |state| {
+            let background = if state.is_hovered() {
+                internal_colors::accent_overlay_4(theme)
+            } else {
+                theme.accent()
+            };
+            Container::new(
+                Text::new_inline(
+                    format!("Open {count} hosts in new tabs"),
+                    appearance.ui_font_family(),
+                    12.5,
+                )
+                .with_color(theme.background().into_solid())
+                .with_style(Properties::default().weight(Weight::Semibold))
+                .finish(),
+            )
+            .with_background(background)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
+            .with_vertical_padding(6.)
+            .with_horizontal_padding(12.)
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(SshProfilesPanelAction::OpenSelected))
+        .finish();
+
+        Container::new(
+            Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_spacing(8.)
+                .with_child(
+                    Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_spacing(8.)
+                        .with_child(
+                            Text::new_inline(
+                                format!("{count} selected"),
+                                appearance.ui_font_family(),
+                                12.5,
+                            )
+                            .with_color(theme.active_ui_text_color().into())
+                            .with_style(Properties::default().weight(Weight::Semibold))
+                            .finish(),
+                        )
+                        .with_child(
+                            Shrinkable::new(
+                                1.,
+                                Text::new_inline(names, appearance.ui_font_family(), 11.5)
+                                    .with_clip(ClipConfig::ellipsis())
+                                    .with_color(theme.disabled_ui_text_color().into())
+                                    .finish(),
+                            )
+                            .finish(),
+                        )
+                        .with_child(clear)
+                        .finish(),
+                )
+                .with_child(open)
+                .finish(),
+        )
+        .with_background(internal_colors::fg_overlay_1(theme))
+        .with_border(Border::top(1.).with_border_fill(theme.outline()))
+        .with_uniform_padding(PANEL_PADDING + 2.)
+        .finish()
+    }
+}
+
+fn render_color_square(color: pathfinder_color::ColorU) -> Box<dyn Element> {
+    ConstrainedBox::new(
+        Container::new(Empty::new().finish())
+            .with_background(ThemeFill::Solid(color))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.)))
+            .finish(),
+    )
+    .with_width(COLOR_DOT_SIZE)
+    .with_height(COLOR_DOT_SIZE)
+    .finish()
 }
 
 impl Entity for SshProfilesPanelView {
@@ -783,8 +1438,29 @@ impl TypedActionView for SshProfilesPanelView {
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         match action {
             SshProfilesPanelAction::Add => self.open_add_modal(ctx),
+            SshProfilesPanelAction::Connect(id) => ctx.dispatch_typed_action(
+                &WorkspaceAction::SshManager(SshManagerAction::Connect(*id)),
+            ),
             SshProfilesPanelAction::Edit(id) => self.open_edit_modal(*id, ctx),
             SshProfilesPanelAction::Remove(id) => self.open_delete_modal(*id, ctx),
+            SshProfilesPanelAction::TogglePinned(id) => self.toggle_pinned(*id, ctx),
+            SshProfilesPanelAction::QuickConnect => self.quick_connect(ctx),
+            SshProfilesPanelAction::SetFilter(filter) => {
+                self.filter = *filter;
+                ctx.notify();
+            }
+            SshProfilesPanelAction::ToggleGroup(group) => {
+                if !self.collapsed_groups.remove(group) {
+                    self.collapsed_groups.insert(group.clone());
+                }
+                ctx.notify();
+            }
+            SshProfilesPanelAction::ToggleSelected(id) => self.toggle_selected(*id, ctx),
+            SshProfilesPanelAction::ClearSelection => {
+                self.selected.clear();
+                ctx.notify();
+            }
+            SshProfilesPanelAction::OpenSelected => self.open_selected(ctx),
         }
     }
 }
@@ -798,10 +1474,17 @@ impl View for SshProfilesPanelView {
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
         let profiles = Self::profiles(app);
+        let query = self.search_query(app);
+        let usage = SshSettings::as_ref(app).ssh_host_usage.value();
 
         let mut content = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
-            .with_child(self.render_header(appearance, app));
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.render_header(profiles.len(), appearance, app))
+            .with_child(self.render_search_field(appearance));
+        if query.is_empty() {
+            content = content.with_child(self.render_filters(&profiles, usage, appearance, app));
+        }
 
         if !self.notices.is_empty() {
             let mut banner = Flex::column()
@@ -821,22 +1504,33 @@ impl View for SshProfilesPanelView {
             );
         }
 
-        if profiles.is_empty() {
-            content = content.with_child(self.render_empty_state(appearance));
+        if profiles.is_empty() && query.is_empty() {
+            content = content.with_child(
+                Container::new(
+                    Text::new(
+                        "No saved hosts yet. Add one, or search with user@host to connect.",
+                        appearance.ui_font_family(),
+                        12.,
+                    )
+                    .with_color(theme.sub_text_color(theme.background()).into())
+                    .finish(),
+                )
+                .with_padding(Padding::uniform(PANEL_PADDING + 2.))
+                .finish(),
+            );
         }
 
-        let mut list = Flex::column()
-            .with_spacing(ROW_GAP)
+        let selection_bar =
+            (!self.selected.is_empty()).then(|| self.render_selection_bar(&profiles, appearance));
+        let list = Flex::column()
             .with_main_axis_size(MainAxisSize::Min)
-            .with_cross_axis_alignment(CrossAxisAlignment::Stretch);
-        for profile in profiles {
-            list = list.with_child(self.render_profile_row(profile, appearance));
-        }
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_children(self.render_host_list(profiles, &query, usage, appearance, app));
         let scrollable_list = ClippedScrollable::vertical(
             self.list_scroll_state.clone(),
             Container::new(list.finish())
-                .with_padding_left(PANEL_PADDING)
-                .with_padding_right(PANEL_PADDING)
+                .with_padding_bottom(PANEL_PADDING)
+                .with_border(Border::top(1.).with_border_fill(theme.outline()))
                 .finish(),
             ScrollbarWidth::Custom(SCROLLBAR_WIDTH),
             theme.nonactive_ui_detail().into(),
@@ -847,14 +1541,9 @@ impl View for SshProfilesPanelView {
         .finish();
 
         content = content.with_child(Shrinkable::new(1., scrollable_list).finish());
-        content = content.with_child(
-            Container::new(self.render_add_row(appearance))
-                .with_padding_left(PANEL_PADDING)
-                .with_padding_right(PANEL_PADDING)
-                .with_padding_top(PANEL_PADDING)
-                .with_padding_bottom(PANEL_PADDING)
-                .finish(),
-        );
+        if let Some(selection_bar) = selection_bar {
+            content = content.with_child(selection_bar);
+        }
 
         ConstrainedBox::new(
             Container::new(content.finish())
@@ -864,836 +1553,6 @@ impl View for SshProfilesPanelView {
         )
         .with_width(PANEL_WIDTH)
         .finish()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SshProfileModalMode {
-    Add,
-    Edit(Uuid),
-}
-
-#[derive(Clone)]
-pub enum PasswordIntent {
-    Keep,
-    Set(Zeroizing<String>),
-    Clear,
-}
-
-impl std::fmt::Debug for PasswordIntent {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Keep => formatter.write_str("Keep"),
-            Self::Set(_) => formatter.write_str("Set(<redacted>)"),
-            Self::Clear => formatter.write_str("Clear"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum SshProfileModalEvent {
-    Cancel,
-    Submit {
-        mode: SshProfileModalMode,
-        profile: Box<SshHostProfile>,
-        password: PasswordIntent,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SshProfileModalAction {
-    Cancel,
-    Save,
-    TogglePasswordVisibility,
-    ClearPassword,
-    JumpHostDropdownPlaceholder,
-    AddJumpHost(Uuid),
-    RemoveJumpHost(usize),
-}
-
-pub struct SshProfileModalView {
-    mode: SshProfileModalMode,
-    draft_id: Uuid,
-    name_editor: ViewHandle<EditorView>,
-    host_editor: ViewHandle<EditorView>,
-    user_editor: ViewHandle<EditorView>,
-    port_editor: ViewHandle<EditorView>,
-    password_editor: ViewHandle<EditorView>,
-    identity_file_editor: ViewHandle<EditorView>,
-    tags_editor: ViewHandle<EditorView>,
-    jump_host_dropdown: ViewHandle<Dropdown<SshProfileModalAction>>,
-    available_profiles: Vec<SshHostProfile>,
-    selected_jump_hosts: Vec<SshJumpHost>,
-    password_clear: bool,
-    had_stored_password: bool,
-    error: Option<String>,
-    cancel_button: ViewHandle<ActionButton>,
-    save_button: ViewHandle<ActionButton>,
-    password_eye_mouse_state: MouseStateHandle,
-    password_clear_mouse_state: MouseStateHandle,
-    jump_host_chip_mouse_states: RefCell<HashMap<usize, MouseStateHandle>>,
-    form_scroll_state: ClippedScrollStateHandle,
-}
-
-impl SshProfileModalView {
-    pub fn new(ctx: &mut ViewContext<Self>) -> Self {
-        let name_editor = Self::editor("Label", false, ctx);
-        let host_editor = Self::editor("Host", false, ctx);
-        let user_editor = Self::editor("Username", false, ctx);
-        let port_editor = Self::editor("22", false, ctx);
-        let password_editor = Self::editor("Password", true, ctx);
-        let identity_file_editor = Self::editor("~/.ssh/id_ed25519", false, ctx);
-        let tags_editor = Self::editor("prod, db", false, ctx);
-        let cancel_button = ctx.add_typed_action_view(|_| {
-            ActionButton::new("Cancel", SecondaryTheme)
-                .with_width(88.)
-                .on_click(|ctx| ctx.dispatch_typed_action(SshProfileModalAction::Cancel))
-        });
-        let save_button = ctx.add_typed_action_view(|_| {
-            ActionButton::new("Save", PrimaryTheme)
-                .with_width(88.)
-                .on_click(|ctx| ctx.dispatch_typed_action(SshProfileModalAction::Save))
-        });
-        let jump_host_dropdown = ctx.add_typed_action_view(|ctx| {
-            let mut dropdown = Dropdown::new(ctx);
-            dropdown.set_top_bar_max_width(JUMP_HOST_DROPDOWN_WIDTH);
-            dropdown.set_menu_width(JUMP_HOST_DROPDOWN_WIDTH, ctx);
-            dropdown.set_menu_max_height(180., ctx);
-            dropdown.set_top_bar_height(32., ctx);
-            dropdown.set_menu_header_text_override(|_| "Add jump host".to_string());
-            dropdown
-        });
-
-        for (index, editor) in [
-            &name_editor,
-            &host_editor,
-            &user_editor,
-            &port_editor,
-            &password_editor,
-            &identity_file_editor,
-            &tags_editor,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            ctx.subscribe_to_view(editor, move |me, _, event, ctx| {
-                me.handle_editor_event(index, event, ctx);
-            });
-        }
-
-        Self {
-            mode: SshProfileModalMode::Add,
-            draft_id: Uuid::new_v4(),
-            name_editor,
-            host_editor,
-            user_editor,
-            port_editor,
-            password_editor,
-            identity_file_editor,
-            tags_editor,
-            jump_host_dropdown,
-            available_profiles: Vec::new(),
-            selected_jump_hosts: Vec::new(),
-            password_clear: false,
-            had_stored_password: false,
-            error: None,
-            cancel_button,
-            save_button,
-            password_eye_mouse_state: Default::default(),
-            password_clear_mouse_state: Default::default(),
-            jump_host_chip_mouse_states: Default::default(),
-            form_scroll_state: Default::default(),
-        }
-    }
-
-    fn editor(
-        placeholder: &'static str,
-        is_password: bool,
-        ctx: &mut ViewContext<Self>,
-    ) -> ViewHandle<EditorView> {
-        let editor = ctx.add_view(|ctx| {
-            EditorView::single_line(
-                SingleLineEditorOptions {
-                    text: TextOptions::ui_text(None, Appearance::as_ref(ctx)),
-                    soft_wrap: true,
-                    is_password,
-                    ..Default::default()
-                },
-                ctx,
-            )
-        });
-        editor.update(ctx, |editor, ctx| {
-            editor.set_placeholder_text(placeholder, ctx);
-        });
-        editor
-    }
-
-    pub fn open_add(&mut self, profiles: Vec<SshHostProfile>, ctx: &mut ViewContext<Self>) {
-        self.mode = SshProfileModalMode::Add;
-        self.draft_id = Uuid::new_v4();
-        self.available_profiles = profiles;
-        self.selected_jump_hosts.clear();
-        self.password_clear = false;
-        self.had_stored_password = false;
-        self.error = None;
-        self.set_editor_text("", &self.name_editor, ctx);
-        self.set_editor_text("", &self.host_editor, ctx);
-        self.set_editor_text("", &self.user_editor, ctx);
-        self.set_editor_text(&default_ssh_port().to_string(), &self.port_editor, ctx);
-        self.reset_password_editor(ctx);
-        self.set_editor_text("", &self.identity_file_editor, ctx);
-        self.set_editor_text("", &self.tags_editor, ctx);
-        self.jump_host_chip_mouse_states.borrow_mut().clear();
-        self.sync_jump_host_dropdown(ctx);
-        self.sync_save_button_state(ctx);
-        ctx.notify();
-    }
-
-    pub fn open_edit(
-        &mut self,
-        profile: SshHostProfile,
-        profiles: Vec<SshHostProfile>,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        self.mode = SshProfileModalMode::Edit(profile.id);
-        self.draft_id = profile.id;
-        self.available_profiles = profiles
-            .into_iter()
-            .filter(|candidate| candidate.id != profile.id)
-            .collect();
-        self.selected_jump_hosts = profile.jump_hosts.clone();
-        self.password_clear = false;
-        self.error = None;
-        self.set_editor_text(&profile.name, &self.name_editor, ctx);
-        self.set_editor_text(&profile.host, &self.host_editor, ctx);
-        self.set_editor_text(
-            profile.user.as_deref().unwrap_or_default(),
-            &self.user_editor,
-            ctx,
-        );
-        self.set_editor_text(&profile.port.to_string(), &self.port_editor, ctx);
-        let stored_password = match ctx
-            .secure_storage()
-            .read_value(&ssh_profile_password_key(profile.id))
-        {
-            Ok(password) => Some(Zeroizing::new(password)),
-            Err(err) => {
-                if !matches!(err, warpui_extras::secure_storage::Error::NotFound) {
-                    log::warn!("Failed to read SSH profile password: {err:#}");
-                }
-                None
-            }
-        };
-        self.had_stored_password = stored_password.is_some();
-        self.reset_password_editor(ctx);
-        if let Some(stored_password) = stored_password.as_ref() {
-            self.set_editor_text(stored_password.as_str(), &self.password_editor, ctx);
-        }
-        self.set_editor_text(
-            profile.identity_file.as_deref().unwrap_or_default(),
-            &self.identity_file_editor,
-            ctx,
-        );
-        self.set_editor_text(&profile.tags.join(", "), &self.tags_editor, ctx);
-        self.jump_host_chip_mouse_states.borrow_mut().clear();
-        self.sync_jump_host_dropdown(ctx);
-        self.sync_save_button_state(ctx);
-        ctx.notify();
-    }
-
-    pub fn on_open(&mut self, ctx: &mut ViewContext<Self>) {
-        ctx.focus(&self.name_editor);
-    }
-
-    fn reset_sensitive_state(&mut self, ctx: &mut ViewContext<Self>) {
-        self.password_clear = false;
-        self.had_stored_password = false;
-        self.error = None;
-        self.reset_password_editor(ctx);
-    }
-
-    fn reset_password_editor(&mut self, ctx: &mut ViewContext<Self>) {
-        self.password_editor.update(ctx, |editor, ctx| {
-            editor.clear_buffer_and_reset_undo_stack(ctx);
-            editor.set_placeholder_text("Password", ctx);
-            editor.set_is_password(true, ctx);
-        });
-    }
-
-    fn set_error(&mut self, error: Option<String>, ctx: &mut ViewContext<Self>) {
-        self.error = error;
-        ctx.notify();
-    }
-
-    fn set_editor_text(
-        &self,
-        text: &str,
-        editor: &ViewHandle<EditorView>,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        editor.update(ctx, |editor, ctx| {
-            editor.set_buffer_text_ignoring_undo(text, ctx);
-        });
-    }
-
-    fn editors_in_tab_order(&self) -> [&ViewHandle<EditorView>; EDITOR_COUNT] {
-        [
-            &self.name_editor,
-            &self.host_editor,
-            &self.user_editor,
-            &self.port_editor,
-            &self.password_editor,
-            &self.identity_file_editor,
-            &self.tags_editor,
-        ]
-    }
-
-    fn focus_editor(&self, index: usize, ctx: &mut ViewContext<Self>) {
-        let editor = self.editors_in_tab_order()[index % EDITOR_COUNT].clone();
-        ctx.focus(&editor);
-    }
-
-    fn handle_editor_event(
-        &mut self,
-        editor_index: usize,
-        event: &EditorEvent,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        match event {
-            EditorEvent::Escape => ctx.emit(SshProfileModalEvent::Cancel),
-            EditorEvent::Enter => self.submit(ctx),
-            EditorEvent::Navigate(NavigationKey::Tab) => self.focus_editor(editor_index + 1, ctx),
-            EditorEvent::Navigate(NavigationKey::ShiftTab) => {
-                self.focus_editor(editor_index + EDITOR_COUNT - 1, ctx)
-            }
-            _ => {
-                self.error = None;
-                self.sync_save_button_state(ctx);
-                ctx.notify();
-            }
-        }
-    }
-
-    fn editor_text(&self, editor: &ViewHandle<EditorView>, app: &AppContext) -> String {
-        editor.as_ref(app).buffer_text(app).trim().to_string()
-    }
-
-    fn parse_port(&self, app: &AppContext) -> Option<u16> {
-        let text = self.editor_text(&self.port_editor, app);
-        if text.is_empty() {
-            return Some(default_ssh_port());
-        }
-        let port = text.parse::<u16>().ok()?;
-        (port > 0).then_some(port)
-    }
-
-    fn label_error(&self, app: &AppContext) -> Option<String> {
-        let label = self.editor_text(&self.name_editor, app);
-        if label.is_empty() {
-            return None;
-        }
-        if let Some(error) = ssh_alias_format_error(&label) {
-            return Some(error.to_string());
-        }
-        self.available_profiles
-            .iter()
-            .any(|profile| profile.name == label)
-            .then(|| format!("\"{label}\" is already a host in ~/.ssh/config"))
-    }
-
-    fn is_valid(&self, app: &AppContext) -> bool {
-        !self.editor_text(&self.name_editor, app).is_empty()
-            && self.label_error(app).is_none()
-            && !self.editor_text(&self.host_editor, app).is_empty()
-            && self.parse_port(app).is_some()
-    }
-
-    fn sync_save_button_state(&self, ctx: &mut ViewContext<Self>) {
-        let is_valid = self.is_valid(ctx);
-        self.save_button.update(ctx, |button, ctx| {
-            button.set_disabled(!is_valid, ctx);
-        });
-    }
-
-    fn build_profile(&self, app: &AppContext) -> Option<SshHostProfile> {
-        let name = self.editor_text(&self.name_editor, app);
-        let host = self.editor_text(&self.host_editor, app);
-        if name.is_empty() || host.is_empty() {
-            return None;
-        }
-
-        let user = self.optional_editor_text(&self.user_editor, app);
-        let identity_file = self.optional_editor_text(&self.identity_file_editor, app);
-        let tags = self
-            .editor_text(&self.tags_editor, app)
-            .split(',')
-            .map(str::trim)
-            .filter(|tag| !tag.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
-
-        Some(SshHostProfile {
-            id: self.draft_id,
-            name,
-            host,
-            user,
-            port: self.parse_port(app)?,
-            identity_file,
-            jump_hosts: self.selected_jump_hosts.clone(),
-            tags,
-        })
-    }
-
-    fn optional_editor_text(
-        &self,
-        editor: &ViewHandle<EditorView>,
-        app: &AppContext,
-    ) -> Option<String> {
-        let value = self.editor_text(editor, app);
-        (!value.is_empty()).then_some(value)
-    }
-
-    fn password_intent(&self, app: &AppContext) -> PasswordIntent {
-        let password = self.password_editor.as_ref(app).buffer_text(app);
-        if !password.is_empty() {
-            PasswordIntent::Set(Zeroizing::new(password))
-        } else if self.password_clear || self.had_stored_password {
-            PasswordIntent::Clear
-        } else {
-            PasswordIntent::Keep
-        }
-    }
-
-    fn submit(&mut self, ctx: &mut ViewContext<Self>) {
-        if !self.is_valid(ctx) {
-            return;
-        }
-        let Some(profile) = self.build_profile(ctx) else {
-            log::warn!("SSH profile form passed validation but could not be built");
-            self.set_error(
-                Some("This profile could not be built from the form.".to_string()),
-                ctx,
-            );
-            return;
-        };
-        ctx.emit(SshProfileModalEvent::Submit {
-            mode: self.mode.clone(),
-            profile: Box::new(profile),
-            password: self.password_intent(ctx),
-        });
-    }
-
-    fn jump_host_from_profile(profile: &SshHostProfile) -> SshJumpHost {
-        SshJumpHost {
-            source_profile_id: Some(profile.id),
-            host: profile.host.clone(),
-            user: profile.user.clone(),
-            port: profile.port,
-            identity_file: profile.identity_file.clone(),
-        }
-    }
-
-    fn jump_host_candidate_profiles(&self) -> Vec<&SshHostProfile> {
-        self.available_profiles
-            .iter()
-            .filter(|profile| {
-                !self
-                    .selected_jump_hosts
-                    .iter()
-                    .any(|jump_host| jump_host_points_at(jump_host, profile))
-            })
-            .collect()
-    }
-
-    fn sync_jump_host_dropdown(&mut self, ctx: &mut ViewContext<Self>) {
-        let mut items = vec![DropdownItem::new(
-            "Add jump host",
-            SshProfileModalAction::JumpHostDropdownPlaceholder,
-        )];
-        items.extend(
-            self.jump_host_candidate_profiles()
-                .into_iter()
-                .map(|profile| {
-                    DropdownItem::new(
-                        format!(
-                            "{}  {}",
-                            profile.name,
-                            Self::jump_host_from_profile(profile).target()
-                        ),
-                        SshProfileModalAction::AddJumpHost(profile.id),
-                    )
-                }),
-        );
-        let has_candidates = items.len() > 1;
-
-        self.jump_host_dropdown.update(ctx, |dropdown, ctx| {
-            dropdown.set_items(items, ctx);
-            dropdown
-                .set_selected_by_action(SshProfileModalAction::JumpHostDropdownPlaceholder, ctx);
-            if has_candidates {
-                dropdown.set_enabled(ctx);
-            } else {
-                dropdown.set_disabled(ctx);
-            }
-        });
-    }
-
-    fn jump_host_display_label(&self, jump_host: &SshJumpHost) -> String {
-        let target = jump_host.target();
-        self.available_profiles
-            .iter()
-            .find(|profile| jump_host_points_at(jump_host, profile))
-            .map(|profile| format!("{} - {}", profile.name, target))
-            .unwrap_or(target)
-    }
-
-    fn add_jump_host(&mut self, profile_id: Uuid, ctx: &mut ViewContext<Self>) {
-        let Some(profile) = self
-            .available_profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .cloned()
-        else {
-            log::warn!("Cannot add jump host {profile_id}: it is not an available profile");
-            return;
-        };
-        let jump_host = Self::jump_host_from_profile(&profile);
-        let already_selected = self
-            .selected_jump_hosts
-            .iter()
-            .any(|existing| jump_host_points_at(existing, &profile));
-        if !already_selected {
-            self.selected_jump_hosts.push(jump_host);
-            self.sync_jump_host_dropdown(ctx);
-            ctx.notify();
-        }
-    }
-
-    fn remove_jump_host(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
-        if index < self.selected_jump_hosts.len() {
-            self.selected_jump_hosts.remove(index);
-            self.jump_host_chip_mouse_states.borrow_mut().clear();
-            self.sync_jump_host_dropdown(ctx);
-            ctx.notify();
-        }
-    }
-
-    fn render_label(text: &str, appearance: &Appearance) -> Box<dyn Element> {
-        Text::new(text.to_string(), appearance.ui_font_family(), 11.)
-            .with_color(appearance.theme().active_ui_text_color().into())
-            .finish()
-    }
-
-    fn render_error_text(text: String, appearance: &Appearance) -> Box<dyn Element> {
-        Text::new(text, appearance.ui_font_family(), 11.)
-            .with_color(appearance.theme().ui_error_color())
-            .finish()
-    }
-
-    fn render_text_input(
-        &self,
-        editor: &ViewHandle<EditorView>,
-        appearance: &Appearance,
-    ) -> Box<dyn Element> {
-        appearance
-            .ui_builder()
-            .text_input(editor.clone())
-            .with_style(UiComponentStyles {
-                padding: Some(Coords {
-                    top: 7.,
-                    bottom: 7.,
-                    left: 9.,
-                    right: 9.,
-                }),
-                background: Some(appearance.theme().surface_1().into()),
-                border_color: Some(appearance.theme().outline().into()),
-                border_width: Some(1.),
-                border_radius: Some(CornerRadius::with_all(Radius::Pixels(FIELD_RADIUS))),
-                ..Default::default()
-            })
-            .build()
-            .finish()
-    }
-
-    fn render_field(
-        &self,
-        label: &str,
-        editor: &ViewHandle<EditorView>,
-        appearance: &Appearance,
-    ) -> Box<dyn Element> {
-        Flex::column()
-            .with_spacing(FIELD_LABEL_SPACING)
-            .with_child(Self::render_label(label, appearance))
-            .with_child(self.render_text_input(editor, appearance))
-            .finish()
-    }
-
-    fn render_name_field(&self, app: &AppContext, appearance: &Appearance) -> Box<dyn Element> {
-        let mut column = Flex::column()
-            .with_spacing(FIELD_LABEL_SPACING)
-            .with_child(Self::render_label("Label *", appearance))
-            .with_child(self.render_text_input(&self.name_editor, appearance));
-        if let Some(error) = self.label_error(app) {
-            column = column.with_child(Self::render_error_text(error, appearance));
-        }
-        column.finish()
-    }
-
-    fn render_password_field(&self, app: &AppContext, appearance: &Appearance) -> Box<dyn Element> {
-        let password_is_visible = !self.password_editor.as_ref(app).is_password();
-        let eye = icon_button(
-            appearance,
-            Icon::Eye,
-            password_is_visible,
-            self.password_eye_mouse_state.clone(),
-        )
-        .build()
-        .on_click(|ctx, _, _| {
-            ctx.dispatch_typed_action(SshProfileModalAction::TogglePasswordVisibility)
-        })
-        .finish();
-
-        let clear = icon_button(
-            appearance,
-            Icon::X,
-            self.password_clear,
-            self.password_clear_mouse_state.clone(),
-        )
-        .build()
-        .on_click(|ctx, _, _| ctx.dispatch_typed_action(SshProfileModalAction::ClearPassword))
-        .finish();
-
-        Flex::column()
-            .with_spacing(FIELD_LABEL_SPACING)
-            .with_child(Self::render_label("Password", appearance))
-            .with_child(
-                Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(6.)
-                    .with_child(
-                        Expanded::new(
-                            1.,
-                            self.render_text_input(&self.password_editor, appearance),
-                        )
-                        .finish(),
-                    )
-                    .with_child(eye)
-                    .with_child(clear)
-                    .finish(),
-            )
-            .with_child(
-                Text::new(
-                    if (self.password_clear || self.had_stored_password)
-                        && self.password_editor.as_ref(app).buffer_text(app).is_empty()
-                    {
-                        "Stored password will be removed"
-                    } else {
-                        ""
-                    },
-                    appearance.ui_font_family(),
-                    10.,
-                )
-                .with_color(
-                    appearance
-                        .theme()
-                        .sub_text_color(appearance.theme().background())
-                        .into(),
-                )
-                .finish(),
-            )
-            .finish()
-    }
-
-    fn render_jump_hosts(&self, appearance: &Appearance) -> Box<dyn Element> {
-        let theme = appearance.theme();
-        let mut selected = Wrap::row().with_run_spacing(6.).with_spacing(6.);
-        for (index, jump_host) in self.selected_jump_hosts.iter().enumerate() {
-            let mouse_state = self
-                .jump_host_chip_mouse_states
-                .borrow_mut()
-                .entry(index)
-                .or_default()
-                .clone();
-            let label = self.jump_host_display_label(jump_host);
-            selected = selected.with_child(
-                Container::new(
-                    Flex::row()
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_spacing(4.)
-                        .with_child(
-                            Text::new(label, appearance.ui_font_family(), 11.)
-                                .with_color(theme.active_ui_text_color().into())
-                                .finish(),
-                        )
-                        .with_child(
-                            icon_button(appearance, Icon::X, false, mouse_state)
-                                .build()
-                                .on_click(move |ctx, _, _| {
-                                    ctx.dispatch_typed_action(
-                                        SshProfileModalAction::RemoveJumpHost(index),
-                                    )
-                                })
-                                .finish(),
-                        )
-                        .finish(),
-                )
-                .with_padding_left(8.)
-                .with_padding_right(2.)
-                .with_padding_top(3.)
-                .with_padding_bottom(3.)
-                .with_background(theme.surface_1())
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(FIELD_RADIUS)))
-                .finish(),
-            );
-        }
-
-        let available_is_empty = self.jump_host_candidate_profiles().is_empty();
-        let empty_text = if self.available_profiles.is_empty() {
-            "No other profiles available"
-        } else {
-            "All available profiles selected"
-        };
-
-        let mut content = Flex::column()
-            .with_spacing(7.)
-            .with_child(Self::render_label("Jump hosts", appearance))
-            .with_child(ChildView::new(&self.jump_host_dropdown).finish())
-            .with_child(selected.finish());
-
-        if available_is_empty {
-            content = content.with_child(
-                Text::new(empty_text, appearance.ui_font_family(), 11.)
-                    .with_color(theme.disabled_ui_text_color().into())
-                    .finish(),
-            );
-        }
-
-        content.finish()
-    }
-}
-
-impl Entity for SshProfileModalView {
-    type Event = SshProfileModalEvent;
-}
-
-impl TypedActionView for SshProfileModalView {
-    type Action = SshProfileModalAction;
-
-    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
-        match action {
-            SshProfileModalAction::Cancel => ctx.emit(SshProfileModalEvent::Cancel),
-            SshProfileModalAction::Save => self.submit(ctx),
-            SshProfileModalAction::TogglePasswordVisibility => {
-                self.password_editor.update(ctx, |editor, ctx| {
-                    editor.set_is_password(!editor.is_password(), ctx);
-                });
-                ctx.notify();
-            }
-            SshProfileModalAction::ClearPassword => {
-                self.password_clear = !self.password_clear;
-                if self.password_clear {
-                    let password_editor = self.password_editor.clone();
-                    self.set_editor_text("", &password_editor, ctx);
-                }
-                ctx.notify();
-            }
-            SshProfileModalAction::JumpHostDropdownPlaceholder => {}
-            SshProfileModalAction::AddJumpHost(profile_id) => self.add_jump_host(*profile_id, ctx),
-            SshProfileModalAction::RemoveJumpHost(index) => self.remove_jump_host(*index, ctx),
-        }
-    }
-}
-
-impl View for SshProfileModalView {
-    fn ui_name() -> &'static str {
-        "SshProfileModalView"
-    }
-
-    fn render(&self, app: &AppContext) -> Box<dyn Element> {
-        let appearance = Appearance::as_ref(app);
-        let theme = appearance.theme();
-
-        let form = Flex::column()
-            .with_spacing(12.)
-            .with_child(self.render_name_field(app, appearance))
-            .with_child(self.render_field("Host *", &self.host_editor, appearance))
-            .with_child(
-                Flex::row()
-                    .with_spacing(10.)
-                    .with_child(
-                        Expanded::new(
-                            1.,
-                            self.render_field("Username", &self.user_editor, appearance),
-                        )
-                        .finish(),
-                    )
-                    .with_child(
-                        ConstrainedBox::new(self.render_field(
-                            "Port",
-                            &self.port_editor,
-                            appearance,
-                        ))
-                        .with_width(96.)
-                        .finish(),
-                    )
-                    .finish(),
-            )
-            .with_child(
-                Text::new("Authentication", appearance.ui_font_family(), 11.)
-                    .with_color(theme.sub_text_color(theme.background()).into())
-                    .with_style(Properties::default().weight(Weight::Medium))
-                    .finish(),
-            )
-            .with_child(self.render_password_field(app, appearance))
-            .with_child(self.render_field("Identity file", &self.identity_file_editor, appearance))
-            .with_child(
-                Text::new("Advanced", appearance.ui_font_family(), 11.)
-                    .with_color(theme.sub_text_color(theme.background()).into())
-                    .with_style(Properties::default().weight(Weight::Medium))
-                    .finish(),
-            )
-            .with_child(self.render_jump_hosts(appearance))
-            .with_child(self.render_field("Tags", &self.tags_editor, appearance));
-
-        let buttons = Container::new(
-            Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_main_axis_alignment(MainAxisAlignment::Center)
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(8.)
-                .with_child(ChildView::new(&self.cancel_button).finish())
-                .with_child(ChildView::new(&self.save_button).finish())
-                .finish(),
-        )
-        .with_padding_top(18.)
-        .finish();
-
-        let scrollable_form = ClippedScrollable::vertical(
-            self.form_scroll_state.clone(),
-            form.finish(),
-            ScrollbarWidth::Custom(SCROLLBAR_WIDTH),
-            theme.nonactive_ui_detail().into(),
-            theme.active_ui_detail().into(),
-            ElementFill::None,
-        )
-        .with_overlayed_scrollbar()
-        .finish();
-
-        let mut content = Flex::column()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_child(Shrinkable::new(1., scrollable_form).finish());
-        if let Some(error) = self.error.as_ref() {
-            content = content.with_child(
-                Container::new(Self::render_error_text(error.clone(), appearance))
-                    .with_padding_top(FIELD_LABEL_SPACING)
-                    .finish(),
-            );
-        }
-        content = content.with_child(buttons);
-
-        Container::new(content.finish())
-            .with_background(theme.surface_2())
-            .finish()
     }
 }
 
@@ -1879,7 +1738,7 @@ fn warp_owned_profile_ids() -> anyhow::Result<HashSet<Uuid>> {
     Ok(config_file::load_owned_profile_ids()?.into_iter().collect())
 }
 
-fn jump_host_points_at(jump_host: &SshJumpHost, profile: &SshHostProfile) -> bool {
+pub(super) fn jump_host_points_at(jump_host: &SshJumpHost, profile: &SshHostProfile) -> bool {
     match jump_host.source_profile_id {
         Some(source_profile_id) => source_profile_id == profile.id,
         None => {
@@ -1888,173 +1747,5 @@ fn jump_host_points_at(jump_host: &SshJumpHost, profile: &SshHostProfile) -> boo
                 && jump_host.port == profile.port
                 && jump_host.identity_file == profile.identity_file
         }
-    }
-}
-
-fn ssh_alias_format_error(label: &str) -> Option<&'static str> {
-    if label.chars().any(char::is_whitespace) {
-        return Some("Label cannot contain spaces or line breaks");
-    }
-    if label.chars().any(char::is_control) {
-        return Some("Label cannot contain control characters");
-    }
-    if label
-        .chars()
-        .any(|character| LABEL_FORBIDDEN_CHARACTERS.contains(&character))
-    {
-        return Some("Label cannot contain # * ? ! \" or '");
-    }
-    None
-}
-
-pub enum SshProfileDeleteModalEvent {
-    Confirm(Uuid),
-    Cancel,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SshProfileDeleteModalAction {
-    Confirm,
-    Cancel,
-}
-
-pub struct SshProfileDeleteModalView {
-    profile: Option<(Uuid, String)>,
-    error: Option<String>,
-    cancel_button_mouse_state: MouseStateHandle,
-    confirm_button_mouse_state: MouseStateHandle,
-}
-
-impl SshProfileDeleteModalView {
-    pub fn new() -> Self {
-        Self {
-            profile: None,
-            error: None,
-            cancel_button_mouse_state: Default::default(),
-            confirm_button_mouse_state: Default::default(),
-        }
-    }
-
-    fn open(&mut self, profile_id: Uuid, profile_name: String, ctx: &mut ViewContext<Self>) {
-        self.profile = Some((profile_id, profile_name));
-        self.error = None;
-        ctx.notify();
-    }
-
-    fn reset(&mut self, ctx: &mut ViewContext<Self>) {
-        self.profile = None;
-        self.error = None;
-        ctx.notify();
-    }
-
-    fn set_error(&mut self, error: Option<String>, ctx: &mut ViewContext<Self>) {
-        self.error = error;
-        ctx.notify();
-    }
-}
-
-impl Entity for SshProfileDeleteModalView {
-    type Event = SshProfileDeleteModalEvent;
-}
-
-impl TypedActionView for SshProfileDeleteModalView {
-    type Action = SshProfileDeleteModalAction;
-
-    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
-        match action {
-            SshProfileDeleteModalAction::Cancel => ctx.emit(SshProfileDeleteModalEvent::Cancel),
-            SshProfileDeleteModalAction::Confirm => {
-                let Some((profile_id, _)) = self.profile.as_ref() else {
-                    log::warn!("SSH profile delete confirmed with no profile selected");
-                    return;
-                };
-                ctx.emit(SshProfileDeleteModalEvent::Confirm(*profile_id));
-            }
-        }
-    }
-}
-
-impl View for SshProfileDeleteModalView {
-    fn ui_name() -> &'static str {
-        "SshProfileDeleteModalView"
-    }
-
-    fn render(&self, app: &AppContext) -> Box<dyn Element> {
-        let appearance = Appearance::as_ref(app);
-        let theme = appearance.theme();
-        let name = self
-            .profile
-            .as_ref()
-            .map(|(_, name)| name.as_str())
-            .unwrap_or_default();
-
-        let mut content = Flex::column()
-            .with_spacing(12.)
-            .with_child(
-                Text::new(
-                    format!(
-                        "\"{name}\" will be removed from ~/.ssh/config and its stored password will be deleted. This cannot be undone."
-                    ),
-                    appearance.ui_font_family(),
-                    12.,
-                )
-                .with_color(theme.sub_text_color(theme.surface_2()).into())
-                .finish(),
-            );
-
-        if let Some(error) = self.error.as_ref() {
-            content = content.with_child(SshProfileModalView::render_error_text(
-                error.clone(),
-                appearance,
-            ));
-        }
-
-        let button_style = UiComponentStyles {
-            font_size: Some(12.),
-            padding: Some(Coords::uniform(8.).left(12.).right(12.)),
-            ..Default::default()
-        };
-        content = content.with_child(
-            Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_main_axis_alignment(MainAxisAlignment::Center)
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(8.)
-                .with_child(
-                    appearance
-                        .ui_builder()
-                        .button(
-                            ButtonVariant::Secondary,
-                            self.cancel_button_mouse_state.clone(),
-                        )
-                        .with_text_label("Cancel".to_string())
-                        .with_style(button_style)
-                        .build()
-                        .on_click(|ctx, _, _| {
-                            ctx.dispatch_typed_action(SshProfileDeleteModalAction::Cancel);
-                        })
-                        .finish(),
-                )
-                .with_child(
-                    appearance
-                        .ui_builder()
-                        .button(
-                            ButtonVariant::Error,
-                            self.confirm_button_mouse_state.clone(),
-                        )
-                        .with_text_label("Delete".to_string())
-                        .with_style(button_style)
-                        .build()
-                        .on_click(|ctx, _, _| {
-                            ctx.dispatch_typed_action(SshProfileDeleteModalAction::Confirm);
-                        })
-                        .finish(),
-                )
-                .finish(),
-        );
-
-        Container::new(content.finish())
-            .with_background(theme.surface_2())
-            .finish()
     }
 }

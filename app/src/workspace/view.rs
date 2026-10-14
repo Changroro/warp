@@ -7159,6 +7159,7 @@ impl Workspace {
             );
         }
 
+        menu_items.extend(self.ssh_new_session_menu_items(ctx));
         menu_items.push(MenuItem::Separator);
         menu_items.push(
             MenuItemFields::new("Reopen closed session")

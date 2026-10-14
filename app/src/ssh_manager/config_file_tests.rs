@@ -757,3 +757,20 @@ fn the_original_file_permissions_are_preserved() {
     let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o640);
 }
+
+#[test]
+fn values_that_break_ssh_config_words_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path(), "");
+    let mut profile = SshHostProfile::new("web".to_string(), "10.0.0.5".to_string());
+    for host in ["a\"b", "a b", "a#b", "x%z", "-oProxyCommand=sh"] {
+        profile.host = host.to_string();
+        assert!(upsert_profile_at(&path, &profile).is_err(), "{host}");
+    }
+    profile.host = "10.0.0.5".to_string();
+    profile.user = Some("bob'".to_string());
+    assert!(upsert_profile_at(&path, &profile).is_err());
+    profile.user = Some("bob".to_string());
+    upsert_profile_at(&path, &profile).unwrap();
+    assert_eq!(read(&path).matches("HostName 10.0.0.5").count(), 1);
+}
