@@ -1,23 +1,40 @@
 #!/usr/bin/env bash
-# Merges upstream Warp into the current branch and verifies the fork still builds. See FORK.md.
+# Syncs the fork with upstream Warp: master follows upstream, each feature branch merges master,
+# and dev merges every feature branch. Verifies dev builds and never pushes. See FORK.md.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Keep in sync with the feature list in FORK.md.
+FEATURE_BRANCHES=(feat/session-archive feat/ssh-manager)
 
 if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
     echo "Commit or stash tracked changes before syncing." >&2
     exit 1
 fi
 
+merge_into() {
+    git checkout -q "$1"
+    if ! git merge --no-edit "$2"; then
+        echo >&2
+        echo "Merge conflicts while merging $2 into $1:" >&2
+        git diff --name-only --diff-filter=U >&2
+        echo "Resolve them, commit, and rerun this script." >&2
+        exit 1
+    fi
+}
+
+start=$(git rev-parse --abbrev-ref HEAD)
 git fetch upstream master
-before=$(git rev-parse HEAD)
-if ! git merge --no-edit upstream/master; then
-    echo >&2
-    echo "Merge conflicts in:" >&2
-    git diff --name-only --diff-filter=U >&2
-    echo "Resolve them, commit, and rerun this script." >&2
-    exit 1
-fi
-echo "Merged $(git rev-list --count "$before"..HEAD) commits from upstream/master."
+git checkout -q master
+git merge --ff-only upstream/master
+for branch in "${FEATURE_BRANCHES[@]}"; do
+    merge_into "$branch" master
+done
+for branch in "${FEATURE_BRANCHES[@]}"; do
+    merge_into dev "$branch"
+done
 
 cargo check -p warp --all-targets
 cargo nextest run -p warp -E 'test(/ssh|archive|bootstrap/)'
+git checkout -q "$start"
+echo "Synced. Push with: git push origin master dev ${FEATURE_BRANCHES[*]}"

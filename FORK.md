@@ -1,7 +1,21 @@
 # Fork notes
 
 This checkout is a personal fork of `warpdotdev/warp`. `origin` is the fork, `upstream` is Warp.
-Fork work lands on `dev`; `master` tracks upstream.
+
+## Branches
+
+- `master` mirrors `upstream/master`. Never commit to it.
+- `feat/*` each hold one fork feature. Branch new features from `master`, commit there, then
+  merge the branch into `dev`.
+- `dev` is the integration branch we run: `master` plus every feature branch. Don't commit to it
+  directly.
+
+Active feature branches (keep `FEATURE_BRANCHES` in `script/fork-sync` in sync):
+
+| Branch | Feature |
+| --- | --- |
+| `feat/session-archive` | Archive closed sessions in the vertical tabs panel |
+| `feat/ssh-manager` | SSH host manager. It was branched from `dev` and already contains `feat/session-archive`, so branch an upstream PR from `master` instead. |
 
 ## Syncing with upstream
 
@@ -9,9 +23,10 @@ Fork work lands on `dev`; `master` tracks upstream.
 ./script/fork-sync
 ```
 
-The script fetches `upstream/master`, merges it into the current branch, then runs
-`cargo check -p warp --all-targets` and the fork's tests. It stops at the first failure and never
-pushes. On a merge conflict, resolve it, `git commit`, and rerun the script.
+The script fast-forwards `master` to `upstream/master`, merges `master` into each feature branch,
+merges each feature branch into `dev`, then runs `cargo check -p warp --all-targets` and the fork's
+tests on `dev`. It stops at the first failure and never pushes. On a merge conflict, resolve it,
+`git commit`, and rerun the script. When it finishes, push the branches it prints.
 
 ## Layout rule
 
