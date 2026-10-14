@@ -6,9 +6,6 @@ use warp_core::user_preferences::GetUserPreferences as _;
 use warp_errors::report_error;
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 
-use warp_core::user_preferences::GetUserPreferences as _;
-use warpui::AppContext;
-
 use crate::persistence::ModelEvent;
 use crate::persistence::model::ArchivedSession;
 use crate::terminal::cli_agent::CLIAgent;
