@@ -12,8 +12,9 @@ permissions:
 env:
   # Line tables push hosted runners over their memory limit during LTO, and full debug info would
   # embed the builder's paths in the shipped binary.
-  CARGO_PROFILE_RELEASE_DEBUG: "false"
-  CARGO_PROFILE_RELEASE_LTO_DEBUG: "false"
+  # `release-lto` inherits this. Cargo can't target it by env var: `RELEASE_LTO` parses as
+  # profile `release`, key `lto`.
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 jobs:
   linux:
