@@ -387,7 +387,7 @@ impl HarnessRunner for CodexHarnessRunner {
                 let id = setup_events
                     .record_result(SetupStep::ThirdPartyHarnessExternalConversation, async {
                         self.client
-                            .create_external_conversation(CODEX_CLI_FORMAT)
+                            .create_external_conversation(CODEX_CLI_FORMAT, Harness::Codex)
                             .await
                             .map_err(|e| {
                                 report_error!(&e);
@@ -530,7 +530,7 @@ impl HarnessRunner for CodexHarnessRunner {
     }
 }
 
-fn capture_transcript_with_usage(
+pub(super) fn capture_transcript_with_usage(
     session_id: Uuid,
     transcript_path: &Path,
     is_final: bool,

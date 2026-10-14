@@ -477,7 +477,7 @@ impl HarnessRunner for ClaudeHarnessRunner {
                 let id = setup_events
                     .record_result(SetupStep::ThirdPartyHarnessExternalConversation, async {
                         self.client
-                            .create_external_conversation(CLAUDE_CODE_FORMAT)
+                            .create_external_conversation(CLAUDE_CODE_FORMAT, Harness::Claude)
                             .await
                             .map_err(|e| {
                                 report_error!(&e);
@@ -678,7 +678,7 @@ async fn capture_and_upload_transcript(
     upload_captured_transcript(client, conversation_id, capture).await
 }
 
-fn capture_transcript_with_usage(
+pub(super) fn capture_transcript_with_usage(
     session_id: Uuid,
     harness_working_dir: &Path,
     config_dir: &Path,
