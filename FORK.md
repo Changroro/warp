@@ -36,7 +36,8 @@ Push a `fork-vYYYY.MM.DD` tag (add `.N` for another release the same day) on `de
 rpm is skipped because upstream's bundle script signs it with Warp's key on CI. Upstream's own
 workflows are disabled in this fork's Actions settings so syncing `master` doesn't run Warp's CI.
 
-Fork tooling (`FORK.md`, `script/fork-sync`, the release workflow) lives on `feat/ssh-manager`.
+Fork tooling (`FORK.md`, `script/fork-sync`, the release workflow) and the fork READMEs (the intro
+block above `## About` in `README.md`, and `README.ko.md`) live on `feat/ssh-manager`.
 
 ## Layout rule
 
