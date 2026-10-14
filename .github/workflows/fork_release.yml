@@ -43,8 +43,11 @@ jobs:
         run: script/linux/install_linuxdeploy
 
       # rpm is skipped: bundle_rpm signs with Warp's release key whenever it runs on GitHub.
+      # The deb would otherwise register Warp's apt repository, whose packages would replace this
+      # build on the next `apt upgrade`.
       - name: Bundle
         run: |
+          : > resources/linux/debian/common/postinst.repo.template
           # deb versions are derived from this, so it must look like an upstream release tag.
           export GIT_RELEASE_TAG="v0.${GITHUB_REF_NAME#fork-v}.fork_01"
           script/bundle --channel oss --packages appimage,deb
@@ -107,6 +110,13 @@ jobs:
           path: packages
           merge-multiple: true
 
+      - name: Collect packages
+        run: |
+          mkdir upload
+          find packages -type f \( -name '*.deb' -o -name '*.AppImage' \) -exec mv {} upload/ \;
+          find packages -type f -name '*.dmg' -exec mv {} upload/WarpOss-aarch64.dmg \;
+          ls -la upload
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -121,7 +131,7 @@ jobs:
 
           Source for this build is the tagged commit in this repository (AGPL-3.0).
           EOF
-          gh release create "$TAG" packages/* \
+          gh release create "$TAG" upload/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "Warp fork $TAG" \
             --notes-file notes.md \
