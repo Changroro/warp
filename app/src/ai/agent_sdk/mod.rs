@@ -87,6 +87,8 @@ use crate::server::server_api::{ServerApi, ServerApiProvider};
 use crate::server::team_scope::RequestTeamScope;
 use crate::terminal::view::ConversationRestorationInNewPaneType;
 use crate::workflows::workflow::Workflow;
+#[cfg(not(target_family = "wasm"))]
+use crate::workspaces::update_manager::{TeamUpdateManager, WorkspaceMetadataRetryPolicy};
 use crate::workspaces::user_workspaces::HeadlessTeamScope;
 
 mod admin;
@@ -896,7 +898,7 @@ impl AgentDriverRunner {
             setup_events
                 .record_result(
                     SetupStep::TeamMetadataRefresh,
-                    Self::refresh_team_metadata(&foreground),
+                    Self::refresh_team_metadata(&foreground, args.task_id.is_some()),
                 )
                 .await?;
             let agent_driver_team_scope = if let Some(config) = execution_config {
@@ -1084,10 +1086,27 @@ impl AgentDriverRunner {
 
     async fn refresh_team_metadata(
         foreground: &ModelSpawner<Self>,
+        cloud_startup: bool,
     ) -> Result<(), AgentDriverError> {
         foreground
             .spawn(
-                |_, ctx| -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+                move |_, ctx| -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+                    #[cfg(not(target_family = "wasm"))]
+                    if cloud_startup {
+                        return Box::pin(TeamUpdateManager::handle(ctx).update(
+                            ctx,
+                            |manager, ctx| {
+                                manager.refresh_workspace_metadata_with_retry(
+                                    WorkspaceMetadataRetryPolicy::TimeBudget(Duration::from_secs(
+                                        30,
+                                    )),
+                                    ctx,
+                                )
+                            },
+                        ));
+                    }
+                    #[cfg(target_family = "wasm")]
+                    let _ = cloud_startup;
                     Box::pin(common::refresh_workspace_metadata(ctx))
                 },
             )
@@ -1974,11 +1993,12 @@ impl AgentDriverRunner {
     /// `harness` is the resolved harness from the task config (already validated against the
     /// conversation's metadata up-front by [`common::fetch_and_validate_conversation_harness`]).
     ///
-    /// For the Oz harness, fetches the full conversation and returns a [`driver::ResumeOptions::Oz`].
-    /// For third-party harnesses, delegates to [`ThirdPartyHarness::fetch_resume_payload`] and
-    /// wraps the returned payload (if any) in [`driver::ResumeOptions::ThirdParty`]; each harness
-    /// owns its server call and error mapping. Returns `None` if a third-party harness has no
-    /// resume payload to surface.
+    /// For harnesses that render through a native conversation (Oz, and third-party harnesses
+    /// driven over ACP), fetches the full conversation and returns a
+    /// [`driver::ResumeOptions::Native`] restoration. Otherwise, delegates to
+    /// [`ThirdPartyHarness::fetch_resume_payload`] and wraps the returned payload (if any) in
+    /// [`driver::ResumeOptions::ThirdParty`]; each harness owns its server call and error
+    /// mapping. Returns `None` if a third-party harness has no resume payload to surface.
     #[tracing::instrument(skip_all, err, fields(tags.cloud_agent = true, conversation_id = conversation_id))]
     async fn load_conversation_information(
         foreground: &ModelSpawner<Self>,
@@ -1986,57 +2006,58 @@ impl AgentDriverRunner {
         harness: &HarnessKind,
     ) -> Result<Option<driver::ResumeOptions>, AgentDriverError> {
         match harness {
-            HarnessKind::Oz => {
-                let server_api = foreground
-                    .spawn(|_, ctx| {
-                        ServerApiProvider::handle(ctx)
-                            .as_ref(ctx)
-                            .get_ai_client()
-                            .clone()
-                    })
-                    .await?;
-                let token = ServerConversationToken::new(conversation_id.clone());
-                let (conversation_data, metadata) = server_api
-                    .get_ai_conversation(token)
-                    .await
-                    .map_err(|err| AgentDriverError::ConversationLoadFailed(format!("{err}")))?;
-                let conversation = convert_conversation_data_to_ai_conversation(
-                    AIConversationId::default(),
-                    &conversation_data,
-                    metadata,
-                    RestorationMode::Continue,
-                )
-                .ok_or_else(|| {
-                    AgentDriverError::ConversationLoadFailed(
-                        "Failed to convert conversation data to AIConversation".into(),
-                    )
-                })?;
-                Ok(Some(driver::ResumeOptions::Oz(Box::new(
-                    ConversationRestorationInNewPaneType::Historical {
-                        conversation,
-                        should_use_live_appearance: false,
-                        ambient_agent_task_id: None,
-                    },
-                ))))
+            HarnessKind::Unsupported(harness) => {
+                return Err(AgentDriverError::HarnessSetupFailed {
+                    harness: harness.to_string(),
+                    reason: format!(
+                        "The {harness} harness is only supported for local child agent launches."
+                    ),
+                });
             }
-            HarnessKind::ThirdParty(h) => {
+            HarnessKind::ThirdParty(h) if h.drives_cli_agent_session() => {
                 let harness_support_client = foreground
                     .spawn(|_, ctx| ServerApiProvider::as_ref(ctx).get_harness_support_client())
                     .await?;
                 let resume_conversation_id = ServerConversationToken::new(conversation_id.clone());
-                Ok(
-                    h.fetch_resume_payload(&resume_conversation_id, harness_support_client)
-                        .await?
-                        .map(|payload| driver::ResumeOptions::ThirdParty(Box::new(payload))),
-                )
+                return Ok(h
+                    .fetch_resume_payload(&resume_conversation_id, harness_support_client)
+                    .await?
+                    .map(|payload| driver::ResumeOptions::ThirdParty(Box::new(payload))));
             }
-            HarnessKind::Unsupported(harness) => Err(AgentDriverError::HarnessSetupFailed {
-                harness: harness.to_string(),
-                reason: format!(
-                    "The {harness} harness is only supported for local child agent launches."
-                ),
-            }),
+            HarnessKind::Oz | HarnessKind::ThirdParty(_) => {}
         }
+
+        let server_api = foreground
+            .spawn(|_, ctx| {
+                ServerApiProvider::handle(ctx)
+                    .as_ref(ctx)
+                    .get_ai_client()
+                    .clone()
+            })
+            .await?;
+        let token = ServerConversationToken::new(conversation_id.clone());
+        let (conversation_data, metadata) = server_api
+            .get_ai_conversation(token)
+            .await
+            .map_err(|err| AgentDriverError::ConversationLoadFailed(format!("{err}")))?;
+        let conversation = convert_conversation_data_to_ai_conversation(
+            AIConversationId::default(),
+            &conversation_data,
+            metadata,
+            RestorationMode::Continue,
+        )
+        .ok_or_else(|| {
+            AgentDriverError::ConversationLoadFailed(
+                "Failed to convert conversation data to AIConversation".into(),
+            )
+        })?;
+        Ok(Some(driver::ResumeOptions::Native(Box::new(
+            ConversationRestorationInNewPaneType::Historical {
+                conversation,
+                should_use_live_appearance: false,
+                ambient_agent_task_id: None,
+            },
+        ))))
     }
 
     /// Resolve the environment and store into `driver_options`.

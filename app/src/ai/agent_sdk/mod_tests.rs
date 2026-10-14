@@ -1,10 +1,15 @@
 use std::fs;
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use chrono::Utc;
 use clap::Parser;
 use cloud_object_models::CodeForge;
 use command::blocking::Command as ProcessCommand;
+use futures::FutureExt;
+use http::StatusCode;
 use mockito::{Matcher, Server};
 use serde_json::json;
 use warp_cli::agent::{
@@ -38,17 +43,24 @@ use crate::auth::AuthStateProvider;
 use crate::auth::user::{PrincipalType, User};
 use crate::network::NetworkStatus;
 use crate::root_view::NewWorkspaceSource;
+use crate::server::graphql::GraphQLError;
 use crate::server::ids::ServerId;
 use crate::server::server_api::ServerApiProvider;
 use crate::server::server_api::ai::{AIClient, AgentConfigSnapshot, MockAIClient};
 use crate::server::server_api::managed_secrets::AppManagedSecretManager;
 use crate::server::server_api::team::MockTeamClient;
 use crate::server::server_api::workspace::MockWorkspaceClient;
+use crate::settings::PrivacySettings;
 use crate::workspaces::team::{Team, TeamVisibility};
 use crate::workspaces::team_tester::TeamTesterStatus;
 use crate::workspaces::update_manager::TeamUpdateManager;
-use crate::workspaces::user_workspaces::{HeadlessTeamScope, TeamScope, UserWorkspaces};
-use crate::workspaces::workspace::{Workspace, WorkspaceUid};
+#[cfg(not(target_family = "wasm"))]
+use crate::workspaces::update_manager::WorkspaceMetadataRetryPolicy;
+use crate::workspaces::user_workspaces::{
+    HeadlessTeamScope, TeamScope, UserWorkspaces, WorkspacesMetadataResponse,
+    WorkspacesMetadataWithPricing,
+};
+use crate::workspaces::workspace::{ChargeUnit, UserTier, Workspace, WorkspaceUid};
 
 const TASK_ID: &str = "00000000-0000-0000-0000-000000000001";
 
@@ -699,9 +711,23 @@ fn factory_experiment_bootstrap_subprocess() {
     });
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn test_with_paused_time<F: Future<Output = ()> + 'static>(test: impl FnOnce(App) -> F) {
+    drop(warp_core::channel::ChannelState::mock_server());
+    let app = App::test((), |app| async move { app });
+    let executor = app.foreground_executor();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(executor.run(test(app)));
+}
+
 #[test]
+#[cfg(not(target_family = "wasm"))]
 fn legacy_execution_launch_skips_bootstrap_and_reports_team_metadata_refresh_failure() {
-    App::test((), |mut app| async move {
+    test_with_paused_time(|mut app| async move {
         let _execution_config = FeatureFlag::CloudAgentExecutionConfig.override_enabled(false);
         app.add_singleton_model(|_| NetworkStatus::new());
         app.add_singleton_model(TeamTesterStatus::new);
@@ -711,7 +737,7 @@ fn legacy_execution_launch_skips_bootstrap_and_reports_team_metadata_refresh_fai
         let mut team_client = MockTeamClient::new();
         team_client
             .expect_workspaces_metadata()
-            .times(4)
+            .times(1..)
             .returning(|| Err(anyhow::anyhow!("workspace metadata unavailable")));
         app.add_singleton_model(|ctx| TeamUpdateManager::new(Arc::new(team_client), None, ctx));
         let mut ai_client = MockAIClient::new();
@@ -736,7 +762,7 @@ fn legacy_execution_launch_skips_bootstrap_and_reports_team_metadata_refresh_fai
                         && conversation_id.is_none()
                         && status_message.as_ref().is_some_and(|status| {
                             status.message
-                                == "Failed to refresh team metadata: workspace metadata unavailable"
+                                == "Failed to refresh team metadata: Timed out refreshing team metadata"
                         })
                         && session_debug_until.is_none()
                         && debug_agent_active.is_none()
@@ -756,6 +782,7 @@ fn legacy_execution_launch_skips_bootstrap_and_reports_team_metadata_refresh_fai
             "123",
         ]);
 
+        let started = tokio::time::Instant::now();
         let error = AgentDriverRunner::setup_and_run_driver(
             foreground,
             args,
@@ -767,7 +794,137 @@ fn legacy_execution_launch_skips_bootstrap_and_reports_team_metadata_refresh_fai
         let AgentDriverError::TeamMetadataRefreshFailed(source) = error else {
             panic!("unexpected setup error: {error:#}");
         };
+        assert_eq!(source.to_string(), "Timed out refreshing team metadata");
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+    });
+}
+
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn cloud_startup_refresh_applies_metadata_after_delayed_authorization() {
+    test_with_paused_time(|mut app| async move {
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(TeamTesterStatus::new);
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        app.add_singleton_model(PrivacySettings::mock);
+        initialize_team_scope_test_app(&mut app, vec![]);
+
+        let started = tokio::time::Instant::now();
+        let mut team_client = MockTeamClient::new();
+        team_client.expect_workspaces_metadata().returning(move || {
+            if started.elapsed() < Duration::from_secs(12) {
+                return Err(GraphQLError::HttpError {
+                    status: StatusCode::UNAUTHORIZED,
+                    body: "execution not claimed".to_string(),
+                }
+                .into());
+            }
+            Ok(WorkspacesMetadataWithPricing {
+                metadata: WorkspacesMetadataResponse {
+                    workspaces: vec![],
+                    joinable_teams: vec![],
+                    experiments: None,
+                    ai_credit_availability: None,
+                    user_tier: UserTier {
+                        charge_unit: ChargeUnit::Cents,
+                        ..Default::default()
+                    },
+                },
+                pricing_info: None,
+            })
+        });
+        app.add_singleton_model(|ctx| TeamUpdateManager::new(Arc::new(team_client), None, ctx));
+        let runner = app.add_singleton_model(|_| AgentDriverRunner);
+        let foreground = runner.update(&mut app, |_, ctx| ctx.spawner());
+
+        AgentDriverRunner::refresh_team_metadata(&foreground, true)
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() >= Duration::from_secs(12));
+        assert!(started.elapsed() < Duration::from_secs(14));
+        app.read(|ctx| {
+            assert_eq!(UserWorkspaces::as_ref(ctx).charge_unit(), ChargeUnit::Cents);
+        });
+    });
+}
+
+#[test]
+fn ordinary_metadata_refresh_keeps_four_attempt_limit() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(TeamTesterStatus::new);
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        let mut team_client = MockTeamClient::new();
+        team_client
+            .expect_workspaces_metadata()
+            .times(4)
+            .returning(|| Err(anyhow::anyhow!("workspace metadata unavailable")));
+        app.add_singleton_model(|ctx| TeamUpdateManager::new(Arc::new(team_client), None, ctx));
+        let runner = app.add_singleton_model(|_| AgentDriverRunner);
+        let foreground = runner.update(&mut app, |_, ctx| ctx.spawner());
+
+        let error = AgentDriverRunner::refresh_team_metadata(&foreground, false)
+            .await
+            .unwrap_err();
+
+        let AgentDriverError::TeamMetadataRefreshFailed(source) = error else {
+            panic!("unexpected refresh error: {error:#}");
+        };
         assert_eq!(source.to_string(), "workspace metadata unavailable");
+    });
+}
+
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn cloud_startup_metadata_refresh_is_a_logged_out_noop() {
+    test_with_paused_time(|mut app| async move {
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(TeamTesterStatus::new);
+        app.add_singleton_model(|_| AuthStateProvider::new_logged_out_for_test());
+        let mut team_client = MockTeamClient::new();
+        team_client.expect_workspaces_metadata().never();
+        app.add_singleton_model(|ctx| TeamUpdateManager::new(Arc::new(team_client), None, ctx));
+        let runner = app.add_singleton_model(|_| AgentDriverRunner);
+        let foreground = runner.update(&mut app, |_, ctx| ctx.spawner());
+        let started = tokio::time::Instant::now();
+
+        AgentDriverRunner::refresh_team_metadata(&foreground, true)
+            .await
+            .unwrap();
+
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    });
+}
+
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn dropping_cloud_startup_metadata_refresh_stops_retries() {
+    test_with_paused_time(|mut app| async move {
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(TeamTesterStatus::new);
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = attempts.clone();
+        let mut team_client = MockTeamClient::new();
+        team_client.expect_workspaces_metadata().returning(move || {
+            observed_attempts.fetch_add(1, Ordering::Relaxed);
+            Err(anyhow::anyhow!("workspace metadata unavailable"))
+        });
+        let manager =
+            app.add_singleton_model(|ctx| TeamUpdateManager::new(Arc::new(team_client), None, ctx));
+        let refresh = manager.update(&mut app, |manager, ctx| {
+            manager.refresh_workspace_metadata_with_retry(
+                WorkspaceMetadataRetryPolicy::TimeBudget(Duration::from_secs(30)),
+                ctx,
+            )
+        });
+
+        assert!(refresh.now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     });
 }
 
