@@ -2,7 +2,14 @@
 # Syncs the fork with upstream Warp: master follows upstream, each feature branch merges master,
 # and dev merges every feature branch. Verifies dev builds and never pushes. See FORK.md.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+
+# Checking out the feature branches removes this file, so run from a copy outside the repo.
+if [[ -z "${FORK_SYNC_REPO:-}" ]]; then
+    copy=$(mktemp)
+    cp "$0" "$copy"
+    FORK_SYNC_REPO=$(cd "$(dirname "$0")/.." && pwd) exec bash "$copy"
+fi
+cd "$FORK_SYNC_REPO"
 
 # Keep in sync with the feature list in FORK.md.
 FEATURE_BRANCHES=(feat/session-archive feat/ssh-manager)
