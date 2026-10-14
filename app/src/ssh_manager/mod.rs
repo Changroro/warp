@@ -1,19 +1,22 @@
 //! Fork-owned SSH host manager. Upstream files only hold thin hooks into this module; see
 //! `FORK.md` for the list.
 
-pub mod auto_inject;
+pub mod askpass;
 pub mod config_file;
 pub mod control_master;
 pub mod host_editor;
 pub mod launcher;
-pub mod login_prompt;
 pub mod open_connections;
 pub mod panel;
 pub mod profile;
 pub mod reconnect;
 pub mod reconnect_banner;
+pub mod remote_sessions;
+pub mod ssh_command;
 pub mod ui;
 pub mod usage;
+
+use std::path::PathBuf;
 
 use uuid::Uuid;
 use warpui::AppContext;
@@ -35,6 +38,15 @@ pub enum SshManagerAction {
     Connect(Uuid),
     /// Opens a new terminal tab and runs `ssh` with the given arguments.
     QuickConnect(String),
+    /// Reopens the tabs of the WarpOss app running on the host as SSH tabs to it, connecting
+    /// first if no connection to the host is open.
+    OpenRemoteSessions(Uuid),
+    /// Reads the host's WarpOss tabs through the ControlMaster of a live connection to it and
+    /// reopens them.
+    ReadRemoteSessions {
+        profile_id: Uuid,
+        control_path: PathBuf,
+    },
     /// Saves a `[user@]host[:port]` quick-connect entry as a profile.
     SaveHost {
         input: String,
@@ -47,6 +59,8 @@ impl SshManagerAction {
         match self {
             SshManagerAction::Connect(_)
             | SshManagerAction::QuickConnect(_)
+            | SshManagerAction::OpenRemoteSessions(_)
+            | SshManagerAction::ReadRemoteSessions { .. }
             | SshManagerAction::SaveHost { .. } => true,
             SshManagerAction::TogglePanel
             | SshManagerAction::OpenPanel

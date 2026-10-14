@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use chrono::Utc;
 use settings::Setting as _;
 use uuid::Uuid;
@@ -11,10 +15,13 @@ use super::{DefaultSessionModeBehavior, NewSessionSource, Workspace};
 use crate::appearance::Appearance;
 use crate::menu::{MenuItem, MenuItemFields};
 use crate::modal::{Modal, ModalEvent, ModalViewState};
+use crate::pane_group::PanesLayout;
 use crate::settings::SshSettings;
 use crate::ssh_manager::launcher::{LAUNCHER_WIDTH, SshLauncherEvent, SshLauncherView};
+use crate::ssh_manager::open_connections::SshOpenConnections;
 use crate::ssh_manager::panel::{SshProfilesPanelEvent, SshProfilesPanelView};
-use crate::ssh_manager::profile::{QuickConnectDestination, quick_connect_args};
+use crate::ssh_manager::profile::{QuickConnectDestination, SshHostProfile, quick_connect_args};
+use crate::ssh_manager::remote_sessions::{self, RemoteSessions};
 use crate::ssh_manager::ui::{ansi_color, host_color};
 use crate::ssh_manager::usage::{SshDestination, format_relative_time};
 use crate::ssh_manager::{LAUNCHER_BINDING_NAME, SshManagerAction, TOGGLE_PANEL_BINDING_NAME};
@@ -87,8 +94,17 @@ impl Workspace {
             SshManagerAction::TogglePanel => self.toggle_ssh_profiles_panel(ctx),
             SshManagerAction::OpenPanel => self.open_ssh_profiles_panel(ctx),
             SshManagerAction::OpenLauncher => self.open_ssh_launcher(ctx),
-            SshManagerAction::Connect(profile_id) => self.connect_ssh_profile(*profile_id, ctx),
+            SshManagerAction::Connect(profile_id) => {
+                self.connect_ssh_profile(*profile_id, ctx);
+            }
             SshManagerAction::QuickConnect(input) => self.quick_connect_ssh(input, ctx),
+            SshManagerAction::OpenRemoteSessions(profile_id) => {
+                self.open_remote_ssh_sessions(*profile_id, ctx)
+            }
+            SshManagerAction::ReadRemoteSessions {
+                profile_id,
+                control_path,
+            } => self.read_remote_ssh_sessions(*profile_id, control_path.clone(), ctx),
             SshManagerAction::SaveHost { input, connect } => {
                 self.save_ssh_host(input, *connect, ctx)
             }
@@ -107,7 +123,7 @@ impl Workspace {
         let usage = settings.ssh_host_usage.value();
         let now = Utc::now();
         let find = |id: Uuid| profiles.iter().find(|profile| profile.id == id);
-        let host_item = |profile: &crate::ssh_manager::profile::SshHostProfile, detail: String| {
+        let host_item = |profile: &SshHostProfile, detail: String| {
             let color = host_color(profile).unwrap_or(AnsiColorIdentifier::White);
             MenuItemFields::new(profile.name.clone())
                 .with_on_select_action(WorkspaceAction::SshManager(SshManagerAction::Connect(
@@ -297,44 +313,143 @@ impl Workspace {
                     self.connect_ssh_profile(profile_id, ctx);
                 }
             }
-            Err(message) => {
-                let window_id = ctx.window_id();
-                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
-                    toast_stack.add_ephemeral_toast(
-                        DismissibleToast::error(message),
-                        window_id,
-                        ctx,
-                    );
-                });
-            }
+            Err(message) => self.show_ssh_toast(DismissibleToast::error(message), ctx),
         }
     }
 
-    fn connect_ssh_profile(&mut self, profile_id: Uuid, ctx: &mut ViewContext<Self>) {
-        let Some(profile) = SshSettings::as_ref(ctx)
+    fn show_ssh_toast(
+        &self,
+        toast: DismissibleToast<WorkspaceAction>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let window_id = ctx.window_id();
+        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+        });
+    }
+
+    fn saved_ssh_profile(&self, profile_id: Uuid, ctx: &AppContext) -> Option<SshHostProfile> {
+        SshSettings::as_ref(ctx)
             .saved_ssh_host_profiles
             .value()
             .iter()
             .find(|profile| profile.id == profile_id)
             .cloned()
-        else {
+    }
+
+    fn open_remote_ssh_sessions(&mut self, profile_id: Uuid, ctx: &mut ViewContext<Self>) {
+        let live_control_path = SshOpenConnections::terminals(profile_id, ctx)
+            .into_iter()
+            .find_map(|terminal| terminal.as_ref(ctx).ssh_upload_control_path(ctx));
+        if let Some(control_path) = live_control_path {
+            self.read_remote_ssh_sessions(profile_id, control_path, ctx);
+        } else if let Some(terminal_view) = self.connect_ssh_profile(profile_id, ctx) {
+            terminal_view.update(ctx, |terminal_view, _| {
+                terminal_view.read_remote_sessions_when_ready();
+            });
+        }
+    }
+
+    fn read_remote_ssh_sessions(
+        &mut self,
+        profile_id: Uuid,
+        control_path: PathBuf,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(profile) = self.saved_ssh_profile(profile_id, ctx) else {
+            return;
+        };
+        self.show_ssh_toast(
+            DismissibleToast::default(format!("Reading Warp tabs on {}…", profile.name)),
+            ctx,
+        );
+        ctx.spawn(
+            remote_sessions::fetch(control_path),
+            move |me, result, ctx| match result {
+                Ok(sessions) if sessions.tabs.is_empty() => me.show_ssh_toast(
+                    DismissibleToast::error(format!(
+                        "{} has no terminal tabs open in {}",
+                        profile.name, sessions.database
+                    )),
+                    ctx,
+                ),
+                Ok(sessions) => me.open_remote_ssh_tabs(&profile, sessions, ctx),
+                Err(err) => me.show_ssh_toast(
+                    DismissibleToast::error(format!(
+                        "Couldn't read Warp tabs on {}: {err:#}",
+                        profile.name
+                    )),
+                    ctx,
+                ),
+            },
+        );
+    }
+
+    fn open_remote_ssh_tabs(
+        &mut self,
+        profile: &SshHostProfile,
+        sessions: RemoteSessions,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.record_ssh_connection(SshDestination::Profile(profile.id), ctx);
+        let tab_count = sessions.tabs.len();
+        let host_tab_color = host_color(profile);
+        for tab in sessions.tabs {
+            self.add_tab_with_pane_layout(
+                PanesLayout::Template(tab.layout),
+                Arc::new(HashMap::new()),
+                tab.title,
+                ctx,
+            );
+            if let Some(color) = tab.color.or(host_tab_color) {
+                self.set_tab_color(self.active_tab_index, SelectedTabColor::Color(color), ctx);
+            }
+            let pane_group = self.active_tab_pane_group().as_ref(ctx);
+            let terminal_views = pane_group
+                .visible_pane_ids()
+                .into_iter()
+                .filter_map(|pane_id| pane_group.terminal_view_from_pane_id(pane_id, ctx))
+                .collect::<Vec<_>>();
+            for (terminal_view, directory) in terminal_views.into_iter().zip(tab.directories) {
+                terminal_view.update(ctx, |terminal_view, ctx| {
+                    terminal_view.connect_ssh_profile_in(profile, directory, ctx);
+                });
+            }
+        }
+        self.show_ssh_toast(
+            DismissibleToast::success(format!(
+                "Opened {tab_count} tabs from {} ({})",
+                profile.name, sessions.database
+            )),
+            ctx,
+        );
+        ctx.notify();
+    }
+
+    fn connect_ssh_profile(
+        &mut self,
+        profile_id: Uuid,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<ViewHandle<TerminalView>> {
+        let Some(profile) = self.saved_ssh_profile(profile_id, ctx) else {
             log::warn!(
                 "Failed to start SSH profile session: no saved profile for profile_id={profile_id}"
             );
-            return;
+            return None;
         };
 
         self.record_ssh_connection(SshDestination::Profile(profile_id), ctx);
         let color = host_color(&profile);
-        if let Some(terminal_view) = self.open_ssh_tab(&profile.name, color, ctx) {
-            terminal_view.update(ctx, |terminal_view, ctx| {
-                terminal_view.connect_ssh_profile(&profile, ctx);
-            });
-        } else {
+        let Some(terminal_view) = self.open_ssh_tab(&profile.name, color, ctx) else {
             log::warn!(
                 "Failed to start SSH profile session: no active session view for profile_id={profile_id}"
             );
-        }
+            return None;
+        };
+        terminal_view.update(ctx, |terminal_view, ctx| {
+            terminal_view.connect_ssh_profile(&profile, ctx);
+        });
+        Some(terminal_view)
     }
 
     fn quick_connect_ssh(&mut self, input: &str, ctx: &mut ViewContext<Self>) {

@@ -74,6 +74,8 @@ mod session_archive;
 mod session_management;
 mod shell_indicator;
 mod ssh_manager;
+#[cfg(unix)]
+pub use ssh_manager::askpass::run_if_requested as run_ssh_askpass_if_requested;
 mod suggestions;
 mod system;
 mod tab;

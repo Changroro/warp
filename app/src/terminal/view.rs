@@ -12755,7 +12755,9 @@ impl TerminalView {
                         let alias_value = session.alias_value(first_word)?;
                         Some(format!("{alias_value}{rest}"))
                     });
-                let warpify_command = expanded_command.as_deref().unwrap_or(command.as_str());
+                let warpify_command = crate::ssh_manager::askpass::strip_env_prefix(
+                    expanded_command.as_deref().unwrap_or(command.as_str()),
+                );
 
                 // Check if the current running command spawns a subshell eligible for Warpification.
                 let shell_family = self.shell_family(ctx);
@@ -12820,11 +12822,6 @@ impl TerminalView {
                         if let Some(ssh_host) =
                             parse_interactive_ssh_command(warpify_command).map(|cmd| cmd.host)
                         {
-                            self.maybe_activate_ssh_profile_auto_inject(
-                                warpify_command,
-                                block_id.clone(),
-                                ctx,
-                            );
                             self.warpify_state
                                 .set_pending_ssh_host(warpify_command.to_string(), ssh_host);
                             self.model.lock().start_notify_on_end_of_ssh_login();
@@ -27103,8 +27100,6 @@ impl TerminalView {
                 );
             }
             SshLoginStatus::ReadyToWarpify => {
-                self.ssh_profile.clear_auto_inject();
-
                 // The tmux-based SSH warpification flow has been removed in favor of the
                 // remote-server SSH extension. If this user had previously opted into the tmux
                 // wrapper, show them a one-time deprecation notice on their next SSH session.
@@ -27151,7 +27146,9 @@ impl TerminalView {
                 let alias_value = session.alias_value(first_word)?;
                 Some(format!("{alias_value}{rest}"))
             });
-        let warpify_command = expanded_command.as_deref().unwrap_or(command);
+        let warpify_command = crate::ssh_manager::askpass::strip_env_prefix(
+            expanded_command.as_deref().unwrap_or(command),
+        );
         let shell_family = self.shell_family_for_password_prompt_polling(ctx);
         let warpify_settings = WarpifySettings::as_ref(ctx);
         let is_compatible_subshell_command = warpify_settings
