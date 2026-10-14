@@ -213,6 +213,18 @@ impl TerminalView {
         self.execute_command_or_set_pending(&command, ctx);
     }
 
+    /// Counts this terminal's connection as open only while the terminal is in a tab. Closed tabs
+    /// stay alive for a while so they can be reopened, with ssh still running.
+    pub fn set_ssh_manager_attached(&mut self, attached: bool, ctx: &mut ViewContext<Self>) {
+        match self.ssh_profile.connection.as_ref() {
+            Some(connection) if attached && !connection.disconnected => {
+                let profile_id = connection.profile_id;
+                SshOpenConnections::connected(ctx.handle(), profile_id, ctx);
+            }
+            _ => SshOpenConnections::disconnected(ctx.view_id(), ctx),
+        }
+    }
+
     /// Sends a clipboard image to the remote host of a connected SSH manager session and pastes its
     /// remote path, since programs on the remote host can't read the local clipboard. Returns
     /// whether the paste was handled.
