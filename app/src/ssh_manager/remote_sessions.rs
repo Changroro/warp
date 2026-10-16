@@ -1,6 +1,7 @@
 //! Reads the tabs of the WarpOss app running on an SSH host from that host's session database, so
-//! they can be reopened here as SSH tabs with the same titles, colors, and splits.
+//! they can be reopened here as SSH tabs with the same titles, colors, splits, and agent logos.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Context as _;
@@ -8,10 +9,12 @@ use serde::Deserialize;
 
 use crate::launch_configs::launch_config::{PaneMode, PaneTemplateType, SplitDirection};
 use crate::tab::SelectedTabColor;
+use crate::terminal::cli_agent::CLIAgent;
 use crate::themes::theme::AnsiColorIdentifier;
 
-/// Prints the path of the most recently written WarpOss session database on the host, then its
-/// pane tree as JSON. Each desktop workspace can have its own database under `~/.local/state`.
+/// Prints the path of the most recently written WarpOss session database on the host, the last
+/// CLI agent of each of its panes as one line of JSON, then its pane tree as JSON. Each desktop
+/// workspace can have its own database under `~/.local/state`.
 const REMOTE_SCRIPT: &str = r#"
 command -v sqlite3 >/dev/null 2>&1 || { echo "sqlite3 is not installed on this host" >&2; exit 3; }
 newest=""
@@ -26,7 +29,10 @@ for db in "$HOME/.local/state/warp-oss/warp.sqlite" "$HOME"/.local/state/*/warp-
 done
 [ -n "$newest" ] || { echo "WarpOss has no session database on this host" >&2; exit 4; }
 printf "%s\n" "$newest"
-exec sqlite3 -readonly -json "$newest" "SELECT n.id, n.tab_id, n.parent_pane_node_id AS parent, n.is_leaf, b.horizontal, l.kind, p.cwd, t.custom_title AS title, t.color FROM pane_nodes n JOIN tabs t ON t.id = n.tab_id LEFT JOIN pane_branches b ON b.pane_node_id = n.id LEFT JOIN pane_leaves l ON l.pane_node_id = n.id LEFT JOIN terminal_panes p ON p.id = n.id ORDER BY t.window_id, t.id, n.id"
+agents="$(dirname "$newest")/pane-cli-agents.json"
+if [ -f "$agents" ]; then tr -d '\n' < "$agents"; fi
+printf "\n"
+exec sqlite3 -readonly -json "$newest" "SELECT n.id, n.tab_id, n.parent_pane_node_id AS parent, n.is_leaf, b.horizontal, l.kind, p.cwd, lower(hex(p.uuid)) AS uuid, t.custom_title AS title, t.color FROM pane_nodes n JOIN tabs t ON t.id = n.tab_id LEFT JOIN pane_branches b ON b.pane_node_id = n.id LEFT JOIN pane_leaves l ON l.pane_node_id = n.id LEFT JOIN terminal_panes p ON p.id = n.id ORDER BY t.window_id, t.id, n.id"
 "#;
 
 #[cfg(not(target_family = "wasm"))]
@@ -43,8 +49,15 @@ pub struct RemoteTab {
     pub color: Option<AnsiColorIdentifier>,
     /// Terminal panes only. Every leaf opens in the local default directory.
     pub layout: PaneTemplateType,
-    /// The remote working directory of each leaf of `layout`, left to right and top to bottom.
-    pub directories: Vec<Option<String>>,
+    /// Each leaf of `layout`, left to right and top to bottom.
+    pub panes: Vec<RemotePane>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct RemotePane {
+    pub directory: Option<String>,
+    /// The last CLI agent the pane ran on the host.
+    pub agent: Option<CLIAgent>,
 }
 
 #[derive(Deserialize)]
@@ -56,14 +69,20 @@ struct NodeRow {
     horizontal: Option<i64>,
     kind: Option<String>,
     cwd: Option<String>,
+    uuid: Option<String>,
     title: Option<String>,
     color: Option<String>,
 }
 
 pub fn parse_remote_output(output: &str) -> anyhow::Result<RemoteSessions> {
-    let (database, json) = output
+    let (database, rest) = output
         .split_once('\n')
         .context("the host printed no session database path")?;
+    let (agents, json) = rest
+        .split_once('\n')
+        .context("the host printed no pane agents")?;
+    // An unreadable agents file only costs the logos.
+    let agents: HashMap<String, CLIAgent> = serde_json::from_str(agents).unwrap_or_default();
     let rows: Vec<NodeRow> = if json.trim().is_empty() {
         Vec::new()
     } else {
@@ -79,13 +98,13 @@ pub fn parse_remote_output(output: &str) -> anyhow::Result<RemoteSessions> {
             .iter()
             .filter(|node| node.tab_id == row.tab_id)
             .collect::<Vec<_>>();
-        let mut directories = Vec::new();
-        if let Some(layout) = build_pane(row, &tab_rows, &mut directories) {
+        let mut panes = Vec::new();
+        if let Some(layout) = build_pane(row, &tab_rows, &agents, &mut panes) {
             tabs.push(RemoteTab {
                 title: row.title.clone().filter(|title| !title.is_empty()),
                 color: row.color.as_deref().and_then(parse_tab_color),
                 layout,
-                directories,
+                panes,
             });
         }
     }
@@ -98,13 +117,21 @@ pub fn parse_remote_output(output: &str) -> anyhow::Result<RemoteSessions> {
 fn build_pane(
     node: &NodeRow,
     tab_rows: &[&NodeRow],
-    directories: &mut Vec<Option<String>>,
+    agents: &HashMap<String, CLIAgent>,
+    panes: &mut Vec<RemotePane>,
 ) -> Option<PaneTemplateType> {
     if node.is_leaf != 0 {
         if node.kind.as_deref() != Some("terminal") {
             return None;
         }
-        directories.push(node.cwd.clone().filter(|cwd| !cwd.is_empty()));
+        panes.push(RemotePane {
+            directory: node.cwd.clone().filter(|cwd| !cwd.is_empty()),
+            agent: node
+                .uuid
+                .as_ref()
+                .and_then(|uuid| agents.get(uuid))
+                .copied(),
+        });
         return Some(PaneTemplateType::PaneTemplate {
             cwd: PathBuf::new(),
             commands: Vec::new(),
@@ -117,7 +144,7 @@ fn build_pane(
     let mut panes = tab_rows
         .iter()
         .filter(|child| child.parent == Some(node.id))
-        .filter_map(|child| build_pane(child, tab_rows, directories))
+        .filter_map(|child| build_pane(child, tab_rows, agents, panes))
         .collect::<Vec<_>>();
     match panes.len() {
         0 => None,

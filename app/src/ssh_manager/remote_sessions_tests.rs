@@ -21,10 +21,21 @@ fn row(
 }
 
 fn output(rows: Vec<serde_json::Value>) -> String {
+    output_with_agents("", rows)
+}
+
+fn output_with_agents(agents: &str, rows: Vec<serde_json::Value>) -> String {
     format!(
-        "/home/me/.local/state/warp-ws0/warp-oss/warp.sqlite\n{}",
+        "/home/me/.local/state/warp-ws0/warp-oss/warp.sqlite\n{agents}\n{}",
         serde_json::Value::Array(rows)
     )
+}
+
+fn directories(tab: &RemoteTab) -> Vec<Option<String>> {
+    tab.panes
+        .iter()
+        .map(|pane| pane.directory.clone())
+        .collect()
 }
 
 fn shape(layout: &PaneTemplateType) -> String {
@@ -65,7 +76,7 @@ fn rebuilds_tabs_with_nested_splits_and_leaf_directories() {
     assert_eq!(sessions.tabs[0].title.as_deref(), Some("api"));
     assert_eq!(sessions.tabs[0].color, Some(AnsiColorIdentifier::Red));
     assert_eq!(
-        sessions.tabs[0].directories,
+        directories(&sessions.tabs[0]),
         vec![Some("/srv/app".to_string())]
     );
     assert_eq!(
@@ -73,7 +84,7 @@ fn rebuilds_tabs_with_nested_splits_and_leaf_directories() {
         "Horizontal[pane, Vertical[pane, pane]]"
     );
     assert_eq!(
-        sessions.tabs[1].directories,
+        directories(&sessions.tabs[1]),
         vec![
             Some("/srv/left".to_string()),
             Some("/srv/top".to_string()),
@@ -94,12 +105,53 @@ fn drops_non_terminal_panes_and_collapses_their_splits() {
 
     assert_eq!(sessions.tabs.len(), 1);
     assert_eq!(shape(&sessions.tabs[0].layout), "pane");
-    assert_eq!(sessions.tabs[0].directories, vec![Some("/srv".to_string())]);
+    assert_eq!(
+        directories(&sessions.tabs[0]),
+        vec![Some("/srv".to_string())]
+    );
 }
 
 #[test]
 fn accepts_a_database_without_tabs() {
-    let sessions = parse_remote_output("/db/warp.sqlite\n").unwrap();
+    let sessions = parse_remote_output("/db/warp.sqlite\n\n").unwrap();
     assert!(sessions.tabs.is_empty());
     assert!(parse_remote_output("").is_err());
+}
+
+#[test]
+fn panes_carry_the_last_agent_the_host_recorded_for_them() {
+    let mut claude = row(2, 1, Some(1), Some(("terminal", "/srv/a")), false);
+    claude["uuid"] = "ab01".into();
+    let mut shell = row(3, 1, Some(1), Some(("terminal", "/srv/b")), false);
+    shell["uuid"] = "ab02".into();
+    let sessions = parse_remote_output(&output_with_agents(
+        r#"{"ab01":"Claude","ff00":"Codex"}"#,
+        vec![row(1, 1, None, None, false), claude, shell],
+    ))
+    .unwrap();
+
+    let agents: Vec<_> = sessions.tabs[0]
+        .panes
+        .iter()
+        .map(|pane| pane.agent)
+        .collect();
+    assert_eq!(agents, [Some(CLIAgent::Claude), None]);
+}
+
+#[test]
+fn a_missing_or_broken_agents_file_only_drops_the_logos() {
+    for agents in ["", "not json"] {
+        let sessions = parse_remote_output(&output_with_agents(
+            agents,
+            vec![row(1, 1, None, Some(("terminal", "/srv")), false)],
+        ))
+        .unwrap();
+        assert_eq!(
+            sessions.tabs[0].panes,
+            [RemotePane {
+                directory: Some("/srv".to_string()),
+                agent: None
+            }]
+        );
+    }
 }
