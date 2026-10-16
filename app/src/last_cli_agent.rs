@@ -38,6 +38,14 @@ pub fn register_pane(terminal_view_id: EntityId, pane_uuid: &[u8], app: &mut App
     });
 }
 
+/// Records `agent` as the last agent of the terminal's pane, as if it had run there.
+pub fn remember(terminal_view_id: EntityId, agent: CLIAgent, app: &mut AppContext) {
+    if !app.has_singleton_model::<LastCliAgents>() {
+        return;
+    }
+    LastCliAgents::handle(app).update(app, |model, _| model.record(terminal_view_id, agent));
+}
+
 /// The logo of the last agent the terminal ran, shown when no agent is running now.
 pub fn icon_variant(terminal_view_id: EntityId, app: &AppContext) -> Option<IconWithStatusVariant> {
     if !app.has_singleton_model::<LastCliAgents>() {
@@ -83,10 +91,14 @@ impl LastCliAgents {
             | CLIAgentSessionsModelEvent::SessionUpdated { agent, .. } => *agent,
             CLIAgentSessionsModelEvent::Ended { .. } => return,
         };
+        self.record(event.terminal_view_id(), agent);
+    }
+
+    fn record(&mut self, terminal_view_id: EntityId, agent: CLIAgent) {
         if matches!(agent, CLIAgent::Unknown) {
             return;
         }
-        let Some(pane) = self.pane_by_view.get(&event.terminal_view_id()) else {
+        let Some(pane) = self.pane_by_view.get(&terminal_view_id) else {
             return;
         };
         // shortcut: entries for closed panes are never pruned; they cost a few dozen bytes each.
