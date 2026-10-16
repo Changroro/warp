@@ -1,3 +1,4 @@
+mod agent_dots;
 pub mod telemetry;
 
 use std::cell::RefCell;
@@ -417,6 +418,7 @@ fn render_pane_row_element(
         is_pinned,
         container_is_hovered,
         shortcut_hint_binding_name: _,
+        other_pane_agents: _,
     } = props;
     let is_selected = is_active_tab && is_focused;
     let show_pin = FeatureFlag::PinnedTabs.is_enabled() && is_pinned && !container_is_hovered;
@@ -711,6 +713,8 @@ pub(super) struct VerticalTabsPanelState {
     /// lines (one per repo/branch), so each entry holds one handle per branch line.
     summary_pr_badge_mouse_states: RefCell<HashMap<PaneId, Vec<MouseStateHandle>>>,
     detail_pane_badge_mouse_states: RefCell<HashMap<PaneId, PaneRowBadgeMouseStates>>,
+    /// Fork: click states for the other-pane agent logos in the Tabs view.
+    agent_dot_mouse_states: RefCell<HashMap<PaneId, MouseStateHandle>>,
     detail_scroll_state: ClippedScrollStateHandle,
     detail_sidecar_mouse_state: MouseStateHandle,
     detail_overlay_state: Arc<Mutex<VerticalTabsDetailOverlayState>>,
@@ -753,6 +757,7 @@ impl Default for VerticalTabsPanelState {
             pane_badge_mouse_states: RefCell::default(),
             summary_pr_badge_mouse_states: RefCell::default(),
             detail_pane_badge_mouse_states: RefCell::default(),
+            agent_dot_mouse_states: RefCell::default(),
             detail_scroll_state: ClippedScrollStateHandle::default(),
             detail_sidecar_mouse_state: Default::default(),
             detail_overlay_state: Arc::new(Mutex::new(VerticalTabsDetailOverlayState::default())),
@@ -871,6 +876,8 @@ struct PaneProps<'a> {
     /// The pin icon is hidden when a tab is hovered.
     container_is_hovered: bool,
     shortcut_hint_binding_name: Option<&'static str>,
+    /// Fork: agents of the tab's other panes, drawn under the icon in the Tabs view.
+    other_pane_agents: Vec<agent_dots::PaneAgent>,
 }
 
 struct PaneRowState {
@@ -2386,6 +2393,15 @@ fn render_tab_group_internal(
                         is_last: row_idx + 1 == total_rows,
                     };
                 }
+                if matches!(display_granularity, VerticalTabsDisplayGranularity::Tabs) {
+                    pane_props.other_pane_agents = agent_dots::other_pane_agents(
+                        pane_group,
+                        &visible_pane_ids,
+                        *pane_id,
+                        &state.agent_dot_mouse_states,
+                        app,
+                    );
+                }
                 let view_mode = *TabSettings::as_ref(app).vertical_tabs_view_mode.value();
                 let row = match view_mode {
                     VerticalTabsViewMode::Compact => render_compact_pane_row(pane_props, app),
@@ -3575,14 +3591,19 @@ fn render_row_title_line(
         .finish()
 }
 
-fn render_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
+fn render_pane_row(mut props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
     let effective_subtitle = props.subtitle.clone();
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
     let font_family = appearance.ui_font_family();
 
-    let icon = render_pane_icon_with_status(
-        resolve_icon_with_status_variant(&props.typed, &props.title, appearance, app),
+    let icon = agent_dots::with_other_pane_agents(
+        render_pane_icon_with_status(
+            resolve_icon_with_status_variant(&props.typed, &props.title, appearance, app),
+            theme,
+        ),
+        std::mem::take(&mut props.other_pane_agents),
+        props.pane_group_id,
         theme,
     );
 
@@ -4026,6 +4047,7 @@ impl<'a> PaneProps<'a> {
             typed,
             is_being_dragged: pane.is_pane_being_dragged(app),
             stack_position: PaneRowStackPosition::Standalone,
+            other_pane_agents: Vec::new(),
             is_in_multi_selection,
             is_in_multi_tab_selection,
             pane_color: pane_row_state.pane_color,
