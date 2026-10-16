@@ -94,7 +94,9 @@ pub(crate) fn terminal_view_agent_icon_variant(
             .selected_conversation_display_title(app)
             .is_some(),
     };
+    // Fork: fall back to the last agent the pane ran.
     agent_icon_variant_from_terminal_inputs(&inputs)
+        .or_else(|| crate::last_cli_agent::icon_variant(terminal_view.id(), app))
 }
 
 pub(crate) fn agent_conversation_entry_icon_variant(
