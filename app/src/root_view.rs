@@ -4157,7 +4157,12 @@ impl AuthOnboardingState {
         match self {
             &mut AuthOnboardingState::Auth(ref args)
             | &mut AuthOnboardingState::ConfirmIncomingAuth(ref args) => {
-                let workspace = args.clone().create_workspace(ctx);
+                let mut args = args.clone();
+                crate::session_guard::forget_layout_for_other_account(
+                    &mut args.workspace_setting,
+                    ctx,
+                );
+                let workspace = args.create_workspace(ctx);
                 *self = AuthOnboardingState::Terminal(workspace);
             }
             &mut AuthOnboardingState::LoginSlide { ref target, .. } => {
@@ -4294,6 +4299,12 @@ impl AuthOnboardingState {
                 // No workspace to clean up for onboarding/login slide state
             }
             AuthOnboardingState::Terminal(workspace) => {
+                // Fork: log back into this window's current layout.
+                let workspace_setting = crate::session_guard::workspace_source_after_log_out(
+                    workspace.as_ref(ctx),
+                    ctx.window_id(),
+                    ctx,
+                );
                 // Clean up current workspace before resetting.
                 workspace.update(ctx, |workspace, ctx| {
                     workspace.on_log_out(ctx);
@@ -4301,12 +4312,6 @@ impl AuthOnboardingState {
 
                 let global_resource_handles =
                     GlobalResourceHandlesProvider::as_ref(ctx).get().clone();
-                // When a user logs out, reset workspace_setting so user logs back into a
-                // fresh workspace.
-                let workspace_setting = NewWorkspaceSource::Empty {
-                    previous_active_window: None,
-                    shell: None,
-                };
                 let workspace_args = WorkspaceArgs {
                     global_resource_handles,
                     server_time: None,

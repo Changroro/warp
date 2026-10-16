@@ -70,6 +70,7 @@ mod reward_view;
 mod safe_triangle;
 mod search_bar;
 mod server;
+mod session_guard;
 mod session_management;
 mod shell_indicator;
 mod suggestions;

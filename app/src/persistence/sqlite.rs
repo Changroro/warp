@@ -140,6 +140,10 @@ pub fn initialize(
     let database_path = database_file_path_for_scope(&scope);
     match init_db(&scope) {
         Ok(mut conn) => {
+            // Fork: keep layout-only backups of the app's session database.
+            if matches!(scope, PersistenceScope::App) {
+                crate::session_guard::start_auto_backups(database_path.clone());
+            }
             let mut persisted_data = read_persisted_data(&mut conn, ctx, data_scope);
 
             let writer_handles = match start_writer(conn, database_path.clone()) {
