@@ -15,7 +15,7 @@ Active feature branches (keep `FEATURE_BRANCHES` in `script/fork-sync` in sync):
 | Branch | Feature |
 | --- | --- |
 | `feat/session-archive` | Archive closed sessions in the vertical tabs panel |
-| `feat/ssh-manager` | SSH host manager. It was branched from `dev` and already contains `feat/session-archive`, so branch an upstream PR from `master` instead. |
+| `feat/ssh-manager` | SSH host manager. It was branched from `dev` and already contains `feat/session-archive` and `feat/agent-logos` (remote tabs keep their agent logos), so branch an upstream PR from `master` instead. |
 | `feat/session-guard` | Keep the saved session layout across logout, plus layout-only backups |
 | `feat/agent-logos` | Remember each pane's last CLI agent and show split panes' agents in vertical tabs |
 

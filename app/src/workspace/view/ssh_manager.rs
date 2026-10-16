@@ -410,9 +410,12 @@ impl Workspace {
                 .into_iter()
                 .filter_map(|pane_id| pane_group.terminal_view_from_pane_id(pane_id, ctx))
                 .collect::<Vec<_>>();
-            for (terminal_view, directory) in terminal_views.into_iter().zip(tab.directories) {
+            for (terminal_view, pane) in terminal_views.into_iter().zip(tab.panes) {
+                if let Some(agent) = pane.agent {
+                    crate::last_cli_agent::remember(terminal_view.id(), agent, ctx);
+                }
                 terminal_view.update(ctx, |terminal_view, ctx| {
-                    terminal_view.connect_ssh_profile_in(profile, directory, ctx);
+                    terminal_view.connect_ssh_profile_in(profile, pane.directory, ctx);
                 });
             }
         }
