@@ -12,7 +12,7 @@ fi
 cd "$FORK_SYNC_REPO"
 
 # Keep in sync with the feature list in FORK.md.
-FEATURE_BRANCHES=(feat/session-archive feat/ssh-manager)
+FEATURE_BRANCHES=(feat/session-archive feat/ssh-manager feat/session-guard feat/agent-logos)
 
 if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
     echo "Commit or stash tracked changes before syncing." >&2

@@ -16,6 +16,8 @@ Active feature branches (keep `FEATURE_BRANCHES` in `script/fork-sync` in sync):
 | --- | --- |
 | `feat/session-archive` | Archive closed sessions in the vertical tabs panel |
 | `feat/ssh-manager` | SSH host manager. It was branched from `dev` and already contains `feat/session-archive`, so branch an upstream PR from `master` instead. |
+| `feat/session-guard` | Keep the saved session layout across logout, plus layout-only backups |
+| `feat/agent-logos` | Remember each pane's last CLI agent and show split panes' agents in vertical tabs |
 
 ## Syncing with upstream
 
@@ -83,3 +85,31 @@ Code: `app/src/session_archive.rs`. Hooks: `app/src/lib.rs`, `app/src/tab.rs`,
 `app/src/persistence/{mod,sqlite}.rs`, `crates/persistence/src/{model,schema}.rs`,
 `crates/persistence/migrations/2026-07-30-*`, and the test setup in `app/src/test_util/terminal.rs`
 and `app/src/workspace/view_tests.rs`.
+
+## Session guard
+
+Code: `app/src/session_guard.rs`. Backups go to `session-backups/` and the owning account's user id
+to `session-owner`, both next to `warp.sqlite`. To restore a backup, quit Warp, then copy each
+table from the backup into `warp.sqlite` (`ATTACH` the backup, then `DELETE` and `INSERT ... SELECT`
+per table in one transaction).
+
+| File | Hook |
+| --- | --- |
+| `app/src/lib.rs` | `mod session_guard;` |
+| `app/src/auth/mod.rs` | `session_guard::on_log_out` replaces `persistence::remove` in `log_out` |
+| `app/src/auth/auth_manager.rs` | `session_guard::on_user_fetched` replaces `persistence::reconstruct` |
+| `app/src/root_view.rs` | `workspace_source_after_log_out` in `AuthOnboardingState::log_out`, `forget_layout_for_other_account` in `complete_auth_and_create_workspace` |
+| `app/src/workspace/global_actions.rs` | `save_app` skips snapshots without windows |
+| `app/src/persistence/sqlite.rs` | `start_auto_backups` in `initialize` for the app scope |
+
+## Agent logos
+
+Code: `app/src/last_cli_agent.rs` and `app/src/workspace/view/vertical_tabs/agent_dots.rs`. The
+last agent per pane is stored in `pane-cli-agents.json` next to `warp.sqlite`.
+
+| File | Hook |
+| --- | --- |
+| `app/src/lib.rs` | `mod last_cli_agent;` and `last_cli_agent::init` after `CLIAgentSessionsModel` |
+| `app/src/pane_group/pane/terminal_pane.rs` | `register_pane` in `TerminalPane::new` |
+| `app/src/ui_components/agent_icon.rs` | `last_cli_agent::icon_variant` fallback in `terminal_view_agent_icon_variant` |
+| `app/src/workspace/view/vertical_tabs.rs` | `mod agent_dots;`, `PaneProps::other_pane_agents`, `agent_dot_mouse_states`, the Tabs-view fill in `render_tab_group`, and the icon wrap in `render_pane_row` |
