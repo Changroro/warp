@@ -50,7 +50,7 @@ use crate::terminal::shared_session::manager::Manager as SharedSessionManager;
 use crate::uri::browser_url_handler::{parse_current_url, update_browser_url};
 use crate::workspaces::team_tester::TeamTesterStatus;
 use crate::{
-    GlobalResourceHandlesProvider, TelemetryEvent, persistence, send_telemetry_from_ctx,
+    GlobalResourceHandlesProvider, TelemetryEvent, send_telemetry_from_ctx,
     send_telemetry_sync_from_ctx,
 };
 
@@ -495,10 +495,11 @@ impl AuthManager {
                 let global_resource_handles =
                     GlobalResourceHandlesProvider::as_ref(ctx).get().clone();
 
-                // As part of Logout v0:
-                // Reconstruct the database if it was removed.
-                // Do nothing if the database was not removed.
-                persistence::reconstruct(&global_resource_handles.model_event_sender);
+                // Fork: a different account than the database's owner starts from an empty one.
+                crate::session_guard::on_user_fetched(
+                    &global_resource_handles.model_event_sender,
+                    ctx,
+                );
                 if let Some(model_event_sender) = &global_resource_handles.model_event_sender
                     && let Err(e) =
                         model_event_sender.send(ModelEvent::UpsertCurrentUserInformation {

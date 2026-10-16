@@ -71,6 +71,7 @@ mod safe_triangle;
 mod search_bar;
 mod server;
 mod session_archive;
+mod session_guard;
 mod session_management;
 mod shell_indicator;
 mod ssh_manager;

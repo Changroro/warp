@@ -59,10 +59,7 @@ use crate::terminal::shared_session::manager::Manager as SharedSessionManager;
 use crate::workflows::manager::WorkflowManager;
 use crate::workspace::{OneTimeModalModel, Workspace, WorkspaceAction};
 use crate::workspaces::update_manager::TeamUpdateManager;
-use crate::{
-    GlobalResourceHandlesProvider, focus_running_window_and_show_native_modal, persistence,
-    send_telemetry_sync_from_app_ctx,
-};
+use crate::{focus_running_window_and_show_native_modal, send_telemetry_sync_from_app_ctx};
 
 pub fn init(app: &mut AppContext) {
     auth_view_modal::init(app);
@@ -277,11 +274,8 @@ pub fn log_out(app: &mut AppContext) {
         index_manager.reset_codebase_indexing(ctx);
     });
 
-    let global_resource_handles = GlobalResourceHandlesProvider::as_ref(app).get();
-
-    // As part of Logout v0, we remove sqlite3 so sessions and cloud objects don't persist between accounts.
-    // TODO: Implement per-user scoping of sqlite3.
-    persistence::remove(&global_resource_handles.model_event_sender);
+    // Fork: keep the session database so the layout survives logout; see `session_guard`.
+    crate::session_guard::on_log_out(app);
 
     AuthManager::handle(app).update(app, |auth_manager, ctx| {
         auth_manager.log_out(ctx);
