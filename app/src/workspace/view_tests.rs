@@ -5826,3 +5826,46 @@ fn test_tab_group_rename_blur_does_not_commit_unfinished_name() {
         });
     });
 }
+
+fn archived_titles(app: &App) -> Vec<String> {
+    SessionArchiveModel::handle(app).read(app, |archive, _| {
+        archive
+            .sessions()
+            .iter()
+            .map(|session| session.title.clone())
+            .collect()
+    })
+}
+
+#[test]
+fn archiving_the_only_tab_still_records_it() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.set_active_tab_name("solo", ctx);
+            workspace.archive_tab(0, ctx);
+        });
+
+        assert_eq!(archived_titles(&app), vec!["solo".to_string()]);
+    })
+}
+
+#[test]
+fn a_tab_dropped_on_the_archive_section_is_archived() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.set_active_tab_name("dragged", ctx);
+            workspace.archive_drop_target = Some(workspace.tabs[1].pane_group.id());
+            workspace.handle_action(&WorkspaceAction::DropTab, ctx);
+
+            assert_eq!(workspace.tabs.len(), 1);
+            assert_eq!(workspace.archive_drop_target, None);
+        });
+
+        assert_eq!(archived_titles(&app), vec!["dragged".to_string()]);
+    })
+}

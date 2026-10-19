@@ -58,7 +58,7 @@ use crate::pane_group::{
 use crate::persistence::model::ArchivedSession;
 use crate::safe_triangle::SafeTriangle;
 use crate::session_archive::{
-    SessionArchiveModel, archive_section_collapsed, deserialize_cli_agent,
+    SessionArchiveModel, archive_section_collapsed, session_agent, session_layout,
 };
 use crate::tab::{
     SelectedTabColor, TAB_INDICATOR_SYNCED_COLOR, TabData, reveals_tab_shortcut_hints,
@@ -1827,7 +1827,9 @@ fn render_groups(
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(empty_state);
-        if let Some(archive) = render_session_archive_section(state, app) {
+        if let Some(archive) =
+            render_session_archive_section(state, workspace.archive_drop_target.is_some(), app)
+        {
             column.add_child(archive);
         }
         return column.finish();
@@ -2099,7 +2101,9 @@ fn render_groups(
         .borrow_mut()
         .retain(|id, _| all_pane_ids.contains(id));
 
-    if let Some(archive) = render_session_archive_section(state, app) {
+    if let Some(archive) =
+        render_session_archive_section(state, workspace.archive_drop_target.is_some(), app)
+    {
         groups.add_child(archive);
     }
 
@@ -7648,6 +7652,7 @@ impl Workspace {
 /// purpose, kept only as a record of where they were working.
 fn render_session_archive_section(
     state: &VerticalTabsPanelState,
+    is_drop_target: bool,
     app: &AppContext,
 ) -> Option<Box<dyn Element>> {
     let appearance = Appearance::as_ref(app);
@@ -7730,7 +7735,7 @@ fn render_session_archive_section(
             section.add_child(
                 Container::new(
                     Text::new_inline(
-                        "Right-click a tab to move it here.",
+                        "Drag or right-click a tab to archive it.",
                         appearance.ui_font_family(),
                         11.,
                     )
@@ -7746,12 +7751,20 @@ fn render_session_archive_section(
         }
     }
 
-    Some(
-        Container::new(section.finish())
-            .with_padding_top(TABS_MODE_ITEM_SPACING)
-            .finish(),
-    )
+    let mut section = Container::new(section.finish())
+        .with_padding_top(TABS_MODE_ITEM_SPACING)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)));
+    if is_drop_target {
+        section = section
+            .with_background(internal_colors::fg_overlay_2(theme))
+            .with_border(Border::all(1.).with_border_fill(theme.accent()));
+    }
+    Some(SavePosition::new(section.finish(), SESSION_ARCHIVE_SECTION_POSITION_ID).finish())
 }
+
+/// Where the archive section was laid out, so a dragged tab can be dropped on it.
+pub(super) const SESSION_ARCHIVE_SECTION_POSITION_ID: &str =
+    "vertical_tabs_session_archive_section";
 
 fn archived_session_matches_query(session: &ArchivedSession, query_lower: &str) -> bool {
     if query_lower.is_empty() {
@@ -7775,15 +7788,36 @@ fn render_archived_session_row(
     let main_text_color = theme.main_text_color(theme.background());
     let sub_text_color = theme.sub_text_color(theme.background());
 
-    let agent = session.cli_agent.as_deref().and_then(deserialize_cli_agent);
+    let agent = session_agent(session);
+    let layout = session_layout(session);
     let home_dir = dirs::home_dir();
     let home_str = home_dir.as_ref().and_then(|path| path.to_str());
     let subtitle = session
         .cwd
         .as_deref()
         .map(|cwd| warp_util::path::user_friendly_path(cwd, home_str).to_string())
+        .or_else(|| {
+            let leaf = *layout.as_ref()?.leaves().first()?;
+            let host = crate::settings::SshSettings::as_ref(app)
+                .saved_ssh_host_profiles
+                .value()
+                .iter()
+                .find(|profile| Some(profile.id) == leaf.ssh_profile)?
+                .name
+                .clone();
+            Some(match leaf.cwd {
+                Some(cwd) => format!("{host}: {cwd}"),
+                None => host,
+            })
+        })
         .unwrap_or_default();
     let mut meta_parts = Vec::new();
+    if let Some(panes) = layout
+        .map(|layout| layout.leaves().len())
+        .filter(|count| *count > 1)
+    {
+        meta_parts.push(format!("{panes} panes"));
+    }
     if let Some(agent) = agent {
         meta_parts.push(agent.display_name().to_string());
     }

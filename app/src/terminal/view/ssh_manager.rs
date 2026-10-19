@@ -140,6 +140,15 @@ fn last_chars(value: &str, max_chars: usize) -> String {
 }
 
 impl TerminalView {
+    /// The saved SSH profile this terminal is connected to through the SSH manager.
+    pub fn connected_ssh_profile_id(&self) -> Option<Uuid> {
+        self.ssh_profile
+            .connection
+            .as_ref()
+            .filter(|connection| !connection.disconnected)
+            .and_then(|connection| connection.profile_id)
+    }
+
     /// Handles a command starting. Returns whether `command` belongs to an SSH profile connection
     /// that has Warpification disabled, and if so suppresses the remote shell bootstrap until the
     /// command finishes.
