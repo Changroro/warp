@@ -1162,6 +1162,8 @@ pub struct Workspace {
     /// once the tab is actually removed, so cancelling the close confirmation
     /// leaves nothing behind.
     pending_archive: Option<(EntityId, NewArchiveEntry)>,
+    /// The pane group of a tab being dragged over the archive section, which archives it on drop.
+    archive_drop_target: Option<EntityId>,
     auto_handoff_sleep_modal: ViewHandle<AutoHandoffSleepModal>,
     chatgpt_plan_modal: ViewHandle<ChatGPTPlanModal>,
     enable_auto_reload_modal: ViewHandle<EnableAutoReloadModal>,
@@ -3586,6 +3588,7 @@ impl Workspace {
             feature_intro_modal: feature_intro_view,
             feature_intro_tab_pane_group_id: None,
             pending_archive: None,
+            archive_drop_target: None,
             auto_handoff_sleep_modal: auto_handoff_sleep_view,
             chatgpt_plan_modal: chatgpt_plan_view,
             enable_auto_reload_modal,
@@ -12319,15 +12322,7 @@ impl Workspace {
         self.vertical_tabs_panel
             .clear_detail_sidecar_if_for_pane_group(pane_group.id());
 
-        // If this is the last tab, close the window instead of actually removing
-        // the tab.
-        if self.tabs.len() == 1 {
-            if ContextFlag::CloseWindow.is_enabled() {
-                ctx.close_window();
-            }
-            return;
-        }
-
+        // Recorded before the last-tab check, which closes the window without removing the tab.
         if self
             .pending_archive
             .as_ref()
@@ -12336,6 +12331,15 @@ impl Workspace {
         {
             SessionArchiveModel::handle(ctx)
                 .update(ctx, |archive, ctx| archive.archive(entry, ctx));
+        }
+
+        // If this is the last tab, close the window instead of actually removing
+        // the tab.
+        if self.tabs.len() == 1 {
+            if ContextFlag::CloseWindow.is_enabled() {
+                ctx.close_window();
+            }
+            return;
         }
 
         // Preserve split-off child-agent tabs by moving their lone pane back
@@ -12558,6 +12562,7 @@ impl Workspace {
             CLIAgentSessionsModel::as_ref(ctx)
                 .session(view.id())
                 .map(|session| session.agent)
+                .or_else(|| crate::last_cli_agent::agent(view.id(), ctx))
         });
         let branch = terminal_view
             .as_ref()
@@ -12586,7 +12591,27 @@ impl Workspace {
             cli_agent,
             branch,
             last_used_at,
+            layout: crate::session_archive::layout_of(pane_group, ctx),
         })
+    }
+
+    fn update_archive_drop_target(
+        &mut self,
+        tab_index: usize,
+        position: RectF,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let over_archive = ctx
+            .element_position_by_id_at_last_frame(
+                self.window_id,
+                vertical_tabs::SESSION_ARCHIVE_SECTION_POSITION_ID,
+            )
+            .is_some_and(|section| section.contains_point(position.center()));
+        let target = over_archive.then(|| self.tabs[tab_index].pane_group.id());
+        if target != self.archive_drop_target {
+            self.archive_drop_target = target;
+            ctx.notify();
+        }
     }
 
     /// Resolves where a dragged archive row landed by comparing its centre
@@ -12623,10 +12648,13 @@ impl Workspace {
             .cwd
             .clone()
             .unwrap_or_else(|| "your home directory".to_string());
+        let info_text = crate::session_archive::session_layout(&session)
+            .map(|layout| self.archived_layout_description(&layout, ctx))
+            .unwrap_or_else(|| format!("A new tab will start in {directory}."));
 
         let dialog = AlertDialogWithCallbacks {
             message_text: format!("Open \"{}\" again?", session.title),
-            info_text: format!("A new tab will start in {directory}."),
+            info_text,
             button_data: vec![
                 ModalButton {
                     title: "Open".to_string(),
@@ -12661,16 +12689,20 @@ impl Workspace {
             return;
         };
 
-        match session.cwd {
-            Some(cwd) => self.open_directory_in_new_tab(PathBuf::from(cwd), ctx),
-            None => self.add_new_session_tab_with_default_mode(
-                NewSessionSource::Tab,
-                None,
-                None,
-                None,
-                false,
-                ctx,
-            ),
+        if let Some(layout) = crate::session_archive::session_layout(&session) {
+            self.open_archived_layout(session.title, layout, ctx);
+        } else {
+            match session.cwd {
+                Some(cwd) => self.open_directory_in_new_tab(PathBuf::from(cwd), ctx),
+                None => self.add_new_session_tab_with_default_mode(
+                    NewSessionSource::Tab,
+                    None,
+                    None,
+                    None,
+                    false,
+                    ctx,
+                ),
+            }
         }
 
         let last_index = self.tabs.len().saturating_sub(1);
@@ -25577,6 +25609,15 @@ impl TypedActionView for Workspace {
                     // preview window actually closes. See the field doc on
                     // `CrossWindowTabDrag::pending_source_window_closes`.
                 }
+                if let Some(pane_group_id) = self.archive_drop_target.take()
+                    && !is_cross_window
+                    && let Some(index) = self
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.pane_group.id() == pane_group_id)
+                {
+                    self.archive_tab(index, ctx);
+                }
             }
             CopyAccessTokenToClipboard => {
                 // Blocking is ok here only because this action is only registered in dev and local
@@ -29032,6 +29073,7 @@ impl Workspace {
         if current_index >= self.tabs.len() {
             return;
         }
+        self.update_archive_drop_target(current_index, position, ctx);
         // Only detach when the drag leaves the active tab presentation on its
         // perpendicular axis. `tab_bar_rects_for_window` returns just the rect
         // for the layout that actually holds the tabs (the vertical panel in

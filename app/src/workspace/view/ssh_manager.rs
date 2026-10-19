@@ -16,6 +16,7 @@ use crate::appearance::Appearance;
 use crate::menu::{MenuItem, MenuItemFields};
 use crate::modal::{Modal, ModalEvent, ModalViewState};
 use crate::pane_group::PanesLayout;
+use crate::session_archive::{ArchivedPane, SessionArchiveModel};
 use crate::settings::SshSettings;
 use crate::ssh_manager::launcher::{LAUNCHER_WIDTH, SshLauncherEvent, SshLauncherView};
 use crate::ssh_manager::open_connections::SshOpenConnections;
@@ -27,6 +28,7 @@ use crate::ssh_manager::usage::{SshDestination, format_relative_time};
 use crate::ssh_manager::{LAUNCHER_BINDING_NAME, SshManagerAction, TOGGLE_PANEL_BINDING_NAME};
 use crate::tab::SelectedTabColor;
 use crate::terminal::TerminalView;
+use crate::terminal::cli_agent::CLIAgent;
 use crate::themes::theme::Fill as ThemeFill;
 use crate::ui_components::icons;
 use crate::util::bindings::keybinding_name_to_display_string;
@@ -404,21 +406,25 @@ impl Workspace {
             if let Some(color) = tab.color.or(host_tab_color) {
                 self.set_tab_color(self.active_tab_index, SelectedTabColor::Color(color), ctx);
             }
-            let pane_group = self.active_tab_pane_group().as_ref(ctx);
-            let terminal_views = pane_group
-                .visible_pane_ids()
-                .into_iter()
-                .filter_map(|pane_id| pane_group.terminal_view_from_pane_id(pane_id, ctx))
-                .collect::<Vec<_>>();
-            for (terminal_view, pane) in terminal_views.into_iter().zip(tab.panes) {
-                if let Some(agent) = pane.agent {
-                    crate::last_cli_agent::remember(terminal_view.id(), agent, ctx);
-                }
-                terminal_view.update(ctx, |terminal_view, ctx| {
-                    terminal_view.connect_ssh_profile_in(profile, pane.directory, ctx);
-                });
-            }
+            self.set_up_active_tab_panes(
+                tab.panes
+                    .into_iter()
+                    .map(|pane| (pane.agent, Some((profile.clone(), pane.directory)))),
+                ctx,
+            );
         }
+        let archived = sessions
+            .archived
+            .into_iter()
+            .map(|session| session.into_local(profile.id))
+            .collect();
+        SessionArchiveModel::handle(ctx).update(ctx, |archive, ctx| {
+            archive.replace_imported(
+                &remote_sessions::imported_id_prefix(profile.id),
+                archived,
+                ctx,
+            );
+        });
         self.show_ssh_toast(
             DismissibleToast::success(format!(
                 "Opened {tab_count} tabs from {} ({})",
@@ -427,6 +433,106 @@ impl Workspace {
             ctx,
         );
         ctx.notify();
+    }
+
+    /// Gives each visible terminal pane of the active tab, left to right and top to bottom, its
+    /// agent logo and connects it to its SSH host in its remote directory.
+    fn set_up_active_tab_panes(
+        &mut self,
+        panes: impl IntoIterator<Item = (Option<CLIAgent>, Option<(SshHostProfile, Option<String>)>)>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let pane_group = self.active_tab_pane_group().as_ref(ctx);
+        let terminal_views = pane_group
+            .visible_pane_ids()
+            .into_iter()
+            .filter_map(|pane_id| pane_group.terminal_view_from_pane_id(pane_id, ctx))
+            .collect::<Vec<_>>();
+        for (terminal_view, (agent, ssh)) in terminal_views.into_iter().zip(panes) {
+            if let Some(agent) = agent {
+                crate::last_cli_agent::remember(terminal_view.id(), agent, ctx);
+            }
+            if let Some((profile, directory)) = ssh {
+                terminal_view.update(ctx, |terminal_view, ctx| {
+                    terminal_view.connect_ssh_profile_in(&profile, directory, ctx);
+                });
+            }
+        }
+    }
+
+    /// Reopens an archived tab with its splits, directories, agent logos, and SSH hosts. Panes
+    /// whose SSH profile was deleted open locally.
+    pub(super) fn open_archived_layout(
+        &mut self,
+        title: String,
+        layout: ArchivedPane,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // Untitled tabs were archived under their directory's name; keep that name out of the
+        // reopened tab so it goes on following the directory.
+        let first_directory = layout
+            .leaves()
+            .first()
+            .and_then(|leaf| leaf.cwd)
+            .and_then(|cwd| std::path::Path::new(cwd).file_name())
+            .map(|name| name.to_string_lossy().into_owned());
+        let custom_title = Some(title).filter(|title| Some(title) != first_directory.as_ref());
+        self.add_tab_with_pane_layout(
+            PanesLayout::Template(layout.template()),
+            Arc::new(HashMap::new()),
+            custom_title,
+            ctx,
+        );
+        let panes = layout
+            .leaves()
+            .into_iter()
+            .map(|leaf| {
+                let ssh = leaf
+                    .ssh_profile
+                    .and_then(|profile_id| self.saved_ssh_profile(profile_id, ctx))
+                    .map(|profile| (profile, leaf.cwd.map(str::to_string)));
+                (leaf.agent, ssh)
+            })
+            .collect::<Vec<_>>();
+        if let Some(color) = panes
+            .iter()
+            .find_map(|(_, ssh)| ssh.as_ref())
+            .and_then(|(profile, _)| host_color(profile))
+        {
+            self.set_tab_color(self.active_tab_index, SelectedTabColor::Color(color), ctx);
+        }
+        self.set_up_active_tab_panes(panes, ctx);
+    }
+
+    /// What reopening `layout` will do, for the confirmation dialog.
+    pub(super) fn archived_layout_description(
+        &self,
+        layout: &ArchivedPane,
+        ctx: &AppContext,
+    ) -> String {
+        let leaves = layout.leaves();
+        let hosts = leaves
+            .iter()
+            .filter_map(|leaf| leaf.ssh_profile)
+            .filter_map(|profile_id| self.saved_ssh_profile(profile_id, ctx))
+            .map(|profile| profile.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let panes = match leaves.len() {
+            1 => "A new tab".to_string(),
+            count => format!("A new tab with {count} panes"),
+        };
+        if hosts.is_empty() {
+            let directory = leaves
+                .first()
+                .and_then(|leaf| leaf.cwd)
+                .unwrap_or("your home directory");
+            format!("{panes} will start in {directory}.")
+        } else {
+            format!(
+                "{panes} will reconnect to {}.",
+                hosts.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        }
     }
 
     fn connect_ssh_profile(

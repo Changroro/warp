@@ -382,6 +382,8 @@ pub struct ArchivedSession {
     pub last_used_at: NaiveDateTime,
     pub archived_at: NaiveDateTime,
     pub sort_order: i32,
+    /// JSON pane tree with each leaf's directory, agent, and SSH host.
+    pub layout: Option<String>,
 }
 
 /// Persisted form of a tab group. `name` is optional — untitled groups omit

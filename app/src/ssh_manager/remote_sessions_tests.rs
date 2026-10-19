@@ -155,3 +155,55 @@ fn a_missing_or_broken_agents_file_only_drops_the_logos() {
         );
     }
 }
+
+#[test]
+fn archived_sessions_on_the_host_come_back_as_ssh_entries() {
+    let profile = Uuid::new_v4();
+    let layout = r#"{"kind":"split","horizontal":true,"panes":[{"kind":"leaf","cwd":"/srv/a","agent":"Claude"},{"kind":"leaf","cwd":"/srv/b"}]}"#;
+    let archive = serde_json::json!([
+        {"id": "one", "title": "api", "cwd": "/srv/a", "cli_agent": "Claude", "branch": "main",
+         "last_used_at": "2026-10-15 09:30:00.123456", "archived_at": "2026-10-15 10:00:00",
+         "sort_order": 0, "layout": layout},
+        {"id": "two", "title": "old host", "cwd": "/srv/old", "cli_agent": "Codex",
+         "last_used_at": "2026-10-14 08:00:00", "sort_order": 1}
+    ]);
+    let output = format!(
+        "{}{ARCHIVE_MARKER}{archive}",
+        output(vec![row(1, 1, None, Some(("terminal", "/srv")), false)])
+    );
+
+    let sessions = parse_remote_output(&output).unwrap();
+    assert_eq!(sessions.tabs.len(), 1);
+    let imported: Vec<_> = sessions
+        .archived
+        .into_iter()
+        .map(|session| session.into_local(profile))
+        .collect();
+
+    assert_eq!(imported[0].id, format!("ssh:{profile}:one"));
+    assert_eq!(imported[0].cwd, None);
+    let split = crate::session_archive::session_layout(&imported[0]).unwrap();
+    let hosts: Vec<_> = split.leaves().iter().map(|leaf| leaf.ssh_profile).collect();
+    assert_eq!(hosts, [Some(profile), Some(profile)]);
+    assert_eq!(
+        imported[0].last_used_at.to_string(),
+        "2026-10-15 09:30:00.123456"
+    );
+
+    let single = crate::session_archive::session_layout(&imported[1]).unwrap();
+    assert_eq!(
+        single.leaves()[0],
+        crate::session_archive::ArchivedLeaf {
+            cwd: Some("/srv/old"),
+            agent: Some(CLIAgent::Codex),
+            ssh_profile: Some(profile),
+        },
+        "a host without layouts still opens the archived directory with its agent"
+    );
+}
+
+#[test]
+fn a_host_without_an_archive_table_imports_nothing() {
+    let output = format!("{}{ARCHIVE_MARKER}", output(vec![]));
+    assert!(parse_remote_output(&output).unwrap().archived.is_empty());
+}

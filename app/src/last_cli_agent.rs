@@ -46,12 +46,17 @@ pub fn remember(terminal_view_id: EntityId, agent: CLIAgent, app: &mut AppContex
     LastCliAgents::handle(app).update(app, |model, _| model.record(terminal_view_id, agent));
 }
 
-/// The logo of the last agent the terminal ran, shown when no agent is running now.
-pub fn icon_variant(terminal_view_id: EntityId, app: &AppContext) -> Option<IconWithStatusVariant> {
+/// The last agent the terminal ran.
+pub fn agent(terminal_view_id: EntityId, app: &AppContext) -> Option<CLIAgent> {
     if !app.has_singleton_model::<LastCliAgents>() {
         return None;
     }
-    let agent = LastCliAgents::as_ref(app).agent(terminal_view_id)?;
+    LastCliAgents::as_ref(app).agent(terminal_view_id)
+}
+
+/// The logo of the last agent the terminal ran, shown when no agent is running now.
+pub fn icon_variant(terminal_view_id: EntityId, app: &AppContext) -> Option<IconWithStatusVariant> {
+    let agent = agent(terminal_view_id, app)?;
     Some(IconWithStatusVariant::CLIAgent {
         agent,
         status: None,

@@ -86,6 +86,12 @@ Code: `app/src/session_archive.rs`. Hooks: `app/src/lib.rs`, `app/src/tab.rs`,
 `crates/persistence/migrations/2026-07-30-*`, and the test setup in `app/src/test_util/terminal.rs`
 and `app/src/workspace/view_tests.rs`.
 
+Split layouts with per-pane directories, agents, and SSH hosts (`layout` column,
+`crates/persistence/migrations/2026-10-19-*`), dropping a dragged tab on the archive section
+(`Workspace::archive_drop_target`, `SESSION_ARCHIVE_SECTION_POSITION_ID`), and importing a host's
+archive when opening its Warp tabs live on `feat/ssh-manager`, which has the SSH manager and
+`last_cli_agent` they rely on.
+
 ## Session guard
 
 Code: `app/src/session_guard.rs`. Backups go to `session-backups/` and the owning account's user id
