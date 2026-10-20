@@ -2315,7 +2315,9 @@ impl RemoteServerManager {
         // so this is a belt-and-suspenders check at zero extra cost (it
         // uses data already received in the InitializeResponse).
         let client_version = ChannelState::app_version();
-        if !version_is_compatible(client_version, &resp.server_version) {
+        if crate::setup::remote_server_version_is_pinned()
+            && !version_is_compatible(client_version, &resp.server_version)
+        {
             log::warn!(
                 "Remote server version mismatch, removing stale binary: session={session_id:?} \
                  client={client_version:?} server={:?}",
