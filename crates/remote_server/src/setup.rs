@@ -495,6 +495,16 @@ pub fn remote_server_binary() -> String {
     }
 }
 
+/// Whether the installed binary is pinned to the client's version. `false` on
+/// [`Channel::Local`] and [`Channel::Oss`], whose installs are unversioned
+/// downloads that can never carry the client's own release tag.
+pub fn remote_server_version_is_pinned() -> bool {
+    match ChannelState::channel() {
+        Channel::Local | Channel::Oss => false,
+        Channel::Stable | Channel::Preview | Channel::Dev | Channel::Integration => true,
+    }
+}
+
 /// Returns the shell command to verify the remote server binary is
 /// installed and functional by running it with `--version`.
 ///
