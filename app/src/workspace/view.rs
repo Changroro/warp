@@ -12592,6 +12592,10 @@ impl Workspace {
             branch,
             last_used_at,
             layout: crate::session_archive::layout_of(pane_group, ctx),
+            group_name: tab
+                .group_id
+                .and_then(|group_id| self.tab_groups.get(&group_id))
+                .and_then(|group| group.name.clone()),
         })
     }
 
@@ -12688,6 +12692,14 @@ impl Workspace {
             log::warn!("Failed to restore archived session: no session for id={id}");
             return;
         };
+        // shortcut: matches by name because group ids are regenerated on restart; untitled or
+        // renamed groups aren't found, so the tab lands ungrouped.
+        let group_id = session.group_name.as_deref().and_then(|name| {
+            self.tab_groups
+                .values()
+                .find(|group| group.name.as_deref() == Some(name))
+                .map(|group| group.id)
+        });
 
         if let Some(layout) = crate::session_archive::session_layout(&session) {
             self.open_archived_layout(session.title, layout, ctx);
@@ -12705,9 +12717,21 @@ impl Workspace {
             }
         }
 
-        let last_index = self.tabs.len().saturating_sub(1);
-        if self.active_tab_index != last_index {
-            self.move_tab_to_index(self.active_tab_index, last_index, ctx);
+        // The new tab may have joined the active tab's group; drop that before placing it, or the
+        // move splits the group.
+        let new_index = self.active_tab_index;
+        if let Some(tab) = self.tabs.get_mut(new_index) {
+            tab.group_id = None;
+        }
+        let target_index = group_id
+            .and_then(|group_id| self.index_after_group(group_id))
+            .unwrap_or(self.tabs.len());
+        if let Some(tab) = self.tabs.get_mut(new_index) {
+            tab.group_id = group_id;
+        }
+        self.move_tab_to_index(new_index, target_index, ctx);
+        if let Some(group_id) = group_id {
+            self.expand_tab_group(group_id, ctx);
         }
     }
 

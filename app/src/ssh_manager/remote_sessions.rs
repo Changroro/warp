@@ -101,6 +101,7 @@ impl RemoteArchivedSession {
             archived_at: Utc::now().naive_utc(),
             sort_order: 0,
             layout: serde_json::to_string(&layout).ok(),
+            group_name: None,
         }
     }
 }

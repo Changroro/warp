@@ -87,6 +87,7 @@ diesel::table! {
         archived_at -> Timestamp,
         sort_order -> Integer,
         layout -> Nullable<Text>,
+        group_name -> Nullable<Text>,
     }
 }
 

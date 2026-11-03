@@ -384,6 +384,8 @@ pub struct ArchivedSession {
     pub sort_order: i32,
     /// JSON pane tree with each leaf's directory, agent, and SSH host.
     pub layout: Option<String>,
+    /// Name of the tab group the tab was in, so it can return there.
+    pub group_name: Option<String>,
 }
 
 /// Persisted form of a tab group. `name` is optional — untitled groups omit
