@@ -1263,6 +1263,7 @@ fn archived_session(title: &str, cwd: Option<&str>) -> ArchivedSession {
         archived_at: timestamp,
         sort_order: 0,
         layout: None,
+        group_name: None,
     }
 }
 

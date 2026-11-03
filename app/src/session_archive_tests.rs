@@ -32,6 +32,7 @@ fn session(id: &str, day: u32) -> ArchivedSession {
         archived_at: timestamp,
         sort_order: 0,
         layout: None,
+        group_name: None,
     }
 }
 

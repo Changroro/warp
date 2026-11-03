@@ -311,20 +311,21 @@ impl TerminalView {
         );
     }
 
-    /// The ControlMaster socket of the live connection: Warp's own, or the SSH wrapper's.
+    /// The ControlMaster socket of the live connection: Warp's own for an SSH manager connection,
+    /// otherwise the SSH wrapper's, which also covers `ssh` typed into the terminal.
     pub fn ssh_upload_control_path(&self, app: &AppContext) -> Option<PathBuf> {
-        let connection = self
-            .ssh_profile
+        self.ssh_profile
             .connection
             .as_ref()
-            .filter(|connection| connection.local_session_id.is_some())?;
-        connection.control_path.clone().or_else(|| {
-            let session = self
-                .sessions
-                .as_ref(app)
-                .get(self.active_block_session_id()?)?;
-            session.ssh_wrapper_socket_path().map(PathBuf::from)
-        })
+            .filter(|connection| connection.local_session_id.is_some())
+            .and_then(|connection| connection.control_path.clone())
+            .or_else(|| {
+                let session = self
+                    .sessions
+                    .as_ref(app)
+                    .get(self.active_block_session_id()?)?;
+                session.ssh_wrapper_socket_path().map(PathBuf::from)
+            })
     }
 
     /// Sends a clipboard image to the remote host of a connected SSH manager session and pastes its

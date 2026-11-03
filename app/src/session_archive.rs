@@ -97,6 +97,7 @@ impl SessionArchiveModel {
                 .layout
                 .as_ref()
                 .and_then(|layout| serde_json::to_string(layout).ok()),
+            group_name: entry.group_name,
         };
 
         self.send(ModelEvent::UpsertArchivedSession {
@@ -229,6 +230,7 @@ pub struct NewArchiveEntry {
     pub branch: Option<String>,
     pub last_used_at: Option<NaiveDateTime>,
     pub layout: Option<ArchivedPane>,
+    pub group_name: Option<String>,
 }
 
 /// The split layout of an archived tab, with what each terminal pane needs to come back.

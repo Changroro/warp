@@ -90,7 +90,9 @@ Split layouts with per-pane directories, agents, and SSH hosts (`layout` column,
 `crates/persistence/migrations/2026-10-19-*`), dropping a dragged tab on the archive section
 (`Workspace::archive_drop_target`, `SESSION_ARCHIVE_SECTION_POSITION_ID`), and importing a host's
 archive when opening its Warp tabs live on `feat/ssh-manager`, which has the SSH manager and
-`last_cli_agent` they rely on.
+`last_cli_agent` they rely on. So does reopening a tab in the tab group it was archived from
+(`group_name` column, `crates/persistence/migrations/2026-11-03-*`), matched by name because group
+ids are regenerated on restart.
 
 ## Session guard
 

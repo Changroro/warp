@@ -5869,3 +5869,50 @@ fn a_tab_dropped_on_the_archive_section_is_archived() {
         assert_eq!(archived_titles(&app), vec!["dragged".to_string()]);
     })
 }
+
+#[test]
+fn a_restored_archived_tab_returns_to_its_group() {
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let (personal, company) = workspace.update(&mut app, |workspace, ctx| {
+            for _ in 0..3 {
+                workspace.add_terminal_tab(false, ctx);
+            }
+            let mut personal = TabGroup::new();
+            personal.name = Some("개인 개발".to_string());
+            let mut company = TabGroup::new();
+            company.name = Some("Company".to_string());
+            let ids = (personal.id, company.id);
+            workspace.tab_groups.insert(personal.id, personal);
+            workspace.tab_groups.insert(company.id, company);
+            workspace.tabs[0].group_id = Some(ids.0);
+            workspace.tabs[1].group_id = Some(ids.0);
+            workspace.tabs[2].group_id = Some(ids.1);
+            workspace.tabs[3].group_id = Some(ids.1);
+
+            workspace.archive_tab(1, ctx);
+            workspace.activate_tab(0, ctx);
+            ids
+        });
+
+        let id = SessionArchiveModel::handle(&app)
+            .read(&app, |archive, _| archive.sessions()[0].id.clone());
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.restore_archived_session(&id, ctx);
+
+            let groups = workspace
+                .tabs
+                .iter()
+                .map(|tab| tab.group_id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                groups,
+                vec![Some(personal), Some(personal), Some(company), Some(company)]
+            );
+            assert_eq!(workspace.active_tab_index, 1);
+        });
+    })
+}
