@@ -253,6 +253,12 @@ impl SshProfilesPanelView {
         }
     }
 
+    /// Re-reads `~/.ssh/config` so hosts edited outside Warp show up.
+    pub fn on_panel_shown(&mut self, ctx: &mut ViewContext<Self>) {
+        self.sync_profiles(ctx);
+        ctx.notify();
+    }
+
     pub fn on_panel_hidden(&mut self, ctx: &mut ViewContext<Self>) {
         self.close_modal(ctx);
         self.close_delete_modal(ctx);
