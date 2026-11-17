@@ -75,6 +75,10 @@ Hooks in upstream files (`rg -n 'ssh_manager|ssh_profile|SshManager|SshProfiles'
 | `app/src/editor/view/mod.rs` | `set_is_password` / `is_password` |
 | `crates/warpui_extras/src/secure_storage/mod.rs` | `platform()` opens secure storage without an app, for the password helper |
 | `Cargo.toml`, `app/Cargo.toml` | `zeroize` dependency |
+| `crates/remote_server/src/setup.rs` | `remote_server_version_is_pinned`, `false` on `Local` and `Oss` |
+| `crates/remote_server/src/manager.rs` | the initialize handshake enforces the exact release-tag match only when the version is pinned |
+
+An `Oss` install downloads the unversioned upstream remote server, whose release tag can never equal the fork's, so the tag match is skipped there. This relies on the fork leaving `crates/remote_server/proto/remote_server.proto` and the wire protocol untouched; if the fork changes them, build and ship a matching remote server instead.
 
 ## Session archive
 
