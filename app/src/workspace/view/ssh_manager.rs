@@ -245,7 +245,11 @@ impl Workspace {
 
     fn toggle_ssh_profiles_panel(&mut self, ctx: &mut ViewContext<Self>) {
         self.ssh_manager.panel_open = !self.ssh_manager.panel_open;
-        if !self.ssh_manager.panel_open {
+        if self.ssh_manager.panel_open {
+            self.ssh_manager
+                .panel_view
+                .update(ctx, |panel, ctx| panel.on_panel_shown(ctx));
+        } else {
             self.ssh_manager
                 .panel_view
                 .update(ctx, |panel, ctx| panel.on_panel_hidden(ctx));
@@ -256,6 +260,9 @@ impl Workspace {
     fn open_ssh_profiles_panel(&mut self, ctx: &mut ViewContext<Self>) {
         if !self.ssh_manager.panel_open {
             self.ssh_manager.panel_open = true;
+            self.ssh_manager
+                .panel_view
+                .update(ctx, |panel, ctx| panel.on_panel_shown(ctx));
             ctx.notify();
         }
         self.ssh_manager
