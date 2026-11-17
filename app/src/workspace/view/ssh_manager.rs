@@ -582,12 +582,28 @@ impl Workspace {
         }
     }
 
+    /// The focused pane's terminal when it sits at an idle local prompt, otherwise a new tab.
     fn open_ssh_tab(
         &mut self,
         title: &str,
         color: Option<AnsiColorIdentifier>,
         ctx: &mut ViewContext<Self>,
     ) -> Option<ViewHandle<TerminalView>> {
+        let idle_focused_terminal = self
+            .active_tab_pane_group()
+            .as_ref(ctx)
+            .focused_session_view(ctx)
+            .filter(|terminal_view| {
+                let terminal_view = terminal_view.as_ref(ctx);
+                // A remote prompt would nest ssh on the host; a running command would queue it.
+                terminal_view.active_session_is_local(ctx) == Some(true)
+                    && !terminal_view.is_long_running()
+            });
+        if idle_focused_terminal.is_some() {
+            self.focus_active_tab(ctx);
+            return idle_focused_terminal;
+        }
+
         let window_id = ctx.window_id();
         self.add_new_session_tab_internal_with_default_session_mode_behavior(
             NewSessionSource::Tab,
