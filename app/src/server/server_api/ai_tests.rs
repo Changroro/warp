@@ -6,15 +6,18 @@ use serde_json::{Value, json};
 use warp_graphql::ai::PlatformErrorCode;
 use warp_graphql::platform_error::{PlatformErrorInfo, PlatformErrorMessageFormat};
 use warp_graphql::queries::execution_config::CodeForge;
-use warp_server_client::base_client::{CLOUD_AGENT_ID_HEADER, TEAM_UID_HEADER};
+use warp_server_client::base_client::{
+    AMBIENT_WORKLOAD_TOKEN_HEADER, CLOUD_AGENT_ID_HEADER, TEAM_UID_HEADER,
+};
 
 use super::super::ServerApi;
 use super::{
-    AIClient, AgentMessageHeader, AgentRunEvent, AgentSource, AmbientAgentTaskState, Artifact,
-    ArtifactDownloadResponse, ArtifactType, CONNECTED_SELF_HOSTED_WORKERS_PATH,
-    ConnectedSelfHostedWorker, CreateAgentRequest, ExecutionLocation, ForkConversationResponse,
-    ListConnectedSelfHostedWorkersResponse, ListRunsResponse, PrepareAttachmentUploadsResponse,
-    ReadAgentMessageResponse, RunFollowupRequest, RunSortBy, RunSortOrder, SpawnAgentRequest,
+    AIClient, AgentMessageHeader, AgentRunEvent, AgentRunEventKind, AgentSource,
+    AmbientAgentTaskId, AmbientAgentTaskState, Artifact, ArtifactDownloadResponse, ArtifactType,
+    CONNECTED_SELF_HOSTED_WORKERS_PATH, ConnectedSelfHostedWorker, CreateAgentRequest,
+    ExecutionLocation, ForkConversationResponse, ListConnectedSelfHostedWorkersResponse,
+    ListRunsResponse, PrepareAttachmentUploadsResponse, ReadAgentMessageResponse,
+    RunFollowupRequest, RunSortBy, RunSortOrder, SendAgentMessageRequest, SpawnAgentRequest,
     TaskGitCredentialsError, TaskListFilter, TaskStatusUpdate, UploadFieldValue, UserQueryMode,
     agent_task_status_message_input, build_fork_conversation_url, build_list_agent_runs_url,
     build_run_followup_url, is_unknown_git_credential_schema_error,
@@ -27,6 +30,68 @@ use crate::workspaces::user_workspaces::{TeamContextForOperation, TeamlessScopeF
 
 fn request_scope_for_team(team_uid: ServerId) -> RequestTeamScope {
     RequestTeamScope::from_scope(&TeamContextForOperation::new_for_test(team_uid))
+}
+
+#[test]
+fn list_run_previews_uses_ambient_run_auth_and_reads_app_ports() {
+    let task_id: AmbientAgentTaskId = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+    let request = {
+        let mut server = warp_core::channel::ChannelState::mock_server();
+        server
+            .mock("GET", format!("/api/v1/agent/runs/{task_id}/previews").as_str())
+            .match_header(CLOUD_AGENT_ID_HEADER, task_id.to_string().as_str())
+            .match_header(AMBIENT_WORKLOAD_TOKEN_HEADER, "test-workload-token")
+            .with_status(200)
+            .with_body(
+                r#"{"execution_id":42,"previews":[{"id":"550e8400-e29b-41d4-a716-446655440003","url":"https://preview.example.test","port":3000}]}"#,
+            )
+            .expect(1)
+            .create()
+    };
+    let api = execution_bootstrap_server_api();
+    let response = block_on(api.list_run_previews(&task_id)).unwrap();
+    assert_eq!(response.execution_id, Some(42));
+    assert_eq!(response.previews.len(), 1);
+    assert_eq!(response.previews[0].port, 3000);
+    assert_eq!(
+        response.previews[0].id.as_deref(),
+        Some("550e8400-e29b-41d4-a716-446655440003")
+    );
+    assert_eq!(
+        response.previews[0].url.as_deref(),
+        Some("https://preview.example.test")
+    );
+    request.assert();
+}
+#[test]
+fn list_run_previews_no_execution_and_older_server() {
+    let task_id: AmbientAgentTaskId = "550e8400-e29b-41d4-a716-446655440001".parse().unwrap();
+    for (status, body) in [
+        (200, r#"{"previews":[]}"#),
+        (404, r#"{"error":"not found"}"#),
+    ] {
+        let request = {
+            let mut server = warp_core::channel::ChannelState::mock_server();
+            server
+                .mock(
+                    "GET",
+                    format!("/api/v1/agent/runs/{task_id}/previews").as_str(),
+                )
+                .with_status(status)
+                .with_body(body)
+                .expect(1)
+                .create()
+        };
+        let result = block_on(execution_bootstrap_server_api().list_run_previews(&task_id));
+        if status == 200 {
+            let response = result.unwrap();
+            assert_eq!(response.execution_id, None);
+            assert!(response.previews.is_empty());
+        } else {
+            assert!(result.is_err());
+        }
+        request.assert();
+    }
 }
 
 fn execution_bootstrap_response() -> Value {
@@ -48,12 +113,15 @@ fn execution_bootstrap_response() -> Value {
                         "mcpServersJson": "{}",
                         "skills": [],
                         "factorySkillDirs": [],
+                        "factoryBranch": null,
                         "computerUseEnabled": false,
                         "computerUseModelId": null,
                         "inferenceProviders": null,
                         "repositories": [],
                         "deferredRepositories": [{
-                            "codeForge": "GITLAB", "owner": "platform/backend", "repo": "api"
+                            "forge": "GITLAB", "owner": "platform/backend", "name": "api",
+                            "ref": null, "cloneFrom": null, "preserveOrigin": true,
+                            "expectedSha": "0123456789abcdef0123456789abcdef01234567"
                         }],
                         "setupCommands": [],
                         "providers": null,
@@ -61,7 +129,8 @@ fn execution_bootstrap_response() -> Value {
                         "skipInitialTurn": false,
                         "idleOnCompleteSeconds": null,
                         "idleOnFailSeconds": null,
-                        "snapshotDisabled": false
+                        "snapshotDisabled": false,
+                        "agentHookSources": []
                     },
                     "attachments": [{
                         "fileId": "file-one",
@@ -102,6 +171,12 @@ fn mock_execution_bootstrap(
                 "taskInput": {"taskId": "task-one"}
             }
         })))
+        .match_request(move |request| {
+            let body: Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+            let query = body["query"].as_str().unwrap();
+            query.contains("deferredRepositories") == supports_deferred_repositories
+                && query.contains("expectedSha") == supports_deferred_repositories
+        })
         .with_status(200)
         .with_body(response.to_string())
         .expect(1)
@@ -116,6 +191,36 @@ fn execution_bootstrap_server_api() -> ServerApi {
 }
 
 #[test]
+fn block_snapshot_resolves_url_before_deserializing_storage_bytes() {
+    let block =
+        super::SerializedBlock::new_for_test(b"command".to_vec(), b"\x1b[32moutput".to_vec());
+    let mut storage = Server::new();
+    let storage_request = storage
+        .mock("GET", "/block_snapshot.json")
+        .match_query(Matcher::Exact("X-Amz-Signature=test%2Bsignature".into()))
+        .match_header("x-warp-os-category", Matcher::Missing)
+        .with_status(200)
+        .with_body(block.to_json().unwrap())
+        .create();
+    let api_request = {
+        let mut server = warp_core::channel::ChannelState::mock_server();
+        server.mock("GET", "/api/v1/agent/conversations/test-block-download/block-snapshot")
+            .match_query(Matcher::UrlEncoded("redirect".into(), "false".into()))
+            .with_status(200)
+            .with_body(json!({"url": format!("{}/block_snapshot.json?X-Amz-Signature=test%2Bsignature", storage.url())}).to_string())
+            .create()
+    };
+    let result = block_on(execution_bootstrap_server_api().get_block_snapshot(
+        super::ServerConversationToken::new("test-block-download".into()),
+    ))
+    .unwrap();
+    assert_eq!(result.stylized_command, block.stylized_command);
+    assert_eq!(result.stylized_output, block.stylized_output);
+    api_request.assert();
+    storage_request.assert();
+}
+
+#[test]
 fn execution_bootstrap_fetches_config_secrets_and_attachments_once() {
     for supports_deferred_repositories in [false, true] {
         let mut response = execution_bootstrap_response();
@@ -123,9 +228,14 @@ fn execution_bootstrap_fetches_config_secrets_and_attachments_once() {
             let config = &mut response["data"]["task"]["task"]["executionConfig"];
             config["repositories"] = json!([{
                 "forge": "GITLAB", "owner": "platform/backend", "name": "api",
-                "ref": null, "cloneFrom": null, "preserveOrigin": true,
+                "ref": {"type": "COMMIT_SHA", "value": "0123456789abcdef0123456789abcdef01234567"},
+                "cloneFrom": {"codeForge": "GITHUB", "owner": "acme", "repo": "api"},
+                "preserveOrigin": true
             }]);
-            config["deferredRepositories"] = json!([]);
+            config
+                .as_object_mut()
+                .unwrap()
+                .remove("deferredRepositories");
         }
         let request =
             mock_execution_bootstrap(response, "token-success", supports_deferred_repositories);
@@ -140,22 +250,35 @@ fn execution_bootstrap_fetches_config_secrets_and_attachments_once() {
         assert_eq!(data.config.execution_id.inner(), "1");
         if supports_deferred_repositories {
             assert!(data.config.repositories.is_empty());
-            assert_eq!(data.config.deferred_repositories.len(), 1);
+            let deferred_repositories = data.config.deferred_repositories.unwrap();
+            assert_eq!(deferred_repositories.len(), 1);
+            assert_eq!(deferred_repositories[0].forge, CodeForge::GitLab,);
+            assert_eq!(deferred_repositories[0].owner, "platform/backend");
+            assert_eq!(deferred_repositories[0].name, "api");
             assert_eq!(
-                data.config.deferred_repositories[0].code_forge,
-                CodeForge::GitLab,
+                deferred_repositories[0].expected_sha.as_deref(),
+                Some("0123456789abcdef0123456789abcdef01234567")
             );
-            assert_eq!(
-                data.config.deferred_repositories[0].owner,
-                "platform/backend"
-            );
-            assert_eq!(data.config.deferred_repositories[0].repo, "api");
         } else {
-            assert!(data.config.deferred_repositories.is_empty());
+            assert!(data.config.deferred_repositories.is_none());
             assert_eq!(data.config.repositories.len(), 1);
             assert_eq!(data.config.repositories[0].forge, CodeForge::GitLab);
             assert_eq!(data.config.repositories[0].owner, "platform/backend");
             assert_eq!(data.config.repositories[0].name, "api");
+            assert_eq!(
+                data.config.repositories[0].ref_.as_ref().unwrap().value,
+                "0123456789abcdef0123456789abcdef01234567"
+            );
+            assert_eq!(
+                data.config.repositories[0]
+                    .clone_from
+                    .as_ref()
+                    .unwrap()
+                    .code_forge,
+                CodeForge::GitHub
+            );
+            assert!(data.config.repositories[0].preserve_origin);
+            assert!(data.config.repositories[0].expected_sha.is_none());
         }
         assert!(data.secrets.unwrap().contains_key("API_KEY"));
         assert_eq!(data.attachments.unwrap()[0].filename, "file-one_test.txt");
@@ -171,12 +294,12 @@ fn execution_bootstrap_preserves_secret_errors_with_task_configuration() {
         "error": {"__typename": "InvalidSecretError", "message": "Unable to access task secrets"},
         "responseContext": {"serverVersion": null}
     });
-    let request = mock_execution_bootstrap(response, "token-errors", true);
+    let request = mock_execution_bootstrap(response, "token-errors", false);
     let data = block_on(execution_bootstrap_server_api().get_execution_bootstrap(
         "task-one",
         "1",
         "token-errors".into(),
-        true,
+        false,
     ))
     .unwrap();
     assert_eq!(data.config.execution_id.inner(), "1");
@@ -196,33 +319,16 @@ fn execution_bootstrap_rejects_configuration_errors() {
         "error": {"__typename": "ResourceUnavailableError", "message": "Required repository is unavailable"},
         "responseContext": {"serverVersion": null}
     });
-    let request = mock_execution_bootstrap(response, "token-config-error", true);
+    let request = mock_execution_bootstrap(response, "token-config-error", false);
     let error = block_on(execution_bootstrap_server_api().get_execution_bootstrap(
         "task-one",
         "1",
         "token-config-error".into(),
-        true,
+        false,
     ))
     .err()
     .expect("configuration errors must abort bootstrap");
     assert_eq!(error.to_string(), "Required repository is unavailable");
-    request.assert();
-}
-
-#[test]
-fn execution_bootstrap_requires_non_null_deferred_inventory() {
-    let mut response = execution_bootstrap_response();
-    response["data"]["task"]["task"]["executionConfig"]["deferredRepositories"] = Value::Null;
-    let request = mock_execution_bootstrap(response, "token-null-inventory", true);
-    assert!(
-        block_on(execution_bootstrap_server_api().get_execution_bootstrap(
-            "task-one",
-            "1",
-            "token-null-inventory".into(),
-            true,
-        ))
-        .is_err()
-    );
     request.assert();
 }
 
@@ -577,8 +683,33 @@ fn list_agent_runs_omits_team_header_for_teamless_scope() {
 }
 
 #[test]
+fn send_message_serialization_distinguishes_empty_and_absent_github_attribution() {
+    let mut request = SendAgentMessageRequest {
+        delegated_github_coauthor_user_uid: Some("delegated-human".to_string()),
+        to: vec!["child".to_string()],
+        subject: "Follow-up".to_string(),
+        body: "Continue".to_string(),
+        sender_run_id: "parent-run".to_string(),
+    };
+    let value = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        value["delegated_github_coauthor_user_uid"],
+        "delegated-human"
+    );
+
+    request.delegated_github_coauthor_user_uid = Some(String::new());
+    let value = serde_json::to_value(&request).unwrap();
+    assert_eq!(value["delegated_github_coauthor_user_uid"], "");
+
+    request.delegated_github_coauthor_user_uid = None;
+    let value = serde_json::to_value(&request).unwrap();
+    assert!(value.get("delegated_github_coauthor_user_uid").is_none());
+}
+
+#[test]
 fn spawn_agent_request_serializes_explicit_personal_ownership() {
     let request = SpawnAgentRequest {
+        delegated_github_coauthor_user_uid: None,
         metadata: Default::default(),
         prompt: Some("hello".to_string()),
         mode: UserQueryMode::Normal,
@@ -607,6 +738,7 @@ fn spawn_agent_request_serializes_explicit_personal_ownership() {
 #[test]
 fn spawn_agent_request_serializes_agent_uid_as_agent_identity_uid() {
     let request = SpawnAgentRequest {
+        delegated_github_coauthor_user_uid: None,
         metadata: Default::default(),
         prompt: Some("hello".to_string()),
         mode: UserQueryMode::Normal,
@@ -707,6 +839,7 @@ fn deserialize_connected_self_hosted_workers_response() {
 #[test]
 fn spawn_agent_request_omits_prompt_when_none() {
     let request = SpawnAgentRequest {
+        delegated_github_coauthor_user_uid: None,
         metadata: Default::default(),
         prompt: None,
         mode: UserQueryMode::Normal,
@@ -1363,6 +1496,31 @@ fn test_deserialize_list_tasks_corrupted_json_in_middle() {
 }
 
 #[test]
+fn test_deserialize_list_runs_null_returns_empty() {
+    let response: ListRunsResponse = serde_json::from_str(
+        r#"{
+            "as_of": "2026-10-20T20:19:11.750Z",
+            "page_info": {"has_next_page": false},
+            "runs": null,
+            "team_uid": null
+        }"#,
+    )
+    .unwrap();
+
+    assert!(response.runs.is_empty());
+}
+
+#[test]
+fn test_deserialize_list_runs_rejects_non_array() {
+    assert!(serde_json::from_str::<ListRunsResponse>(r#"{"runs": {}}"#).is_err());
+}
+
+#[test]
+fn test_deserialize_list_runs_requires_runs_field() {
+    assert!(serde_json::from_str::<ListRunsResponse>(r#"{}"#).is_err());
+}
+
+#[test]
 fn test_deserialize_list_tasks_empty_tasks_array() {
     // Empty tasks array should work fine
     let json = r#"{
@@ -1512,11 +1670,11 @@ fn test_deserialize_agent_run_events_with_optional_fields() {
     let events: Vec<AgentRunEvent> = serde_json::from_str(json).unwrap();
 
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].event_type, "run_started");
+    assert_eq!(events[0].kind, AgentRunEventKind::LegacyStarted);
     assert_eq!(events[0].execution_id.as_deref(), Some("exec-1"));
     assert_eq!(events[0].ref_id, None);
     assert_eq!(events[0].sequence, 7);
-    assert_eq!(events[1].event_type, "new_message");
+    assert_eq!(events[1].kind, AgentRunEventKind::NewMessage);
     assert_eq!(events[1].ref_id.as_deref(), Some("message-9"));
     assert_eq!(events[1].execution_id, None);
     assert_eq!(events[1].sequence, 8);

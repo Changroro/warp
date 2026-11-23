@@ -46,7 +46,7 @@ impl TryFrom<UploadArtifactArgs> for FileArtifactUploadRequest {
             path: value.path,
             run_id,
             conversation_id: value.conversation_id.map(ServerConversationToken::new),
-            title: None,
+            title: value.title,
             description: value.description,
         })
     }
@@ -171,7 +171,7 @@ impl FileArtifactUploader {
         artifact: &PreparedUploadArtifact,
     ) -> Result<String> {
         upload_file_to_target(
-            self.server_api.http_client(),
+            self.server_api.external_http_client(),
             target,
             FileUploadBody::new(artifact.path.clone()),
         )

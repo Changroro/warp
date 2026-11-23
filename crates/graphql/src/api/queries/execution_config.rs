@@ -23,6 +23,20 @@ pub struct ExecutionBootstrap {
     pub task: BootstrapTaskResult,
 }
 
+impl ExecutionBootstrap {
+    pub fn build_with_capabilities(
+        variables: ExecutionBootstrapVariables,
+    ) -> Result<cynic::Operation<Self, ExecutionBootstrapVariables>, cynic::OperationBuildError>
+    {
+        let supports_deferred_repositories = variables.supports_deferred_repositories;
+        let mut builder = cynic::OperationBuilder::query().with_variables(variables);
+        if supports_deferred_repositories {
+            builder = builder.with_feature_enabled("deferred_repositories");
+        }
+        builder.build()
+    }
+}
+
 crate::client::define_operation! {
     execution_bootstrap(ExecutionBootstrapVariables) -> ExecutionBootstrap;
 }
@@ -45,7 +59,7 @@ pub struct BootstrapTaskOutput {
 #[derive(cynic::QueryFragment, Debug)]
 #[cynic(graphql_type = "Task", variables = "ExecutionBootstrapVariables")]
 pub struct BootstrapTask {
-    #[arguments(executionId: $execution_id, supportsDeferredRepositories: $supports_deferred_repositories)]
+    #[arguments(executionId: $execution_id, supportsDeferredRepositories: $supports_deferred_repositories, supportsAgentHooks: true)]
     pub execution_config: ExecutionConfiguration,
     pub attachments: Vec<TaskAttachment>,
 }
@@ -64,11 +78,13 @@ pub struct ExecutionConfiguration {
     pub mcp_servers_json: String,
     pub skills: Vec<ExecutionSkillSpec>,
     pub factory_skill_dirs: Vec<String>,
+    pub factory_branch: Option<FactoryBranchExecutionConfig>,
     pub computer_use_enabled: bool,
     pub computer_use_model_id: Option<String>,
     pub inference_providers: Option<InferenceProviderClientConfigs>,
     pub repositories: Vec<ExecutionRepository>,
-    pub deferred_repositories: Vec<SourceRepo>,
+    #[cynic(feature = "deferred_repositories")]
+    pub deferred_repositories: Option<Vec<ExecutionRepository>>,
     pub setup_commands: Vec<String>,
     pub providers: Option<CloudProviderClientConfigs>,
     pub session_sharing_acls: Vec<SessionSharingAclSpec>,
@@ -76,11 +92,62 @@ pub struct ExecutionConfiguration {
     pub idle_on_complete_seconds: Option<i32>,
     pub idle_on_fail_seconds: Option<i32>,
     pub snapshot_disabled: bool,
+    pub agent_hook_sources: Vec<AgentHookSource>,
+}
+
+#[derive(cynic::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentHookFormat {
+    #[cynic(rename = "CURSOR")]
+    Cursor,
+    #[cynic(fallback)]
+    Unknown,
+}
+
+#[derive(cynic::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentHookLevel {
+    #[cynic(rename = "FACTORY")]
+    Factory,
+    #[cynic(rename = "AGENT")]
+    Agent,
+    #[cynic(fallback)]
+    Unknown,
+}
+
+#[derive(cynic::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentHookOnAsk {
+    #[cynic(rename = "DENY")]
+    Deny,
+    #[cynic(rename = "FAIL_RUN")]
+    FailRun,
+    #[cynic(fallback)]
+    Unknown,
+}
+
+#[derive(cynic::QueryFragment, Clone, Debug)]
+pub struct AgentHookRepository {
+    pub forge: CodeForge,
+    pub owner: String,
+    pub name: String,
+}
+
+#[derive(cynic::QueryFragment, Clone, Debug)]
+pub struct AgentHookSource {
+    pub format: AgentHookFormat,
+    pub repository: Option<AgentHookRepository>,
+    pub path: String,
+    pub level: AgentHookLevel,
+    pub strict: bool,
+    pub on_ask: AgentHookOnAsk,
 }
 
 #[derive(cynic::QueryFragment, Debug)]
 pub struct ExecutionSkillSpec {
     pub spec: String,
+}
+
+#[derive(cynic::QueryFragment, Clone, Debug)]
+pub struct FactoryBranchExecutionConfig {
+    pub source_sha: String,
 }
 
 #[derive(cynic::Enum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,21 +172,21 @@ pub enum ExecutionRepositoryRefType {
     Unknown,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 pub struct ExecutionRepositoryRef {
     #[cynic(rename = "type")]
     pub type_: ExecutionRepositoryRefType,
     pub value: String,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 pub struct SourceRepo {
     pub code_forge: CodeForge,
     pub owner: String,
     pub repo: String,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 pub struct ExecutionRepository {
     pub forge: CodeForge,
     pub owner: String,
@@ -128,15 +195,17 @@ pub struct ExecutionRepository {
     pub ref_: Option<ExecutionRepositoryRef>,
     pub clone_from: Option<SourceRepo>,
     pub preserve_origin: bool,
+    #[cynic(feature = "deferred_repositories")]
+    pub expected_sha: Option<String>,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 pub struct CloudProviderClientConfigs {
     pub gcp: Option<GcpCloudProviderClientConfig>,
     pub aws: Option<AwsCloudProviderClientConfig>,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(graphql_type = "GCPCloudProviderClientConfig")]
 pub struct GcpCloudProviderClientConfig {
     pub project_number: String,
@@ -145,7 +214,7 @@ pub struct GcpCloudProviderClientConfig {
     pub service_account_email: Option<String>,
 }
 
-#[derive(cynic::QueryFragment, Debug)]
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(graphql_type = "AWSCloudProviderClientConfig")]
 pub struct AwsCloudProviderClientConfig {
     pub role_arn: String,

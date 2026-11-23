@@ -305,6 +305,7 @@ pub enum CustomerType {
     Lightspeed,
     Build,
     BuildMax,
+    Scale,
     Unknown,
 }
 
@@ -321,6 +322,7 @@ impl CustomerType {
             CustomerType::Lightspeed => "Lightspeed".to_string(),
             CustomerType::Build => "Build".to_string(),
             CustomerType::BuildMax => "Max".to_string(),
+            CustomerType::Scale => "Scale".to_string(),
             CustomerType::Unknown => "".to_string(),
         }
     }
@@ -643,8 +645,8 @@ pub struct BillingCycleUsageEntry {
     pub cost_type: AiCreditsUsageAndCostType,
     pub usage_bucket: AiCreditsUsageBucket,
     pub usage_source: AiCreditsUsageSource,
-    pub credits_used: i32,
-    pub cost_cents: i32,
+    pub credits_used: f64,
+    pub cost_cents: f64,
     /// Uid of the team this usage is attributed to. `billingCycleUsageHistory`
     /// is workspace-wide, so this is what scopes an entry to a single team.
     /// `None` for rows written before usage attribution shipped and for the
@@ -693,7 +695,8 @@ impl BillingMetadata {
             | CustomerType::Business
             | CustomerType::Enterprise
             | CustomerType::Build
-            | CustomerType::BuildMax => false,
+            | CustomerType::BuildMax
+            | CustomerType::Scale => false,
             CustomerType::Free
             | CustomerType::Legacy
             | CustomerType::Prosumer
@@ -726,7 +729,8 @@ impl BillingMetadata {
             | CustomerType::Business
             | CustomerType::Lightspeed
             | CustomerType::Build
-            | CustomerType::BuildMax => true,
+            | CustomerType::BuildMax
+            | CustomerType::Scale => true,
             CustomerType::Free
             | CustomerType::Enterprise
             | CustomerType::Legacy
@@ -744,13 +748,18 @@ impl BillingMetadata {
             | CustomerType::Enterprise
             | CustomerType::Legacy
             | CustomerType::Build
-            | CustomerType::BuildMax => true,
+            | CustomerType::BuildMax
+            | CustomerType::Scale => true,
             CustomerType::Free | CustomerType::Unknown => false,
         }
     }
 
     pub fn is_on_stripe_paid_plan(&self) -> bool {
         BillingMetadata::is_stripe_paid_plan(self.customer_type)
+    }
+
+    pub fn is_on_scale_plan(&self) -> bool {
+        self.customer_type == CustomerType::Scale
     }
 
     pub fn is_on_build_plan(&self) -> bool {
@@ -793,6 +802,7 @@ impl BillingMetadata {
             | CustomerType::Enterprise
             | CustomerType::Build
             | CustomerType::BuildMax
+            | CustomerType::Scale
             | CustomerType::Unknown => false,
         }
     }

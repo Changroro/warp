@@ -23987,6 +23987,9 @@ impl Workspace {
             crate::settings::PromptSubmissionMode::Interrupt => {
                 context.set.insert(flags::PROMPT_SUBMISSION_INTERRUPT);
             }
+            crate::settings::PromptSubmissionMode::Steer => {
+                context.set.insert(flags::PROMPT_SUBMISSION_STEER);
+            }
             crate::settings::PromptSubmissionMode::Queue => {
                 context.set.insert(flags::PROMPT_SUBMISSION_QUEUE);
             }

@@ -1,13 +1,22 @@
+use warp_core::features::FeatureFlag;
+use warpui::{App, SingletonEntity};
+
 use super::{
     BarSegment, aggregate_segments, filter_entries_by_attributed_team, filter_legacy_buckets,
-    has_non_viewer_data, legend_cost_types, members_for_team,
+    format_cost_cents, format_credits, format_usage_cost, has_non_viewer_data, legend_cost_types,
+    members_for_team,
 };
 use crate::auth::UserUid;
 use crate::server::ids::ServerId;
+use crate::settings::UsageDisplayUnit;
+use crate::test_util::billing_unit::{set_charge_unit, set_usage_display_unit};
+use crate::test_util::settings::initialize_settings_for_tests;
 use crate::workspaces::team::{MembershipRole, Team, TeamMember};
+use crate::workspaces::user_workspaces::UserWorkspaces;
 use crate::workspaces::workspace::{
     AiCreditsUsageAndCostSubjectType, AiCreditsUsageAndCostType, AiCreditsUsageBucket,
-    AiCreditsUsageSource, BillingCycleUsageEntry, WorkspaceMember, WorkspaceMemberUsageInfo,
+    AiCreditsUsageSource, BillingCycleUsageEntry, ChargeUnit, WorkspaceMember,
+    WorkspaceMemberUsageInfo,
 };
 
 const VIEWER_UID: &str = "viewer-uid";
@@ -29,10 +38,80 @@ fn entry(
         cost_type,
         usage_bucket,
         usage_source,
-        credits_used,
-        cost_cents,
+        credits_used: f64::from(credits_used),
+        cost_cents: f64::from(cost_cents),
         attributed_team_uid: None,
     }
+}
+
+#[test]
+fn cents_billed_usage_uses_credit_equivalent_despite_credits_display_preference() {
+    App::test((), |mut app| async move {
+        let _flag = FeatureFlag::CreditEquivalentBillingUsage.override_enabled(true);
+        initialize_settings_for_tests(&mut app);
+        app.add_singleton_model(UserWorkspaces::default_mock);
+        set_charge_unit(&mut app, ChargeUnit::Cents);
+        set_usage_display_unit(&mut app, UsageDisplayUnit::Credits);
+
+        let mut included = viewer_user_entry();
+        included.credits_used = 120.4;
+        let mut paid = included.clone();
+        paid.cost_type = AiCreditsUsageAndCostType::Payg;
+        paid.credits_used = 5.25;
+        paid.cost_cents = 50.;
+
+        let (segments, credits, cents) = aggregate_segments([&included, &paid]);
+
+        app.read(|ctx| {
+            let charge_unit = UserWorkspaces::as_ref(ctx).charge_unit();
+            assert_eq!(
+                format_usage_cost(segments[0].credits, segments[0].cost_cents, charge_unit),
+                "$2.17"
+            );
+            assert_eq!(
+                format_usage_cost(segments[1].credits, segments[1].cost_cents, charge_unit),
+                "$0.09"
+            );
+            assert_eq!(format_usage_cost(credits, cents, charge_unit), "$2.26");
+            assert_eq!(cents, 50.);
+        });
+    });
+}
+
+#[test]
+fn credit_billed_usage_shows_charged_cost_when_credit_equivalent_flag_is_enabled() {
+    let _flag = FeatureFlag::CreditEquivalentBillingUsage.override_enabled(true);
+    assert_eq!(format_usage_cost(125.65, 50., ChargeUnit::Credits), "$0.50");
+}
+
+#[test]
+fn usage_dollars_show_charged_cost_when_credit_equivalent_flag_is_disabled() {
+    let _flag = FeatureFlag::CreditEquivalentBillingUsage.override_enabled(false);
+    assert_eq!(format_usage_cost(120.4, 0., ChargeUnit::Cents), "$0.00");
+    assert_eq!(format_usage_cost(125.65, 50., ChargeUnit::Cents), "$0.50");
+}
+
+#[test]
+fn cost_only_team_usage_is_visible() {
+    let mut cost_only = entry(
+        AiCreditsUsageAndCostSubjectType::Team,
+        None,
+        AiCreditsUsageAndCostType::Aggregate,
+        AiCreditsUsageBucket::Aggregate,
+        AiCreditsUsageSource::Aggregate,
+        0,
+        0,
+    );
+    cost_only.cost_cents = 0.6;
+
+    assert!(has_non_viewer_data(
+        &[viewer_user_entry(), cost_only.clone()],
+        Some(VIEWER_UID)
+    ));
+    assert_eq!(
+        legend_cost_types(&[cost_only]),
+        vec![AiCreditsUsageAndCostType::Aggregate]
+    );
 }
 
 /// Boilerplate viewer-owned User row for predicate tests.
@@ -240,8 +319,6 @@ fn aggregate_segments_merges_dupes_drops_zeros_and_sorts() {
             20,
             0,
         ),
-        // Zero-credit entry: must be dropped before totals are computed (so
-        // the stray cost_cents don't leak into the row total).
         entry(
             AiCreditsUsageAndCostSubjectType::User,
             Some(VIEWER_UID),
@@ -250,6 +327,15 @@ fn aggregate_segments_merges_dupes_drops_zeros_and_sorts() {
             AiCreditsUsageSource::Local,
             0,
             42,
+        ),
+        entry(
+            AiCreditsUsageAndCostSubjectType::User,
+            Some(VIEWER_UID),
+            AiCreditsUsageAndCostType::AmbientBonusGrant,
+            AiCreditsUsageBucket::Ai,
+            AiCreditsUsageSource::Cloud,
+            0,
+            0,
         ),
     ];
 
@@ -268,22 +354,21 @@ fn aggregate_segments_merges_dupes_drops_zeros_and_sorts() {
                 AiCreditsUsageAndCostType::BonusGrant,
                 AiCreditsUsageBucket::Compute
             ),
+            (AiCreditsUsageAndCostType::Payg, AiCreditsUsageBucket::Ai),
         ],
-        "expected BaseLimit/Ai before BonusGrant/Compute, Payg zero-credit dropped"
+        "expected cost-type order, excluding only unused entries"
     );
 
     let bonus = &segments[1];
-    assert_eq!(bonus.credits, 17, "10 + 7 merged credits");
-    assert_eq!(bonus.cost_cents, 8, "5 + 3 merged cost cents");
+    assert_eq!(bonus.credits, 17.0, "10 + 7 merged credits");
+    assert_eq!(bonus.cost_cents, 8.0, "5 + 3 merged cost cents");
 
-    // Totals are summed *after* the zero-credit segment is dropped, so the
-    // stray 42 cents on the Payg/Ai entry must not appear here.
-    assert_eq!(total_credits, 20 + 17);
-    assert_eq!(total_cost_cents, 8);
+    assert_eq!(total_credits, 20.0 + 17.0);
+    assert_eq!(total_cost_cents, 50.0);
 }
 
 #[test]
-fn legend_cost_types_excludes_zero_credit_bucket() {
+fn legend_cost_types_excludes_unused_bucket() {
     // Regression: a base-limit row with no usage must not surface "Base" in
     // the legend while only Pay-as-you-go credits were actually spent.
     let entries = vec![
@@ -310,7 +395,7 @@ fn legend_cost_types_excludes_zero_credit_bucket() {
     assert_eq!(
         legend_cost_types(&entries),
         vec![AiCreditsUsageAndCostType::Payg],
-        "zero-credit BaseLimit row must be dropped from the legend"
+        "unused BaseLimit row must be dropped from the legend"
     );
 }
 
@@ -472,4 +557,43 @@ fn members_for_team_keeps_every_member_when_team_is_unknown() {
     let members = vec![workspace_member("a"), workspace_member("b")];
 
     assert_eq!(members_for_team(&members, None), members);
+}
+
+#[test]
+fn aggregate_segments_preserves_fractional_segments_and_totals() {
+    let mut local = viewer_user_entry();
+    local.credits_used = 0.6;
+    local.cost_cents = 0.6;
+    let mut cloud = local.clone();
+    cloud.usage_source = AiCreditsUsageSource::Cloud;
+    let mut other_bucket = local.clone();
+    other_bucket.usage_bucket = AiCreditsUsageBucket::Compute;
+    other_bucket.credits_used = 0.25;
+    other_bucket.cost_cents = 0.25;
+
+    let (segments, credits, cents) = aggregate_segments([&local, &cloud, &other_bucket]);
+
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0].credits, 1.2);
+    assert_eq!(segments[0].cost_cents, 1.2);
+    assert_eq!(segments[1].credits, 0.25);
+    assert_eq!(credits, 1.45);
+    assert_eq!(cents, 1.45);
+    assert_eq!(format_credits(credits), "1");
+    assert_eq!(format_cost_cents(cents), "$0.01");
+}
+
+#[test]
+fn format_credits_rounds_only_for_display() {
+    assert_eq!(format_credits(0.499999), "0");
+    assert_eq!(format_credits(0.5), "1");
+    assert_eq!(format_credits(999.5), "1,000");
+}
+
+#[test]
+fn format_cost_cents_rounds_before_splitting_dollars_and_cents() {
+    assert_eq!(format_cost_cents(0.499999), "$0.00");
+    assert_eq!(format_cost_cents(0.5), "$0.01");
+    assert_eq!(format_cost_cents(99.5), "$1.00");
+    assert_eq!(format_cost_cents(123456.5), "$1,234.57");
 }

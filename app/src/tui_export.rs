@@ -49,6 +49,7 @@ pub use crate::ai::agent_conversations_model::{
     AgentManagementFilters, AgentRunDisplayStatus, HarnessFilter, OwnerFilter,
     query_conversation_entries,
 };
+pub use crate::ai::agent_sdk::authenticate_then_execute;
 pub use crate::ai::ambient_agents::AmbientAgentTaskId;
 pub use crate::ai::ambient_agents::telemetry::{
     CloudAgentTelemetryEvent, HandoffEntryPoint, HandoffSurface,
@@ -194,6 +195,7 @@ pub use crate::server::server_api::TranscribeError;
 pub use crate::server::server_api::ai::{
     AIClient, AgentConfigSnapshot, AttachmentInput, SpawnAgentRequest, SpawnAgentResponse,
 };
+pub use crate::server::server_api::factory::FactoryGitTokenResponse;
 pub use crate::server::team_scope::RequestTeamScope;
 pub use crate::server::telemetry::{SlashMenuSource, TelemetryEvent};
 pub use crate::settings::{AISettingsChangedEvent, InputSettings};
@@ -290,11 +292,11 @@ pub use crate::workspaces::workspace::{
     AiCreditsUsageAndCostType, ChargeUnit, UsageVisibilityGranularity,
 };
 
-pub fn format_usage_cost_cents(cents: i64) -> String {
+pub fn format_usage_cost_cents(cents: f64) -> String {
     crate::settings_view::format_cost_cents(cents)
 }
 
-pub fn format_usage_credits(credits: i64) -> String {
+pub fn format_usage_credits(credits: f64) -> String {
     crate::settings_view::format_credits(credits)
 }
 

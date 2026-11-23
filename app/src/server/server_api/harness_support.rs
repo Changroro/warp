@@ -7,9 +7,17 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use cynic::MutationBuilder;
 #[cfg(test)]
 use mockall::automock;
-use warp_cli::agent::Harness;
+use warp_cli::agent::{Harness, HarnessTransport};
+use warp_graphql::mutations::report_harness_transport::{
+    HarnessTransport as GraphQLHarnessTransport, HarnessTransportFallbackReason,
+    ReportHarnessTransport, ReportHarnessTransportInput, ReportHarnessTransportResult,
+    ReportHarnessTransportVariables,
+};
+#[cfg(not(target_family = "wasm"))]
+use warp_server_client::PresignedDownloadResponse;
 
 #[path = "harness_usage/publication.rs"]
 mod publication;
@@ -28,6 +36,7 @@ use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent_sdk::retry::with_bounded_retry;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::artifacts::Artifact;
+use crate::server::graphql::{get_request_context, get_user_facing_error_message};
 
 /// A presigned upload target returned by the server.
 #[serde_with::serde_as]
@@ -272,6 +281,10 @@ pub struct ResolvedHarnessPrompt {
         deserialize_with = "publication::deserialize_harness_usage_capability"
     )]
     pub harness_usage: Option<HarnessUsageCapability>,
+    /// Standard-Base64 serialized `Request.Input.UserQuery` carrying the attribution of the
+    /// query that opens this execution. Absent when the server has none to give.
+    #[serde(default)]
+    pub user_query_b64: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -282,6 +295,16 @@ pub struct ReportArtifactResponse {
 #[derive(serde::Serialize)]
 struct NotifyUserRequest {
     message: String,
+}
+
+#[derive(serde::Serialize)]
+struct WaitForEventsRequest<'a> {
+    run_ids: &'a [String],
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct WaitForEventsResponse {
+    pub waiting_on_run_ids: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -296,6 +319,37 @@ struct ShutdownError {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<u8>,
+}
+
+/// A harness transport report that sending again cannot fix: the server rejected it, answered
+/// with a result this client does not know, or the report itself carried an unknown reason.
+#[derive(Debug, thiserror::Error)]
+#[error("harness transport report rejected: {0}")]
+pub(crate) struct TransportReportRejected(pub String);
+
+/// The `reportHarnessTransport` input: the transport the harness is actually driven over, and
+/// why it differs from the requested one when it does.
+fn report_harness_transport_input(
+    transport: HarnessTransport,
+    fallback_reason: Option<&str>,
+) -> Result<ReportHarnessTransportInput, TransportReportRejected> {
+    let transport = match transport {
+        HarnessTransport::Acp => GraphQLHarnessTransport::Acp,
+        HarnessTransport::Pty => GraphQLHarnessTransport::Pty,
+    };
+    let fallback_reason = fallback_reason
+        .map(|reason| match reason {
+            "no_sidecar" => Ok(HarnessTransportFallbackReason::NoSidecar),
+            "sidecar_without_adapter" => Ok(HarnessTransportFallbackReason::SidecarWithoutAdapter),
+            other => Err(TransportReportRejected(format!(
+                "unknown fallback reason {other:?}"
+            ))),
+        })
+        .transpose()?;
+    Ok(ReportHarnessTransportInput {
+        transport,
+        fallback_reason,
+    })
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -364,9 +418,20 @@ pub trait HarnessSupportClient: 'static + Send + Sync {
     /// Send a progress notification to the task's originating platform.
     async fn notify_user(&self, message: &str) -> Result<()>;
 
+    /// Register the runs whose lifecycle or message events this run is waiting for.
+    async fn wait_for_events(&self, run_ids: &[String]) -> Result<WaitForEventsResponse>;
+
     /// Report task completion or failure. The server derives PR links/branches from
     /// artifacts already reported via `report_artifact`.
     async fn finish_task(&self, success: bool, summary: &str) -> Result<()>;
+
+    /// Report the transport the run's harness is actually driven over, with the reason when
+    /// the client fell back from the transport the server requested.
+    async fn report_transport(
+        &self,
+        transport: HarnessTransport,
+        fallback_reason: Option<&'static str>,
+    ) -> Result<()>;
 
     /// Report a clean shutdown of the agent process.
     async fn report_clean_shutdown(&self) -> Result<()>;
@@ -401,7 +466,7 @@ pub trait HarnessSupportClient: 'static + Send + Sync {
     /// Download the raw third-party harness transcript bytes for the current task's
     /// conversation.
     ///
-    /// Hits `GET /harness-support/transcript`, which redirects to a signed GCS URL.
+    /// Resolves a signed storage URL through `GET /harness-support/transcript?redirect=false`.
     /// The conversation is resolved from the task's `agent_conversation_id` server-side,
     /// so callers do not pass a conversation id. Each harness deserializes the returned
     /// bytes into its own envelope shape (e.g. Claude Code parses
@@ -411,7 +476,7 @@ pub trait HarnessSupportClient: 'static + Send + Sync {
     async fn fetch_transcript(&self) -> Result<bytes::Bytes>;
 
     /// Get an HTTP client to use with [`UploadTarget`]s for saving blobs.
-    fn http_client(&self) -> &http_client::Client;
+    fn external_http_client(&self) -> &http_client::Client;
 }
 
 impl ServerApi {
@@ -508,12 +573,17 @@ impl ServerApi {
         {
             with_bounded_retry("fetch task-scoped harness-support transcript", || async {
                 let response = self
-                    .get_public_api_response_for_task(task_id, "harness-support/transcript")
+                    .get_public_api_response_for_task(
+                        task_id,
+                        "harness-support/transcript?redirect=false",
+                    )
                     .await?;
-                response
-                    .bytes()
+                let download = response
+                    .json::<PresignedDownloadResponse>()
                     .await
-                    .context("Failed to read task-scoped harness-support transcript body")
+                    .map_err(reqwest::Error::without_url)
+                    .context("Failed to decode task-scoped transcript download URL")?;
+                self.base_client.download_presigned(&download.url).await
             })
             .await
         }
@@ -609,6 +679,14 @@ impl HarnessSupportClient for ServerApi {
         .await
     }
 
+    async fn wait_for_events(&self, run_ids: &[String]) -> Result<WaitForEventsResponse> {
+        self.post_public_api(
+            "harness-support/wait-for-events",
+            &WaitForEventsRequest { run_ids },
+        )
+        .await
+    }
+
     async fn finish_task(&self, success: bool, summary: &str) -> Result<()> {
         self.post_public_api_unit(
             "harness-support/finish-task",
@@ -618,6 +696,28 @@ impl HarnessSupportClient for ServerApi {
             },
         )
         .await
+    }
+
+    async fn report_transport(
+        &self,
+        transport: HarnessTransport,
+        fallback_reason: Option<&'static str>,
+    ) -> Result<()> {
+        let operation = ReportHarnessTransport::build(ReportHarnessTransportVariables {
+            input: report_harness_transport_input(transport, fallback_reason)?,
+            request_context: get_request_context(),
+        });
+        let response = self.send_graphql_request(operation, None).await?;
+        match response.report_harness_transport {
+            ReportHarnessTransportResult::ReportHarnessTransportOutput(_) => Ok(()),
+            ReportHarnessTransportResult::UserFacingError(error) => {
+                Err(TransportReportRejected(get_user_facing_error_message(error)).into())
+            }
+            ReportHarnessTransportResult::Unknown => Err(TransportReportRejected(
+                "unknown reportHarnessTransport response".to_string(),
+            )
+            .into()),
+        }
     }
 
     async fn report_clean_shutdown(&self) -> Result<()> {
@@ -664,12 +764,14 @@ impl HarnessSupportClient for ServerApi {
         {
             with_bounded_retry("fetch harness-support transcript", || async {
                 let response = self
-                    .get_public_api_response("harness-support/transcript")
+                    .get_public_api_response("harness-support/transcript?redirect=false")
                     .await?;
-                response
-                    .bytes()
+                let download = response
+                    .json::<PresignedDownloadResponse>()
                     .await
-                    .context("Failed to read harness-support transcript body")
+                    .map_err(reqwest::Error::without_url)
+                    .context("Failed to decode transcript download URL")?;
+                self.base_client.download_presigned(&download.url).await
             })
             .await
         }
@@ -681,8 +783,8 @@ impl HarnessSupportClient for ServerApi {
         }
     }
 
-    fn http_client(&self) -> &http_client::Client {
-        self.base_client.http_client()
+    fn external_http_client(&self) -> &http_client::Client {
+        self.base_client.external_http_client()
     }
 }
 

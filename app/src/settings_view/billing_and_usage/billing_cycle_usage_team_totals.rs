@@ -11,13 +11,13 @@ use warpui::fonts::{Properties, Weight};
 
 use crate::settings_view::billing_and_usage::billing_cycle_usage_common::{
     BarSegment, BillingUsageMouseStates, ROW_BORDER_RADIUS, ROW_BORDER_WIDTH, TOOLTIP_GAP,
-    aggregate_segments, cost_type_color, format_cost_cents, format_credits,
+    aggregate_segments, cost_type_color, format_cost_cents, format_credits, format_usage_cost,
     render_breakdown_tooltip, render_section_subheader,
 };
 use crate::ui_components::blended_colors;
 use crate::workspaces::workspace::{
-    AiCreditsUsageBucket, AiCreditsUsageSource, BillingCycleUsageEntry, UsageVisibility,
-    UsageVisibilityGranularity,
+    AiCreditsUsageBucket, AiCreditsUsageSource, BillingCycleUsageEntry, ChargeUnit,
+    UsageVisibility, UsageVisibilityGranularity,
 };
 
 fn collapse_segments_to_cost_type(segments: Vec<BarSegment>) -> Vec<BarSegment> {
@@ -48,8 +48,8 @@ pub struct TeamTotalCardSummary {
     pub title: &'static str,
     pub card_key: &'static str,
     pub segments: Vec<BarSegment>,
-    pub total_credits: i64,
-    pub total_cost_cents: i64,
+    pub total_credits: f64,
+    pub total_cost_cents: f64,
     pub limit_cents: Option<i64>,
 }
 
@@ -118,16 +118,20 @@ pub fn build_team_total_card_summaries(
 
 fn render_card_pill_bar(
     segments: &[BarSegment],
-    total_credits: i64,
-    total_cost_cents: i64,
+    total_credits: f64,
+    total_cost_cents: f64,
     limit_cents: Option<i64>,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     let theme = appearance.theme();
     let track_bg = theme.surface_overlay_1();
     let corner = Radius::Pixels(CARD_BAR_RADIUS);
+    let segments = segments
+        .iter()
+        .filter(|s| s.credits > 0.0)
+        .collect::<Vec<_>>();
 
-    if total_credits == 0 || segments.is_empty() {
+    if total_credits == 0.0 || segments.is_empty() {
         return ConstrainedBox::new(
             Container::new(Empty::new().finish())
                 .with_background(track_bg)
@@ -199,6 +203,7 @@ fn render_card_pill_bar(
 ///   [pill stacked bar]
 fn build_team_total_card(
     summary: &TeamTotalCardSummary,
+    charge_unit: ChargeUnit,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     let theme = appearance.theme();
@@ -212,7 +217,7 @@ fn build_team_total_card(
         .finish();
 
     let cost_text = Text::new_inline(
-        format_cost_cents(summary.total_cost_cents),
+        format_usage_cost(summary.total_credits, summary.total_cost_cents, charge_unit),
         appearance.ui_font_family(),
         24.,
     )
@@ -237,7 +242,7 @@ fn build_team_total_card(
     let totals_row: Box<dyn Element> = match summary.limit_cents {
         Some(limit) => {
             let limit_text = Text::new_inline(
-                format!("Limit: {}", format_cost_cents(limit)),
+                format!("Limit: {}", format_cost_cents(limit as f64)),
                 appearance.ui_font_family(),
                 12.,
             )
@@ -286,23 +291,24 @@ fn build_team_total_card(
 
 fn render_team_total_card(
     summary: &TeamTotalCardSummary,
+    charge_unit: ChargeUnit,
     tooltip_mouse_state: MouseStateHandle,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     if summary.segments.is_empty() {
-        return build_team_total_card(summary, appearance);
+        return build_team_total_card(summary, charge_unit, appearance);
     }
 
     Hoverable::new(tooltip_mouse_state, move |state| {
         let mut stack = Stack::new();
-        stack.add_child(build_team_total_card(summary, appearance));
+        stack.add_child(build_team_total_card(summary, charge_unit, appearance));
 
         if state.is_hovered() {
             stack.add_positioned_overlay_child(
                 render_breakdown_tooltip(
                     &summary.segments,
                     summary.total_credits,
-                    summary.total_cost_cents,
+                    charge_unit,
                     appearance,
                 ),
                 OffsetPositioning::offset_from_parent(
@@ -323,6 +329,7 @@ fn render_team_total_card(
 fn render_team_totals_section(
     entries: &[BillingCycleUsageEntry],
     visibility: &UsageVisibility,
+    charge_unit: ChargeUnit,
     mouse_states: &BillingUsageMouseStates,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
@@ -336,7 +343,7 @@ fn render_team_totals_section(
         row.add_child(
             Expanded::new(
                 1.,
-                render_team_total_card(summary, tooltip_state, appearance),
+                render_team_total_card(summary, charge_unit, tooltip_state, appearance),
             )
             .finish(),
         );
@@ -348,6 +355,7 @@ fn render_team_totals_section(
 pub fn render_team_totals_block(
     entries: &[BillingCycleUsageEntry],
     visibility: &UsageVisibility,
+    charge_unit: ChargeUnit,
     mouse_states: &BillingUsageMouseStates,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
@@ -360,6 +368,7 @@ pub fn render_team_totals_block(
     column.add_child(render_team_totals_section(
         entries,
         visibility,
+        charge_unit,
         mouse_states,
         appearance,
     ));

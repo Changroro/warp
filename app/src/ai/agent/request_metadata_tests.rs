@@ -63,6 +63,7 @@ fn record_message(request_id: &str, with_charges: bool) -> api::Message {
                     },
                 )]),
                 byok_inference_usage: HashMap::new(),
+                claude_linked_billing_inference_usage: HashMap::new(),
                 custom_endpoint_inference_usage: HashMap::new(),
                 platform_usage_in_cents: 2.0,
                 platform_usage_duration: Some(duration(90, 0)),
@@ -636,7 +637,7 @@ fn live_request_input(
 ) -> RequestInput {
     RequestInput {
         conversation_id,
-        input_messages: HashMap::from([(task_id, vec![input])]),
+        input_messages: Vec::from([(task_id, vec![input])]),
         working_directory: None,
         model_id: LLMId::from("test-model"),
         coding_model_id: LLMId::from("test-coding-model"),

@@ -12,7 +12,9 @@ use warp_graphql::ai::AgentTaskState;
 use super::super::claude_transcript::{
     ClaudeTranscriptEnvelope, claude_config_dir, write_envelope, write_session_index_entry,
 };
-use super::super::{remove_claude_externally_managed_listener_env_vars, task_env_vars};
+use super::super::{
+    HarnessSupportSkills, remove_claude_externally_managed_listener_env_vars, task_env_vars,
+};
 use super::parent_bridge::{
     ensure_parent_bridge_state_dir, parent_bridge_root,
     prime_parent_bridge_staged_for_self_managed_wake,
@@ -25,6 +27,7 @@ use crate::server::server_api::ServerApi;
 use crate::server::server_api::ai::AIClient;
 use crate::server::server_api::harness_support::ResolvePromptRequest;
 use crate::terminal::CLIAgent;
+use crate::terminal::shell::ShellType;
 
 const CLAUDE_WAKE_PROMPT: &str = "A lead agent mailbox message is available for this child run. Review the mailbox context and continue the task.";
 pub(super) const CLAUDE_WAKE_PROMPT_FILE_NAME: &str = "wake-turn-prompt.txt";
@@ -205,6 +208,7 @@ impl ClaudeHarness {
             &HashMap::new(),
             &ai::skills::parse_skills_dirs_env(),
             false,
+            HarnessSupportSkills::Plugin,
         )
         .context("Failed to prepare Claude environment for wake")?;
 
@@ -235,6 +239,7 @@ impl ClaudeHarness {
             None,
             None,
             true,
+            ShellType::Bash,
         );
         let env_vars = local_wake_task_env_vars(Some(&task_id), parent_run_id.as_deref());
 

@@ -16,7 +16,7 @@ use crate::ai::agent::api::ServerConversationToken;
 use crate::server::server_api::harness_support::{HarnessSupportClient, upload_to_target};
 
 const MAX_CAPTURE_ATTEMPTS: usize = 3;
-const JSONL_LIMITS: JsonlLimits = JsonlLimits {
+pub(super) const JSONL_LIMITS: JsonlLimits = JsonlLimits {
     max_line_bytes: 8 * 1024 * 1024,
     max_total_bytes: 64 * 1024 * 1024,
     max_records: 100_000,
@@ -104,7 +104,7 @@ pub(super) async fn upload_captured_transcript(
 ) -> Result<UploadedTranscriptUsage> {
     let target = client.get_transcript_upload_target(conversation_id).await?;
     upload_to_target(
-        client.http_client(),
+        client.external_http_client(),
         &target,
         capture.transcript_body.clone(),
     )

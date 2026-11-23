@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 use thousands::Separable;
+use warp_core::features::FeatureFlag;
 use warp_core::ui::appearance::Appearance;
 use warpui::Element;
 use warpui::elements::{
@@ -21,7 +22,7 @@ use crate::ui_components::blended_colors;
 use crate::workspaces::team::Team;
 use crate::workspaces::workspace::{
     AiCreditsUsageAndCostSubjectType, AiCreditsUsageAndCostType, AiCreditsUsageBucket,
-    BillingCycleUsageEntry, WorkspaceMember,
+    BillingCycleUsageEntry, ChargeUnit, WorkspaceMember,
 };
 
 // for a bunch of this (min fill ratio, cost type order, ... )
@@ -29,6 +30,7 @@ use crate::workspaces::workspace::{
 pub const ROW_BORDER_RADIUS: f32 = 8.;
 pub const ROW_BORDER_WIDTH: f32 = 1.;
 pub const TOOLTIP_GAP: f32 = 6.;
+pub const CENTS_PER_CREDIT: f64 = 1.8;
 
 const COST_TYPE_ORDER: &[AiCreditsUsageAndCostType] = &[
     AiCreditsUsageAndCostType::BaseLimit,
@@ -42,14 +44,13 @@ const BUCKET_ORDER: &[AiCreditsUsageBucket] = &[
     AiCreditsUsageBucket::Platform,
 ];
 
-/// One colored slice of the stacked bar. `cost_type` drives color; `usage_bucket`
-/// drives the tooltip breakdown.
+/// One cost-type/bucket line in a usage breakdown.
 #[derive(Clone, Debug)]
 pub struct BarSegment {
     pub cost_type: AiCreditsUsageAndCostType,
     pub usage_bucket: AiCreditsUsageBucket,
-    pub credits: i64,
-    pub cost_cents: i64,
+    pub credits: f64,
+    pub cost_cents: f64,
 }
 
 /// Shared mouse-state bag for the billing-and-usage section: the
@@ -141,7 +142,7 @@ fn segment_sort_key(segment: &BarSegment) -> (usize, usize) {
 /// impl Hash and per-row entry counts are small.
 pub fn aggregate_segments<'a>(
     entries: impl IntoIterator<Item = &'a BillingCycleUsageEntry>,
-) -> (Vec<BarSegment>, i64, i64) {
+) -> (Vec<BarSegment>, f64, f64) {
     let mut segments: Vec<BarSegment> = Vec::new();
 
     for entry in entries {
@@ -149,19 +150,19 @@ pub fn aggregate_segments<'a>(
             .iter_mut()
             .find(|s| s.cost_type == entry.cost_type && s.usage_bucket == entry.usage_bucket)
         {
-            existing.credits += entry.credits_used as i64;
-            existing.cost_cents += entry.cost_cents as i64;
+            existing.credits += entry.credits_used;
+            existing.cost_cents += entry.cost_cents;
         } else {
             segments.push(BarSegment {
                 cost_type: entry.cost_type.clone(),
                 usage_bucket: entry.usage_bucket.clone(),
-                credits: entry.credits_used as i64,
-                cost_cents: entry.cost_cents as i64,
+                credits: entry.credits_used,
+                cost_cents: entry.cost_cents,
             });
         }
     }
 
-    segments.retain(|s| s.credits > 0);
+    segments.retain(|s| s.credits > 0.0 || s.cost_cents > 0.0);
     segments.sort_by_key(segment_sort_key);
 
     let total_credits = segments.iter().map(|s| s.credits).sum();
@@ -222,14 +223,7 @@ pub fn members_for_team(members: &[WorkspaceMember], team: Option<&Team>) -> Vec
         .collect()
 }
 
-/// Cost-type buckets to surface in the usage legend, in display order.
-///
-/// Mirrors the buckets the stacked bars actually render: legacy buckets are
-/// dropped (see [`filter_legacy_buckets`]) and a cost type only counts when it
-/// has real usage (`credits_used > 0`), exactly like [`aggregate_segments`],
-/// which retains only segments with `credits > 0`. Without the usage check a
-/// zero-credit entry (e.g. an untouched base-limit row) would list "Base" in
-/// the legend even though it contributed nothing to the chart.
+/// Cost types with credit or monetary usage, excluding legacy buckets, in display order.
 pub fn legend_cost_types(entries: &[BillingCycleUsageEntry]) -> Vec<AiCreditsUsageAndCostType> {
     let filtered = filter_legacy_buckets(entries);
     [
@@ -243,7 +237,7 @@ pub fn legend_cost_types(entries: &[BillingCycleUsageEntry]) -> Vec<AiCreditsUsa
     .filter(|cost_type| {
         filtered
             .iter()
-            .any(|e| e.cost_type == *cost_type && e.credits_used > 0)
+            .any(|e| e.cost_type == *cost_type && (e.credits_used > 0.0 || e.cost_cents > 0.0))
     })
     .collect()
 }
@@ -251,7 +245,7 @@ pub fn legend_cost_types(entries: &[BillingCycleUsageEntry]) -> Vec<AiCreditsUsa
 /// "Is there any data in `entries` that's not my own?"
 pub fn has_non_viewer_data(entries: &[BillingCycleUsageEntry], viewer_uid: Option<&str>) -> bool {
     entries.iter().any(|e| match &e.subject_type {
-        AiCreditsUsageAndCostSubjectType::Team => e.credits_used > 0,
+        AiCreditsUsageAndCostSubjectType::Team => e.credits_used > 0.0 || e.cost_cents > 0.0,
         _ => match (e.subject_uid.as_deref(), viewer_uid) {
             (Some(uid), Some(viewer)) => uid != viewer,
             // Unknown subject — conservatively treat as non-viewer.
@@ -260,11 +254,12 @@ pub fn has_non_viewer_data(entries: &[BillingCycleUsageEntry], viewer_uid: Optio
     })
 }
 
-pub fn format_credits(credits: i64) -> String {
-    credits.separate_with_commas()
+pub fn format_credits(credits: f64) -> String {
+    (credits.round() as i64).separate_with_commas()
 }
 
-pub fn format_cost_cents(cents: i64) -> String {
+pub fn format_cost_cents(cents: f64) -> String {
+    let cents = cents.round() as i64;
     let dollars = cents / 100;
     let remainder = (cents.abs() % 100) as u8;
     if dollars < 0 {
@@ -275,6 +270,18 @@ pub fn format_cost_cents(cents: i64) -> String {
     } else {
         format!("${}.{remainder:02}", dollars.separate_with_commas())
     }
+}
+
+pub fn format_usage_cost(credits: f64, cost_cents: f64, charge_unit: ChargeUnit) -> String {
+    format_cost_cents(
+        if FeatureFlag::CreditEquivalentBillingUsage.is_enabled()
+            && charge_unit == ChargeUnit::Cents
+        {
+            credits * CENTS_PER_CREDIT
+        } else {
+            cost_cents
+        },
+    )
 }
 
 /// Section subheader (e.g. "Team totals", "Member usage"). One step below
@@ -290,8 +297,8 @@ pub fn render_section_subheader(label: &str, appearance: &Appearance) -> Box<dyn
 /// it can back team-totals card hovers as well as per-member row hovers.
 pub fn render_breakdown_tooltip(
     segments: &[BarSegment],
-    total_credits: i64,
-    total_cost_cents: i64,
+    total_credits: f64,
+    charge_unit: ChargeUnit,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     let theme = appearance.theme();
@@ -318,8 +325,10 @@ pub fn render_breakdown_tooltip(
         column.add_child(render_tooltip_row(
             Some(cost_type_color(&line.cost_type)),
             label,
-            line.credits,
-            line.cost_cents,
+            (
+                line.credits,
+                format_usage_cost(line.credits, line.cost_cents, charge_unit),
+            ),
             sub,
             main,
             font_family,
@@ -338,8 +347,14 @@ pub fn render_breakdown_tooltip(
     column.add_child(render_tooltip_row(
         /* no swatch on the total row */ None,
         "Total usage".to_string(),
-        total_credits,
-        total_cost_cents,
+        (
+            total_credits,
+            format_usage_cost(
+                total_credits,
+                segments.iter().map(|segment| segment.cost_cents).sum(),
+                charge_unit,
+            ),
+        ),
         main,
         main,
         font_family,
@@ -365,12 +380,10 @@ pub fn render_breakdown_tooltip(
 
 /// Single tooltip row: `[swatch + label] [spacer] [credits / cost]` with
 /// fixed-width right-aligned number columns.
-#[allow(clippy::too_many_arguments)]
 fn render_tooltip_row(
     swatch_color: Option<ColorU>,
     label: String,
-    credits: i64,
-    cost_cents: i64,
+    (credits, cost): (f64, String),
     label_color: ColorU,
     value_color: ColorU,
     font_family: warpui::fonts::FamilyId,
@@ -409,7 +422,7 @@ fn render_tooltip_row(
         .with_color(value_color)
         .with_style(style)
         .finish();
-    let cost_text = Text::new_inline(format_cost_cents(cost_cents), font_family, 12.)
+    let cost_text = Text::new_inline(cost, font_family, 12.)
         .with_color(value_color)
         .with_style(style)
         .finish();
