@@ -502,48 +502,21 @@ fn tab_detail_target_returns_none_for_mixed_support_tabs() {
 
 #[test]
 fn panes_granularity_returns_all_visible_panes_in_order() {
-    let pane_1 = pane_id();
-    let pane_2 = pane_id();
-    let pane_3 = pane_id();
-    let visible_pane_ids = vec![pane_1, pane_2, pane_3];
+    let visible_pane_ids = vec![pane_id(), pane_id(), pane_id()];
 
     assert_eq!(
-        pane_ids_for_display_granularity(
-            &visible_pane_ids,
-            pane_2,
-            VerticalTabsDisplayGranularity::Panes,
-        ),
+        pane_ids_for_display_granularity(&visible_pane_ids, VerticalTabsDisplayGranularity::Panes),
         visible_pane_ids
     );
 }
 
 #[test]
-fn tabs_granularity_returns_focused_pane_when_present() {
+fn tabs_granularity_returns_first_visible_pane() {
     let pane_1 = pane_id();
-    let pane_2 = pane_id();
-    let pane_3 = pane_id();
 
     assert_eq!(
         pane_ids_for_display_granularity(
-            &[pane_1, pane_2, pane_3],
-            pane_2,
-            VerticalTabsDisplayGranularity::Tabs,
-        ),
-        vec![pane_2]
-    );
-}
-
-#[test]
-fn tabs_granularity_falls_back_to_first_visible_pane_when_focused_pane_is_absent() {
-    let pane_1 = pane_id();
-    let pane_2 = pane_id();
-    let pane_3 = pane_id();
-    let focused_pane = pane_id();
-
-    assert_eq!(
-        pane_ids_for_display_granularity(
-            &[pane_1, pane_2, pane_3],
-            focused_pane,
+            &[pane_1, pane_id(), pane_id()],
             VerticalTabsDisplayGranularity::Tabs,
         ),
         vec![pane_1]
@@ -553,7 +526,7 @@ fn tabs_granularity_falls_back_to_first_visible_pane_when_focused_pane_is_absent
 #[test]
 fn tabs_granularity_returns_empty_for_empty_visible_panes() {
     assert_eq!(
-        pane_ids_for_display_granularity(&[], pane_id(), VerticalTabsDisplayGranularity::Tabs,),
+        pane_ids_for_display_granularity(&[], VerticalTabsDisplayGranularity::Tabs),
         Vec::<PaneId>::new()
     );
 }

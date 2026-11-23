@@ -1259,47 +1259,44 @@ impl VerticalTabsPanelState {
                         )
                     }
                     VerticalTabsResolvedMode::Panes | VerticalTabsResolvedMode::FocusedSession => {
-                        pane_ids_for_display_granularity(
-                            &visible_pane_ids,
-                            pane_group.focused_pane_id(app),
-                            display_granularity,
-                        )
-                        .into_iter()
-                        .any(|pane_id| {
-                            let title_override = (!uses_outer_group_container(display_granularity))
-                                .then(|| pane_group.custom_title(app))
-                                .flatten();
-                            let ms = MouseStateHandle::default();
-                            PaneProps::new(
-                                pane_group,
-                                pane_id,
-                                tab.pane_group.id(),
-                                *tab_index == active_tab_index,
-                                false,
-                                false,
-                                PaneRowState {
-                                    mouse_state: ms,
-                                    title_mouse_state: None,
-                                    pane_color: None,
-                                    badge_mouse_states: PaneRowBadgeMouseStates::default(),
-                                },
-                                self.detail_hover_state(tab.pane_group.window_id(app)),
-                                display_granularity,
-                                true,
-                                title_override.clone(),
-                                None,
-                                None,
-                                false,
-                                None,
-                                false,
-                                None,
-                                tab.pinned,
-                                false,
-                                None,
-                                app,
-                            )
-                            .is_some_and(|props| pane_matches_query(&props, &query_lower, app))
-                        })
+                        pane_ids_for_display_granularity(&visible_pane_ids, display_granularity)
+                            .into_iter()
+                            .any(|pane_id| {
+                                let title_override =
+                                    (!uses_outer_group_container(display_granularity))
+                                        .then(|| pane_group.custom_title(app))
+                                        .flatten();
+                                let ms = MouseStateHandle::default();
+                                PaneProps::new(
+                                    pane_group,
+                                    pane_id,
+                                    tab.pane_group.id(),
+                                    *tab_index == active_tab_index,
+                                    false,
+                                    false,
+                                    PaneRowState {
+                                        mouse_state: ms,
+                                        title_mouse_state: None,
+                                        pane_color: None,
+                                        badge_mouse_states: PaneRowBadgeMouseStates::default(),
+                                    },
+                                    self.detail_hover_state(tab.pane_group.window_id(app)),
+                                    display_granularity,
+                                    true,
+                                    title_override.clone(),
+                                    None,
+                                    None,
+                                    false,
+                                    None,
+                                    false,
+                                    None,
+                                    tab.pinned,
+                                    false,
+                                    None,
+                                    app,
+                                )
+                                .is_some_and(|props| pane_matches_query(&props, &query_lower, app))
+                            })
                     }
                 }
             })
@@ -1879,7 +1876,6 @@ fn render_groups(
                             .flatten();
                         let matching_ids: Vec<PaneId> = pane_ids_for_display_granularity(
                             &visible_pane_ids,
-                            pane_group.focused_pane_id(app),
                             display_granularity,
                         )
                         .into_iter()
@@ -2168,11 +2164,8 @@ fn render_tab_group_internal(
     // Tabs inside a group skip the per-tab outer container; the group provides it.
     let uses_outer_group_container =
         !in_tab_group && uses_outer_group_container(display_granularity);
-    let representative_pane_ids = pane_ids_for_display_granularity(
-        &visible_pane_ids,
-        pane_group.focused_pane_id(app),
-        display_granularity,
-    );
+    let representative_pane_ids =
+        pane_ids_for_display_granularity(&visible_pane_ids, display_granularity);
     let pane_ids_to_render: &[PaneId] = filtered_pane_ids.unwrap_or(&representative_pane_ids);
     let PaneGroupStateHandles {
         group: group_mouse_state,
@@ -6701,20 +6694,17 @@ fn render_popup_text_segment(
     .finish()
 }
 
+/// Fork: a tab is represented by its first pane in layout order so its row doesn't reshuffle
+/// as focus moves between splits.
 fn pane_ids_for_display_granularity(
     visible_pane_ids: &[PaneId],
-    focused_pane_id: PaneId,
     granularity: VerticalTabsDisplayGranularity,
 ) -> Vec<PaneId> {
     match granularity {
         VerticalTabsDisplayGranularity::Panes => visible_pane_ids.to_vec(),
-        VerticalTabsDisplayGranularity::Tabs => visible_pane_ids
-            .iter()
-            .copied()
-            .find(|pane_id| *pane_id == focused_pane_id)
-            .or_else(|| visible_pane_ids.first().copied())
-            .into_iter()
-            .collect(),
+        VerticalTabsDisplayGranularity::Tabs => {
+            visible_pane_ids.first().copied().into_iter().collect()
+        }
     }
 }
 
