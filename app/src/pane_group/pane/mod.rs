@@ -1112,6 +1112,7 @@ pub enum PaneEvent {
     SplitUp(Option<AvailableShell>),
     SplitDown(Option<AvailableShell>),
     ToggleMaximized,
+    MoveToNewTab,
     /// Make this pane the focused pane.
     FocusSelf,
     FocusActiveSession,

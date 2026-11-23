@@ -18373,6 +18373,16 @@ impl TerminalView {
             );
 
             items.push(
+                MenuItemFields::new("Move pane to new tab")
+                    .with_on_select_action(TerminalAction::MovePaneToNewTab)
+                    .with_key_shortcut_label(keybinding_name_to_display_string(
+                        "pane_group:move_pane_to_new_tab",
+                        ctx,
+                    ))
+                    .into_item(),
+            );
+
+            items.push(
                 MenuItemFields::new("Close pane")
                     .with_on_select_action(TerminalAction::Close)
                     .with_key_shortcut_label(
@@ -27859,6 +27869,7 @@ impl TypedActionView for TerminalView {
             | AltSelect(_)
             | AltMouseAction(_)
             | ToggleMaximizePane
+            | MovePaneToNewTab
             | PromptContextMenu { .. }
             | OpenInputContextMenu { .. }
             | InputContextMenuItem(_)
@@ -28172,6 +28183,7 @@ impl TypedActionView for TerminalView {
                 ctx.emit(Event::Pane(PaneEvent::SplitUp(chosen_shell.to_owned())))
             }
             ToggleMaximizePane => ctx.emit(Event::Pane(PaneEvent::ToggleMaximized)),
+            MovePaneToNewTab => ctx.emit(Event::Pane(PaneEvent::MoveToNewTab)),
             PromptContextMenu {
                 position_offset_from_prompt,
             } => self.show_prompt_context_menu(*position_offset_from_prompt, ctx),

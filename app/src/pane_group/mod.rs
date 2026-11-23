@@ -306,6 +306,7 @@ pub enum PaneGroupAction {
     NavigateUp,
     NavigateDown,
     ToggleMaximizePane,
+    MovePaneToNewTab,
     HandleFocusChange,
     FocusTerminalView(EntityId),
 }
@@ -476,6 +477,12 @@ pub fn init(app: &mut AppContext) {
         )
         .with_context_predicate(id!("PaneGroup") & !id!("PaneGroup_PaneDragging"))
         .with_custom_action(CustomAction::ToggleMaximizePane),
+        EditableBinding::new(
+            "pane_group:move_pane_to_new_tab",
+            "Move Active Pane to New Tab",
+            PaneGroupAction::MovePaneToNewTab,
+        )
+        .with_context_predicate(id!("PaneGroup") & !id!("PaneGroup_PaneDragging")),
     ]);
 
     if ChannelState::channel() == Channel::Integration {
@@ -627,6 +634,10 @@ pub enum Event {
     /// from the orchestration pill bar's 3-dot menu.
     OpenChildAgentInNewTab {
         conversation_id: AIConversationId,
+    },
+    /// Fork: move this pane out of its split into a tab of its own.
+    MovePaneToNewTab {
+        pane_id: PaneId,
     },
     OpenSuggestedAgentModeWorkflowModal {
         workflow_and_id: SuggestedAgentModeWorkflowAndId,
@@ -5191,6 +5202,7 @@ impl PaneGroup {
                 self.focus_pane_by_id(pane_id, ctx);
                 self.toggle_maximize_pane(ctx);
             }
+            PaneEvent::MoveToNewTab => self.move_pane_to_new_tab(pane_id, ctx),
             PaneEvent::FocusSelf => self.focus_pane_by_id(pane_id, ctx),
             PaneEvent::FocusActiveSession => self.focus_active_session(ctx),
             PaneEvent::AppStateChanged => {
@@ -5869,6 +5881,13 @@ impl PaneGroup {
     }
 
     /// Toggles whether or not the focused pane is maximized.
+    fn move_pane_to_new_tab(&mut self, pane_id: PaneId, ctx: &mut ViewContext<Self>) {
+        // A lone pane would close its tab on removal, so there is nothing to split off.
+        if self.panes.visible_pane_count() > 1 {
+            ctx.emit(Event::MovePaneToNewTab { pane_id });
+        }
+    }
+
     fn toggle_maximize_pane(&mut self, ctx: &mut ViewContext<Self>) {
         if self.pane_count() > 1 {
             self.focus_state.update(ctx, |focus_state, ctx| {
@@ -8261,6 +8280,7 @@ impl TypedActionView for PaneGroup {
             NavigateUp => self.navigate_pane_by_direction(Direction::Up, ctx),
             NavigateDown => self.navigate_pane_by_direction(Direction::Down, ctx),
             ToggleMaximizePane => self.toggle_maximize_pane(ctx),
+            MovePaneToNewTab => self.move_pane_to_new_tab(self.focused_pane_id(ctx), ctx),
             Move {
                 id,
                 target_pane_id,

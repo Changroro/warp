@@ -17131,6 +17131,15 @@ impl Workspace {
                     });
                 }
             }
+            pane_group::Event::MovePaneToNewTab { pane_id } => {
+                let Some(pane) =
+                    pane_group.update(ctx, |pg, ctx| pg.remove_pane_for_move(pane_id, ctx))
+                else {
+                    return;
+                };
+                let (new_tab_index, group_id) = self.new_tab_index_and_group(ctx);
+                self.add_tab_from_existing_pane(pane, new_tab_index, group_id, ctx);
+            }
             pane_group::Event::DroppedOnTabBar { origin, pane_id } => {
                 if let Some(hovered_tab_index) = self.hovered_tab_index {
                     match hovered_tab_index {

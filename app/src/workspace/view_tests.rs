@@ -5916,3 +5916,32 @@ fn a_restored_archived_tab_returns_to_its_group() {
         });
     })
 }
+
+#[test]
+fn move_pane_to_new_tab_splits_off_the_active_pane() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            let pane_group = workspace.active_tab_pane_group().clone();
+            // A lone pane stays put.
+            pane_group.update(ctx, |pg, ctx| {
+                pg.handle_action(&PaneGroupAction::MovePaneToNewTab, ctx)
+            });
+            assert_eq!(workspace.tabs.len(), 1);
+
+            pane_group.update(ctx, |pg, ctx| {
+                pg.handle_action(&PaneGroupAction::Add(Direction::Right), ctx);
+                pg.handle_action(&PaneGroupAction::MovePaneToNewTab, ctx);
+            });
+        });
+
+        workspace.read(&app, |workspace, ctx| {
+            assert_eq!(workspace.tabs.len(), 2);
+            for tab in &workspace.tabs {
+                assert_eq!(tab.pane_group.as_ref(ctx).pane_count(), 1);
+            }
+        });
+    });
+}
